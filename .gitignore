@@ -3,3 +3,4 @@
 *.xml
 **/.idea/
 .migration_complete
+software/tests/e2e/configs/outputs/
