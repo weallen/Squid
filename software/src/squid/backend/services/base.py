@@ -1,14 +1,56 @@
 # squid/services/base.py
 """Base class for all services."""
 
+import functools
 from abc import ABC
-from typing import List, Optional, Tuple, Type, Callable, TypeVar
+from typing import Any, List, Optional, Tuple, Type, Callable, TypeVar
 
 import squid.core.logging
 from squid.core.events import EventBus, Event
 from squid.core.mode_gate import GlobalModeGate
 
 E = TypeVar("E", bound=Event)
+F = TypeVar("F", bound=Callable[..., Any])
+
+
+def gated_command(
+    method: Optional[F] = None,
+    *,
+    on_blocked: Optional[Callable[[Any, Event], Any]] = None,
+) -> F:
+    """Decorator that skips command handler when mode gate is active.
+
+    Use this on service command handlers that should be blocked during
+    acquisition or other exclusive operations.
+
+    Usage:
+        class CameraService(BaseService):
+            @gated_command
+            def _on_set_exposure(self, cmd: SetExposureCommand) -> None:
+                self.set_exposure_time(cmd.exposure_time_ms)
+
+    When mode gate is active, the decorated method returns None without
+    executing, and a debug message is logged.
+    """
+
+    def decorator(func: F) -> F:
+        @functools.wraps(func)
+        def wrapper(self: "BaseService", event: Event) -> Any:
+            if self._blocked_for_ui_hardware_commands():
+                self._log.debug("Ignoring %s due to mode gate", type(event).__name__)
+                if on_blocked is not None:
+                    try:
+                        on_blocked(self, event)
+                    except Exception:
+                        self._log.exception("Blocked handler hook failed for %s", type(event).__name__)
+                return None
+            return func(self, event)
+
+        return wrapper  # type: ignore[return-value]
+
+    if method is not None:
+        return decorator(method)
+    return decorator  # type: ignore[return-value]
 
 
 class BaseService(ABC):
@@ -55,7 +97,6 @@ class BaseService(ABC):
         """
         self._event_bus.subscribe(event_type, handler)  # type: ignore
         self._subscriptions.append((event_type, handler))  # type: ignore
-        self._log.debug(f"Subscribed to {event_type.__name__}")
 
     def publish(self, event: Event):
         """
@@ -64,12 +105,10 @@ class BaseService(ABC):
         Args:
             event: Event to publish
         """
-        self._log.debug(f"Publishing {type(event).__name__}")
         self._event_bus.publish(event)
 
     def shutdown(self):
         """Unsubscribe from all events and clean up."""
         for event_type, handler in self._subscriptions:
             self._event_bus.unsubscribe(event_type, handler)
-            self._log.debug(f"Unsubscribed from {event_type.__name__}")
         self._subscriptions.clear()

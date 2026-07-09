@@ -1,0 +1,26 @@
+name: "Fluidics Only Protocol"
+version: "3.0"
+description: "Pure fluidics workflow with self-loaded protocol and hardware config."
+output_directory: ../outputs
+
+resources:
+  fluidics_protocols_file: ../fluidics/test_fluidics_protocols.yaml
+  fluidics_config_file: ../fluidics/simulation_fluidics.json
+
+rounds:
+  - name: "System Prime"
+    steps:
+      - step_type: fluidics
+        protocol: system_prime
+  - name: "Primary Stain"
+    steps:
+      - step_type: fluidics
+        protocol: stain_application
+  - name: "Secondary Stain"
+    steps:
+      - step_type: fluidics
+        protocol: secondary_stain
+  - name: "Final Rinse"
+    steps:
+      - step_type: fluidics
+        protocol: final_rinse

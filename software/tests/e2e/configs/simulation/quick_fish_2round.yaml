@@ -1,0 +1,31 @@
+# Quick 2-Round FISH Simulation (V2 Format)
+# Realistic structure, fast execution
+# 2 FOVs recommended
+
+name: "Quick 2-Round FISH"
+version: "2.0"
+description: "Fast 2-round FISH simulation for manual testing"
+
+error_handling:
+  focus_failure: skip
+  fluidics_failure: abort
+  imaging_failure: warn
+
+fov_file: ../fov_positions/test_2fov_simple.csv
+
+rounds:
+  # Round 1: Hybridization 1
+  - name: "Hybridization 1"
+    steps:
+      - step_type: fluidics
+        protocol: hybridization_1
+      - step_type: imaging
+        protocol: protocols/fish_imaging.yaml
+
+  # Round 2: Hybridization 2
+  - name: "Hybridization 2"
+    steps:
+      - step_type: fluidics
+        protocol: hybridization_2
+      - step_type: imaging
+        protocol: protocols/fish_imaging.yaml

@@ -1,6 +1,6 @@
 # Napari live view widget
 import numpy as np
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
 from squid.backend.managers import ContrastManager
 from squid.backend.io.stream_handler import StreamHandler
@@ -28,17 +28,18 @@ from qtpy.QtWidgets import (
 
 from _def import (
     TriggerMode,
-    USE_NAPARI_FOR_LIVE_CONTROL,
-    USE_NAPARI_WELL_SELECTION,
     SQUID_ICON_PATH,
 )
+from squid.core.config.feature_flags import get_feature_flags
 
-from squid.core.utils.config_utils import ChannelMode as ChannelConfiguration
+from squid.core.config.models import AcquisitionChannel as ChannelConfiguration
 
 from squid.core.events import (
+    handles,
     StartLiveCommand,
     StopLiveCommand,
     LiveStateChanged,
+    SetTriggerModeCommand,
     SetTriggerFPSCommand,
     SetMicroscopeModeCommand,
     UpdateIlluminationCommand,
@@ -51,12 +52,16 @@ from squid.core.events import (
     AutoLevelCommand,
     ImageCoordinateClickedCommand,
 )
+from squid.ui.widgets.base import EventBusWidget
 
 if TYPE_CHECKING:
     from squid.ui.ui_event_bus import UIEventBus
 
 
-class NapariLiveWidget(QWidget):
+_FEATURE_FLAGS = get_feature_flags()
+
+
+class NapariLiveWidget(EventBusWidget):
 
     def __init__(
         self,
@@ -74,9 +79,8 @@ class NapariLiveWidget(QWidget):
         autolevel: bool = False,
         parent: QWidget = None,
     ):
-        super().__init__(parent)
+        super().__init__(event_bus, parent)
         self._log = squid.core.logging.get_logger(self.__class__.__name__)
-        self._event_bus = event_bus
         self.streamHandler = streamHandler
         self.wellSelectionWidget = wellSelectionWidget
         self._exposure_limits = exposure_limits
@@ -99,6 +103,7 @@ class NapariLiveWidget(QWidget):
         self.fps_trigger = 10
         self.fps_display = 10
         self.contrastManager = contrastManager
+        self.is_switching_mode = False  # Guard to prevent duplicate commands during mode switch
 
         self.initNapariViewer()
         self.addNapariGrayclipColormap()
@@ -107,14 +112,7 @@ class NapariLiveWidget(QWidget):
         )
         self.update_ui_for_mode(self.live_configuration)
 
-        # Subscribe to state changes from the bus
-        self._event_bus.subscribe(LiveStateChanged, self._on_live_state_changed)
-        self._event_bus.subscribe(TriggerFPSChanged, self._on_trigger_fps_changed)
-        self._event_bus.subscribe(MicroscopeModeChanged, self._on_microscope_mode_changed)
-        self._event_bus.subscribe(ObjectiveChanged, self._on_objective_changed)
-        self._event_bus.subscribe(ChannelConfigurationsChanged, self._on_channel_configs_changed)
-        self._event_bus.subscribe(AutoLevelCommand, self._on_autolevel_command)
-
+    @handles(AutoLevelCommand)
     def _on_autolevel_command(self, event: AutoLevelCommand) -> None:
         self.btn_autolevel.blockSignals(True)
         self.btn_autolevel.setChecked(bool(event.enabled))
@@ -275,7 +273,7 @@ class NapariLiveWidget(QWidget):
         self.entry_triggerFPS.setRange(0.02, 1000)
         self.entry_triggerFPS.setValue(self.fps_trigger)
         self.entry_triggerFPS.valueChanged.connect(
-            lambda fps: self._event_bus.publish(SetTriggerFPSCommand(fps=fps))
+            lambda fps: self._publish(SetTriggerFPSCommand(fps=fps))
         )
 
         # Display FPS
@@ -305,7 +303,7 @@ class NapariLiveWidget(QWidget):
         self.btn_autolevel.setCheckable(True)
         self.btn_autolevel.setChecked(autolevel)
         self.btn_autolevel.toggled.connect(
-            lambda enabled: self._event_bus.publish(AutoLevelCommand(enabled=enabled))
+            lambda enabled: self._publish(AutoLevelCommand(enabled=enabled))
         )
 
         def make_row(label_widget, entry_widget, value_label=None):
@@ -372,7 +370,7 @@ class NapariLiveWidget(QWidget):
         control_layout.addStretch(1)
 
         add_live_controls = False
-        if USE_NAPARI_FOR_LIVE_CONTROL or add_live_controls:
+        if _FEATURE_FLAGS.is_enabled("USE_NAPARI_FOR_LIVE_CONTROL") or add_live_controls:
             live_controls_widget = QWidget()
             live_controls_widget.setLayout(control_layout)
 
@@ -404,7 +402,7 @@ class NapariLiveWidget(QWidget):
                 self.dock_live_controls.toggleViewAction()
             )
 
-        if USE_NAPARI_WELL_SELECTION:
+        if _FEATURE_FLAGS.is_enabled("USE_NAPARI_WELL_SELECTION"):
             well_selector_layout = QVBoxLayout()
 
             well_selector_row = QHBoxLayout()
@@ -447,10 +445,11 @@ class NapariLiveWidget(QWidget):
 
     def toggle_live(self, pressed: bool) -> None:
         if pressed:
-            self._event_bus.publish(StartLiveCommand(configuration=self.live_configuration.name))
+            self._publish(StartLiveCommand(configuration=self.live_configuration.name))
         else:
-            self._event_bus.publish(StopLiveCommand())
+            self._publish(StopLiveCommand())
 
+    @handles(LiveStateChanged)
     def _on_live_state_changed(self, event: LiveStateChanged) -> None:
         """Handle live state changes from the event bus."""
         if getattr(event, "camera", "main") != "main":
@@ -462,6 +461,7 @@ class NapariLiveWidget(QWidget):
             self.btn_live.setChecked(False)
             self.btn_live.setText("Start Live")
 
+    @handles(TriggerFPSChanged)
     def _on_trigger_fps_changed(self, event: TriggerFPSChanged) -> None:
         """Handle trigger FPS change from service."""
         if getattr(event, "camera", "main") != "main":
@@ -470,6 +470,7 @@ class NapariLiveWidget(QWidget):
         self.entry_triggerFPS.setValue(event.fps)
         self.entry_triggerFPS.blockSignals(False)
 
+    @handles(MicroscopeModeChanged)
     def _on_microscope_mode_changed(self, event: MicroscopeModeChanged) -> None:
         """Handle microscope mode change from service."""
         self.dropdown_modeSelection.blockSignals(True)
@@ -494,18 +495,20 @@ class NapariLiveWidget(QWidget):
             self.slider_illuminationIntensity.setValue(int(event.illumination_intensity))
             self.slider_illuminationIntensity.blockSignals(False)
 
+    @handles(ObjectiveChanged)
     def _on_objective_changed(self, event: ObjectiveChanged) -> None:
         """Handle objective change event."""
         if event.objective_name:
             self._current_objective = event.objective_name
             # Re-apply current configuration for the new objective.
-            self._event_bus.publish(
+            self._publish(
                 SetMicroscopeModeCommand(
                     configuration_name=self.live_configuration.name,
                     objective=self._current_objective,
                 )
             )
 
+    @handles(ChannelConfigurationsChanged)
     def _on_channel_configs_changed(self, event: ChannelConfigurationsChanged) -> None:
         """Handle channel configurations changed event."""
         if event.objective_name == self._current_objective:
@@ -558,7 +561,7 @@ class NapariLiveWidget(QWidget):
 
         # Publish command - MicroscopeModeController will handle the actual mode change
         # and publish MicroscopeModeChanged with the config details
-        self._event_bus.publish(
+        self._publish(
             SetMicroscopeModeCommand(
                 configuration_name=config_name,
                 objective=self._current_objective,
@@ -567,23 +570,37 @@ class NapariLiveWidget(QWidget):
         # UI will be updated via _on_microscope_mode_changed event handler
 
     def update_ui_for_mode(self, config: ChannelConfiguration) -> None:
-        self.live_configuration = config
-        self.dropdown_modeSelection.setCurrentText(config.name if config else "Unknown")
-        if self.live_configuration:
-            self.entry_exposureTime.setValue(self.live_configuration.exposure_time)
-            self.entry_analogGain.setValue(self.live_configuration.analog_gain)
-            self.slider_illuminationIntensity.setValue(
-                int(self.live_configuration.illumination_intensity)
-            )
+        try:
+            self.is_switching_mode = True
+            self.live_configuration = config
+            self.dropdown_modeSelection.setCurrentText(config.name if config else "Unknown")
+            if self.live_configuration:
+                self.entry_exposureTime.blockSignals(True)
+                self.entry_exposureTime.setValue(self.live_configuration.exposure_time)
+                self.entry_exposureTime.blockSignals(False)
+
+                self.entry_analogGain.blockSignals(True)
+                self.entry_analogGain.setValue(self.live_configuration.analog_gain)
+                self.entry_analogGain.blockSignals(False)
+
+                self.slider_illuminationIntensity.blockSignals(True)
+                self.slider_illuminationIntensity.setValue(
+                    int(self.live_configuration.illumination_intensity)
+                )
+                self.slider_illuminationIntensity.blockSignals(False)
+        finally:
+            self.is_switching_mode = False
 
     def update_config_exposure_time(self, new_value: float) -> None:
+        if self.is_switching_mode:
+            return
         self.live_configuration.exposure_time = new_value
-        self._event_bus.publish(UpdateChannelConfigurationCommand(
+        self._publish(UpdateChannelConfigurationCommand(
             objective_name=self._current_objective,
             config_name=self.live_configuration.name,
             exposure_time_ms=new_value,
         ))
-        self._event_bus.publish(
+        self._publish(
             SetMicroscopeModeCommand(
                 configuration_name=self.live_configuration.name,
                 objective=self._current_objective,
@@ -591,13 +608,15 @@ class NapariLiveWidget(QWidget):
         )
 
     def update_config_analog_gain(self, new_value: float) -> None:
+        if self.is_switching_mode:
+            return
         self.live_configuration.analog_gain = new_value
-        self._event_bus.publish(UpdateChannelConfigurationCommand(
+        self._publish(UpdateChannelConfigurationCommand(
             objective_name=self._current_objective,
             config_name=self.live_configuration.name,
             analog_gain=new_value,
         ))
-        self._event_bus.publish(
+        self._publish(
             SetMicroscopeModeCommand(
                 configuration_name=self.live_configuration.name,
                 objective=self._current_objective,
@@ -605,24 +624,25 @@ class NapariLiveWidget(QWidget):
         )
 
     def update_config_illumination_intensity(self, new_value: float) -> None:
+        if self.is_switching_mode:
+            return
         self.live_configuration.illumination_intensity = new_value
-        self._event_bus.publish(UpdateChannelConfigurationCommand(
+        self._publish(UpdateChannelConfigurationCommand(
             objective_name=self._current_objective,
             config_name=self.live_configuration.name,
             illumination_intensity=new_value,
         ))
-        self._event_bus.publish(UpdateIlluminationCommand())
+        self._publish(UpdateIlluminationCommand())
 
     def update_resolution_scaling(self, value: float) -> None:
         self.streamHandler.set_display_resolution_scaling(value)
-        self._event_bus.publish(SetDisplayResolutionScalingCommand(scaling=value))
+        self._publish(SetDisplayResolutionScalingCommand(scaling=value))
 
     def on_trigger_mode_changed(self, index: int) -> None:
-        # Get the actual value using user data
-        actual_value = self.dropdown_triggerMode.itemData(index)
-        print(
-            f"Selected: {self.dropdown_triggerMode.currentText()} (actual value: {actual_value})"
-        )
+        # Apply the selected trigger mode via the backend (mirrors LiveControlWidget).
+        mode = self.dropdown_triggerMode.itemData(index)
+        if mode is not None:
+            self._publish(SetTriggerModeCommand(mode=mode))
 
     def addNapariGrayclipColormap(self) -> None:
         if hasattr(napari.utils.colormaps.AVAILABLE_COLORMAPS, "grayclip"):
@@ -765,7 +785,7 @@ class NapariLiveWidget(QWidget):
         ):
             x_centered = int(coords[-1] - layer_shape[-1] / 2)
             y_centered = int(coords[-2] - layer_shape[-2] / 2)
-            self._event_bus.publish(
+            self._publish(
                 ImageCoordinateClickedCommand(
                     x_pixel=x_centered,
                     y_pixel=y_centered,

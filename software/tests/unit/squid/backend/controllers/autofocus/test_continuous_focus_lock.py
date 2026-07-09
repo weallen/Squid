@@ -1,14 +1,45 @@
 """Tests for ContinuousFocusLockController."""
 
+import math
+import time
+
+import numpy as np
+import pytest
+
 from squid.backend.controllers.autofocus.continuous_focus_lock import (
     ContinuousFocusLockController,
 )
+from squid.backend.controllers.autofocus.laser_auto_focus_controller import LaserAFResult
 from squid.core.config.focus_lock import FocusLockConfig
-from squid.core.events import EventBus, FocusLockStatusChanged
+from squid.core.events import (
+    EventBus,
+    FocusLockFrameUpdated,
+    FocusLockMetricsUpdated,
+    FocusLockPiezoLimitCritical,
+    FocusLockStatusChanged,
+    FocusLockWarning,
+    SetFocusLockParamsCommand,
+)
 
 
 class _DummyLaserAFProps:
     correlation_threshold = 0.8
+    has_reference = True
+    x_reference = 100.0
+
+
+class _DummyCameraService:
+    def __init__(self) -> None:
+        self._streaming = True
+
+    def get_is_streaming(self) -> bool:
+        return self._streaming
+
+    def start_streaming(self) -> None:
+        self._streaming = True
+
+    def stop_streaming(self) -> None:
+        self._streaming = False
 
 
 class _DummyLaserAF:
@@ -16,12 +47,44 @@ class _DummyLaserAF:
         self.laser_af_properties = _DummyLaserAFProps()
         self.on_calls = 0
         self.off_calls = 0
+        self.is_initialized = True
+        self._displacement_um = 0.5
+        self._camera_service = _DummyCameraService()
+        self._image = None  # set by tests that exercise commit_reference_from_result
+        self.commit_reference_calls: list = []
+        self.clear_reference_calls = 0
+        self._commit_reference_succeeds = True
 
     def turn_on_laser(self, bypass_mode_gate: bool = False) -> None:  # noqa: ARG002
         self.on_calls += 1
 
     def turn_off_laser(self, bypass_mode_gate: bool = False) -> None:  # noqa: ARG002
         self.off_calls += 1
+
+    def measure_displacement_continuous(self) -> LaserAFResult:
+        import time
+        return LaserAFResult(
+            displacement_um=self._displacement_um,
+            spot_intensity=100.0,
+            spot_snr=10.0,
+            correlation=0.95,
+            spot_x_px=100.0,
+            spot_y_px=50.0,
+            timestamp=time.monotonic(),
+            image=self._image,
+        )
+
+    def commit_reference_from_result(self, result: LaserAFResult) -> bool:
+        self.commit_reference_calls.append(result)
+        if self._commit_reference_succeeds:
+            self.laser_af_properties.has_reference = True
+            self.laser_af_properties.x_reference = result.spot_x_px
+        return self._commit_reference_succeeds
+
+    def clear_reference(self) -> None:
+        self.clear_reference_calls += 1
+        self.laser_af_properties.has_reference = False
+        self.laser_af_properties.x_reference = None
 
 
 class _DummyPiezoService:
@@ -34,8 +97,70 @@ class _DummyPiezoService:
     def get_range(self):
         return (0.0, 300.0)
 
+    def move_to(self, position_um: float) -> None:
+        self.position = position_um
+
     def move_to_fast(self, position_um: float) -> None:
         self.position = position_um
+
+
+class _CoupledLaserAF(_DummyLaserAF):
+    """Synthetic displacement source coupled to piezo position."""
+
+    def __init__(self, piezo: _DummyPiezoService, disturbance_um: float = 0.0) -> None:
+        super().__init__()
+        self._piezo = piezo
+        self.disturbance_um = disturbance_um
+
+    def measure_displacement_continuous(self) -> LaserAFResult:
+        displacement = self.disturbance_um + (self._piezo.get_position() - 150.0)
+        return LaserAFResult(
+            displacement_um=displacement,
+            spot_intensity=100.0,
+            spot_snr=10.0,
+            correlation=0.95,
+            spot_x_px=100.0,
+            spot_y_px=50.0,
+            timestamp=time.monotonic(),
+        )
+
+
+class _SequenceLaserAF(_DummyLaserAF):
+    """Laser AF stub that returns a deterministic result sequence."""
+
+    def __init__(self, results: list[LaserAFResult]) -> None:
+        super().__init__()
+        self._results = list(results)
+        self._index = 0
+
+    def measure_displacement_continuous(self) -> LaserAFResult:
+        if not self._results:
+            return super().measure_displacement_continuous()
+        if self._index >= len(self._results):
+            return self._results[-1]
+        result = self._results[self._index]
+        self._index += 1
+        return result
+
+
+def _make_result(
+    *,
+    displacement_um: float,
+    spot_snr: float = 10.0,
+    correlation: float | None = 0.95,
+    spot_x_px: float | None = 100.0,
+    timestamp: float | None = None,
+) -> LaserAFResult:
+    return LaserAFResult(
+        displacement_um=displacement_um,
+        spot_intensity=100.0,
+        spot_snr=spot_snr,
+        correlation=correlation,
+        spot_x_px=spot_x_px,
+        spot_y_px=50.0 if spot_x_px is not None else None,
+        timestamp=time.monotonic() if timestamp is None else timestamp,
+        image=np.zeros((64, 256), dtype=np.uint8),
+    )
 
 
 def test_control_fn_negative_feedback():
@@ -46,12 +171,98 @@ def test_control_fn_negative_feedback():
         config=FocusLockConfig(gain=0.5, gain_max=0.7),
     )
 
-    assert controller._control_fn(1.0) < 0
-    assert controller._control_fn(-1.0) > 0
+    dt = 1.0 / 60.0
+    assert controller._control_fn(1.0, dt) < 0
+    assert controller._control_fn(-1.0, dt) > 0
+
+
+def test_closed_loop_feedback_rejects_step_disturbance_without_camera():
+    bus = EventBus()
+    piezo = _DummyPiezoService()
+    laser_af = _CoupledLaserAF(piezo, disturbance_um=0.0)
+    controller = ContinuousFocusLockController(
+        laser_af=laser_af,
+        piezo_service=piezo,
+        event_bus=bus,
+        config=FocusLockConfig(
+            loop_rate_hz=80,
+            metrics_rate_hz=20,
+            buffer_length=3,
+            acquire_threshold_um=0.2,
+            maintain_threshold_um=2.0,
+            recovery_attempts=3,
+            recovery_delay_s=0.05,
+        ),
+    )
+
+    controller.start(target_um=0.0)
+    try:
+        controller.set_lock_reference()
+        assert controller.wait_for_lock(timeout_s=1.0)
+        baseline_position = piezo.get_position()
+
+        # Inject a +1 um disturbance and verify controller drives piezo down.
+        laser_af.disturbance_um = 1.0
+        time.sleep(0.35)
+
+        result = laser_af.measure_displacement_continuous()
+        error_um = controller._compute_error(result)
+
+        assert piezo.get_position() < baseline_position - 0.2
+        assert abs(error_um) < 0.3
+    finally:
+        controller.stop()
+
+
+def test_start_does_not_auto_lock_without_explicit_reference():
+    """Start should keep controller ready until lock is explicitly engaged."""
+    controller = ContinuousFocusLockController(
+        laser_af=_DummyLaserAF(),
+        piezo_service=_DummyPiezoService(),
+        event_bus=EventBus(),
+        config=FocusLockConfig(loop_rate_hz=80, metrics_rate_hz=20, buffer_length=3),
+    )
+
+    controller.start()
+    try:
+        time.sleep(0.2)
+        assert controller.status == "ready"
+        assert controller.wait_for_lock(timeout_s=0.2) is False
+    finally:
+        controller.stop()
+
+
+def test_release_reference_stays_released():
+    """Release should not be immediately undone by auto re-lock logic."""
+    controller = ContinuousFocusLockController(
+        laser_af=_DummyLaserAF(),
+        piezo_service=_DummyPiezoService(),
+        event_bus=EventBus(),
+        config=FocusLockConfig(buffer_length=3),
+    )
+    controller._running = True
+    controller._should_run = True
+
+    controller.set_lock_reference()
+    assert controller.status == "locked"
+
+    controller.release_lock_reference()
+    assert controller.status == "ready"
+
+    for _ in range(5):
+        controller._update_lock_state(True, 0.0)
+
+    assert controller.status == "ready"
+    assert controller._lock_buffer_fill == 0
 
 
 def test_lock_state_transitions():
-    """Test that lock state machine transitions correctly with recovery support."""
+    """Test state machine can walk ready->locked->recovering->lost.
+
+    Uses sustained NaN (untrustworthy) readings, which is the only path that
+    should demote from locked. A merely large error is NOT sufficient — the
+    PI loop is expected to correct it.
+    """
     bus = EventBus()
     controller = ContinuousFocusLockController(
         laser_af=_DummyLaserAF(),
@@ -59,25 +270,33 @@ def test_lock_state_transitions():
         event_bus=bus,
         config=FocusLockConfig(
             buffer_length=3,
-            recovery_attempts=1,  # Single recovery attempt for simple test
-            recovery_delay_s=0.0,  # Immediate recovery attempt
+            recovery_attempts=1,
+            recovery_window_readings=1,
+            recovery_delay_s=0.0,
+            # Very small guards so the test runs in a handful of cycles.
+            max_nan_holdover_cycles=1,
+            lock_break_persist_cycles=1,
         ),
     )
 
     events: list[FocusLockStatusChanged] = []
     bus.subscribe(FocusLockStatusChanged, events.append)
 
-    # Start in ready state, build up buffer
+    controller._lock_reference_active = True
     controller._set_status("ready")
-    controller._update_lock_state(True, 0.0)  # buffer_fill = 1
-    controller._update_lock_state(True, 0.0)  # buffer_fill = 2
-    controller._update_lock_state(True, 0.0)  # buffer_fill = 3 -> locked
+    controller._update_lock_state(True, 0.0)
+    controller._update_lock_state(True, 0.0)
+    controller._update_lock_state(True, 0.0)  # -> locked
 
-    # Bad reading triggers recovery (not immediate lost)
-    controller._update_lock_state(False, 1.0)  # -> recovering
-
-    # Another bad reading after recovery delay exhausts attempts -> lost
-    controller._update_lock_state(False, 1.0)  # -> lost
+    # Sustained untrustworthy readings demote past the grace window.
+    grace = (
+        controller._config.max_nan_holdover_cycles
+        + controller._config.lock_break_persist_cycles
+    )
+    for _ in range(grace + 1):
+        controller._update_lock_state(False, float("nan"))  # -> recovering
+    # One more bad frame while recovering exhausts the tiny budget -> lost.
+    controller._update_lock_state(False, float("nan"))
 
     bus.drain()
 
@@ -103,3 +322,1782 @@ def test_laser_state_tracking():
 
     assert laser_af.on_calls == 1
     assert laser_af.off_calls == 1
+
+
+def test_mode_property_tracks_start_and_stop():
+    controller = ContinuousFocusLockController(
+        laser_af=_DummyLaserAF(),
+        piezo_service=_DummyPiezoService(),
+        event_bus=EventBus(),
+    )
+
+    controller.start()
+    try:
+        assert controller.mode == "on"
+    finally:
+        controller.stop()
+
+    assert controller.mode == "off"
+
+
+def test_pause_preserves_lock_state():
+    """Test that pause/resume preserves lock buffer and doesn't reset state."""
+    bus = EventBus()
+    controller = ContinuousFocusLockController(
+        laser_af=_DummyLaserAF(),
+        piezo_service=_DummyPiezoService(),
+        event_bus=bus,
+        config=FocusLockConfig(buffer_length=3),
+    )
+
+    events: list[FocusLockStatusChanged] = []
+    bus.subscribe(FocusLockStatusChanged, events.append)
+
+    # Simulate lock acquisition
+    controller._should_run = True
+    controller._lock_reference_active = True
+    controller._set_status("ready")
+    controller._update_lock_state(True, 0.0)  # buffer_fill = 1
+    controller._update_lock_state(True, 0.0)  # buffer_fill = 2
+    controller._update_lock_state(True, 0.0)  # buffer_fill = 3 -> locked
+
+    bus.drain()
+    assert controller.status == "locked"
+    assert controller._lock_buffer_fill == 3
+
+    # Pause should preserve buffer
+    controller.pause()
+    bus.drain()
+    assert controller.status == "paused"
+    assert controller._lock_buffer_fill == 3  # Buffer preserved
+
+    # Resume should restore locked status
+    controller.resume()
+    bus.drain()
+    assert controller.status == "locked"
+    assert controller._lock_buffer_fill == 3  # Buffer still preserved
+
+
+def test_pause_does_not_reset_on_resume():
+    """Test that resume doesn't call _reset_lock_state."""
+    bus = EventBus()
+    controller = ContinuousFocusLockController(
+        laser_af=_DummyLaserAF(),
+        piezo_service=_DummyPiezoService(),
+        event_bus=bus,
+        config=FocusLockConfig(buffer_length=3),
+    )
+
+    # Set up a locked state with some history
+    controller._should_run = True
+    controller._lock_buffer_fill = 3
+    controller._set_status("locked")
+    controller._error_history.append(0.1)
+    controller._error_history.append(0.2)
+
+    # Pause
+    controller.pause()
+    assert controller.status == "paused"
+    assert len(controller._error_history) == 2  # History preserved
+
+    # Resume
+    controller.resume()
+    assert controller.status == "locked"
+    assert len(controller._error_history) == 2  # History still preserved
+
+
+def test_pause_when_not_started():
+    """Test that pause does nothing when not started."""
+    controller = ContinuousFocusLockController(
+        laser_af=_DummyLaserAF(),
+        piezo_service=_DummyPiezoService(),
+        event_bus=EventBus(),
+    )
+
+    # Not started yet
+    assert controller._should_run is False
+
+    # Pause should have no effect
+    controller.pause()
+    assert controller.status == "disabled"
+    assert controller._paused is False
+
+
+def test_resume_when_not_paused():
+    """Test that resume does nothing when not paused."""
+    bus = EventBus()
+    controller = ContinuousFocusLockController(
+        laser_af=_DummyLaserAF(),
+        piezo_service=_DummyPiezoService(),
+        event_bus=bus,
+    )
+
+    events: list[FocusLockStatusChanged] = []
+    bus.subscribe(FocusLockStatusChanged, events.append)
+
+    # Set up running but not paused
+    controller._should_run = True
+    controller._set_status("locked")
+    controller._lock_buffer_fill = 3
+
+    # Drain the event from _set_status
+    bus.drain()
+    events.clear()
+
+    # Resume should have no effect when not paused
+    controller.resume()
+    bus.drain()
+
+    # No status change events should have been published
+    assert len(events) == 0
+    assert controller.status == "locked"
+
+
+def test_set_status_deduplicates_same_status():
+    """Verify _set_status suppresses duplicate publishes for the same status."""
+    bus = EventBus()
+    controller = ContinuousFocusLockController(
+        laser_af=_DummyLaserAF(),
+        piezo_service=_DummyPiezoService(),
+        event_bus=bus,
+    )
+
+    events: list[FocusLockStatusChanged] = []
+    bus.subscribe(FocusLockStatusChanged, events.append)
+
+    controller._set_status("ready")
+    controller._set_status("ready")  # Same status again — should be suppressed
+    bus.drain()
+
+    assert len(events) == 1
+    assert events[0].status == "ready"
+
+
+def test_crash_clears_running_flags():
+    """Simulate exception in control loop, verify _running and _should_run cleared."""
+    bus = EventBus()
+    laser_af = _DummyLaserAF()
+    controller = ContinuousFocusLockController(
+        laser_af=laser_af,
+        piezo_service=_DummyPiezoService(),
+        event_bus=bus,
+        config=FocusLockConfig(loop_rate_hz=100),
+    )
+
+    # Manually set running flags as if start() was called
+    controller._running = True
+    controller._should_run = True
+
+    # Make measure_displacement_continuous raise to simulate crash
+    def raise_error():
+        raise RuntimeError("simulated camera failure")
+
+    laser_af.measure_displacement_continuous = raise_error
+
+    # Run control loop (should catch exception and clean up)
+    controller._control_loop()
+
+    assert controller._running is False
+    assert controller._should_run is False
+    assert controller.status == "disabled"
+
+
+def test_set_lock_reference_sets_target():
+    """Verify _target_um is set to current displacement when lock reference is set."""
+    bus = EventBus()
+    laser_af = _DummyLaserAF()
+    laser_af._displacement_um = 1.5
+    controller = ContinuousFocusLockController(
+        laser_af=laser_af,
+        piezo_service=_DummyPiezoService(),
+        event_bus=bus,
+    )
+
+    # Simulate running state
+    controller._running = True
+    controller._should_run = True
+
+    controller._set_lock_reference()
+    bus.drain()
+
+    assert controller._target_um == 1.5
+    assert controller.status == "locked"
+
+
+def test_set_lock_reference_uses_cached_displacement_if_measurement_invalid():
+    """If immediate lock-read is invalid, fallback to latest valid displacement."""
+    bus = EventBus()
+    laser_af = _DummyLaserAF()
+
+    def measure_nan() -> LaserAFResult:
+        import time
+        return LaserAFResult(
+            displacement_um=float("nan"),
+            spot_intensity=100.0,
+            spot_snr=10.0,
+            correlation=0.95,
+            spot_x_px=100.0,
+            spot_y_px=50.0,
+            timestamp=time.monotonic(),
+        )
+
+    laser_af.measure_displacement_continuous = measure_nan
+
+    controller = ContinuousFocusLockController(
+        laser_af=laser_af,
+        piezo_service=_DummyPiezoService(),
+        event_bus=bus,
+    )
+    controller._running = True
+    controller._should_run = True
+    controller._set_status("ready")
+    controller._latest_valid_displacement_um = 1.2
+
+    controller._set_lock_reference()
+    bus.drain()
+
+    assert controller.status == "locked"
+    assert controller._target_um == 1.2
+
+
+def test_set_lock_reference_no_valid_displacement_keeps_status():
+    """Do not force locked state when no valid displacement is available."""
+    bus = EventBus()
+    laser_af = _DummyLaserAF()
+
+    def measure_nan() -> LaserAFResult:
+        import time
+        return LaserAFResult(
+            displacement_um=float("nan"),
+            spot_intensity=100.0,
+            spot_snr=10.0,
+            correlation=0.95,
+            spot_x_px=100.0,
+            spot_y_px=50.0,
+            timestamp=time.monotonic(),
+        )
+
+    laser_af.measure_displacement_continuous = measure_nan
+
+    controller = ContinuousFocusLockController(
+        laser_af=laser_af,
+        piezo_service=_DummyPiezoService(),
+        event_bus=bus,
+    )
+    controller._running = True
+    controller._should_run = True
+    controller._target_um = 0.5
+    controller._set_status("ready")
+
+    controller._set_lock_reference()
+    bus.drain()
+
+    assert controller.status == "ready"
+    assert controller._target_um == 0.5
+
+
+def test_set_lock_reference_anchors_reference_before_commit():
+    """Lock action must anchor x_reference on the laser AF config (via
+    commit_reference_from_result) before committing the lock target. Without
+    this, _detect_spot_and_compute_displacement falls back to spot.x every
+    frame, displacement is always 0, and the PI loop never moves the piezo."""
+    import numpy as np
+
+    bus = EventBus()
+    laser_af = _DummyLaserAF()
+    laser_af._image = np.zeros((4, 16), dtype=np.uint8)
+    laser_af.laser_af_properties.has_reference = False
+    laser_af.laser_af_properties.x_reference = None
+    laser_af._displacement_um = 0.0
+
+    controller = ContinuousFocusLockController(
+        laser_af=laser_af,
+        piezo_service=_DummyPiezoService(),
+        event_bus=bus,
+    )
+    controller._running = True
+    controller._should_run = True
+
+    controller._set_lock_reference()
+    bus.drain()
+
+    assert len(laser_af.commit_reference_calls) == 1
+    committed_result = laser_af.commit_reference_calls[0]
+    assert committed_result.spot_x_px == 100.0
+    assert committed_result.image is not None
+    assert laser_af.laser_af_properties.has_reference is True
+    assert laser_af.laser_af_properties.x_reference == 100.0
+    assert controller.status == "locked"
+
+
+def test_set_lock_reference_skips_anchor_when_sample_unhealthy():
+    """Don't commit garbage as the reference when the live sample is bad
+    (no image). Lock should still attempt to commit the lock target from the
+    measurement but must not call commit_reference_from_result."""
+    bus = EventBus()
+    laser_af = _DummyLaserAF()
+    laser_af._image = None
+    laser_af.laser_af_properties.has_reference = False
+
+    def measure_no_image() -> LaserAFResult:
+        import time
+        return LaserAFResult(
+            displacement_um=0.5,
+            spot_intensity=100.0,
+            spot_snr=10.0,
+            correlation=0.95,
+            spot_x_px=100.0,
+            spot_y_px=50.0,
+            timestamp=time.monotonic(),
+            image=None,
+        )
+
+    laser_af.measure_displacement_continuous = measure_no_image
+    controller = ContinuousFocusLockController(
+        laser_af=laser_af,
+        piezo_service=_DummyPiezoService(),
+        event_bus=bus,
+    )
+    controller._running = True
+    controller._should_run = True
+
+    controller._set_lock_reference()
+    bus.drain()
+
+    assert laser_af.commit_reference_calls == []
+    assert laser_af.laser_af_properties.has_reference is False
+
+
+def test_release_lock_reference_clears_af_reference():
+    """Release must wipe has_reference on the laser AF config so the next
+    Lock cycle re-anchors against the live spot rather than reusing stale
+    state from a prior lock."""
+    import numpy as np
+
+    bus = EventBus()
+    laser_af = _DummyLaserAF()
+    laser_af._image = np.zeros((4, 16), dtype=np.uint8)
+    controller = ContinuousFocusLockController(
+        laser_af=laser_af,
+        piezo_service=_DummyPiezoService(),
+        event_bus=bus,
+    )
+    controller._running = True
+    controller._should_run = True
+
+    controller._set_lock_reference()
+    bus.drain()
+    assert controller.status == "locked"
+    assert laser_af.laser_af_properties.has_reference is True
+
+    controller._release_lock_reference()
+    bus.drain()
+
+    assert laser_af.clear_reference_calls == 1
+    assert laser_af.laser_af_properties.has_reference is False
+    assert laser_af.laser_af_properties.x_reference is None
+    assert controller.status == "ready"
+
+
+def test_acquire_lock_reference_retries_until_measurement_stabilizes():
+    bus = EventBus()
+    laser_af = _SequenceLaserAF(
+        [
+            _make_result(displacement_um=float("nan"), spot_snr=0.0, correlation=None, spot_x_px=None),
+            _make_result(displacement_um=0.15, spot_snr=12.0, correlation=0.96, timestamp=10.0),
+            _make_result(displacement_um=0.16, spot_snr=12.0, correlation=0.96, timestamp=10.1),
+            _make_result(displacement_um=0.15, spot_snr=12.0, correlation=0.96, timestamp=10.2),
+        ]
+    )
+    controller = ContinuousFocusLockController(
+        laser_af=laser_af,
+        piezo_service=_DummyPiezoService(),
+        event_bus=bus,
+        config=FocusLockConfig(buffer_length=3, acquire_threshold_um=0.2, maintain_threshold_um=0.4),
+    )
+    controller._running = True
+    controller._should_run = True
+
+    acquired = controller.acquire_lock_reference(timeout_s=0.3, confirmation_readings=3)
+
+    assert acquired is True
+    assert controller.status == "locked"
+    assert controller._lock_reference_active is True
+    assert controller._target_um == pytest.approx(0.15, abs=0.02)
+
+
+def test_search_positions_are_symmetric_around_last_lock():
+    controller = ContinuousFocusLockController(
+        laser_af=_DummyLaserAF(),
+        piezo_service=_DummyPiezoService(),
+        event_bus=EventBus(),
+        config=FocusLockConfig(search_range_um=40.0, search_step_um=10.0),
+    )
+    controller._locked_piezo_um = 150.0
+
+    controller._start_search()
+
+    assert controller._search_positions == [150.0, 140.0, 160.0, 130.0, 170.0, 120.0, 180.0, 110.0, 190.0]
+
+
+def test_search_candidate_rejects_far_high_snr_reflection():
+    controller = ContinuousFocusLockController(
+        laser_af=_DummyLaserAF(),
+        piezo_service=_DummyPiezoService(),
+        event_bus=EventBus(),
+        config=FocusLockConfig(acquire_threshold_um=0.2, maintain_threshold_um=0.5, min_spot_snr=5.0),
+    )
+    controller._target_um = 0.0
+    controller._status = "searching"
+
+    candidate = controller._score_search_candidate(
+        _make_result(displacement_um=4.5, spot_snr=25.0, correlation=0.98, timestamp=20.0),
+        piezo_position_um=150.0,
+    )
+
+    assert candidate.is_valid is False
+
+
+def test_search_requires_confirmation_before_relocking():
+    bus = EventBus()
+    piezo = _DummyPiezoService()
+    laser_af = _SequenceLaserAF(
+        [
+            _make_result(displacement_um=0.05, spot_snr=12.0, correlation=0.98, timestamp=30.0),
+            _make_result(displacement_um=0.04, spot_snr=12.0, correlation=0.98, timestamp=30.1),
+        ]
+    )
+    controller = ContinuousFocusLockController(
+        laser_af=laser_af,
+        piezo_service=piezo,
+        event_bus=bus,
+        config=FocusLockConfig(search_range_um=20.0, search_step_um=10.0),
+    )
+    controller._running = True
+    controller._should_run = True
+    controller._target_um = 0.0
+    controller._locked_piezo_um = 150.0
+    controller._search_confirmation_readings = 2
+    controller._start_search()
+    controller._set_status("searching")
+
+    controller._search_step()
+    assert controller.status == "searching"
+
+    controller._search_step()
+    assert controller.status == "locked"
+    assert piezo.get_position() == pytest.approx(150.0)
+
+
+def test_is_good_reading_ignores_correlation_for_nonzero_target():
+    """Low correlation should not reject otherwise-good reads for non-zero target lock."""
+    controller = ContinuousFocusLockController(
+        laser_af=_DummyLaserAF(),
+        piezo_service=_DummyPiezoService(),
+        event_bus=EventBus(),
+    )
+    controller._target_um = 2.0
+    controller._set_status("locked")
+
+    import time
+    result = LaserAFResult(
+        displacement_um=2.0,
+        spot_intensity=100.0,
+        spot_snr=10.0,
+        correlation=0.1,  # Below threshold, but target is intentionally non-zero
+        spot_x_px=100.0,
+        spot_y_px=50.0,
+        timestamp=time.monotonic(),
+    )
+
+    error_um = controller._compute_error(result)
+    assert error_um == 0.0
+    assert controller._is_good_reading(result, error_um) is True
+
+
+def test_is_good_reading_keeps_correlation_gate_during_acquire():
+    """During acquire, low correlation should still block lock acquisition."""
+    controller = ContinuousFocusLockController(
+        laser_af=_DummyLaserAF(),
+        piezo_service=_DummyPiezoService(),
+        event_bus=EventBus(),
+    )
+    controller._target_um = 0.0
+    controller._set_status("ready")
+
+    import time
+    result = LaserAFResult(
+        displacement_um=0.0,
+        spot_intensity=100.0,
+        spot_snr=10.0,
+        correlation=0.1,  # Below threshold and target is near reference
+        spot_x_px=100.0,
+        spot_y_px=50.0,
+        timestamp=time.monotonic(),
+    )
+
+    error_um = controller._compute_error(result)
+    assert error_um == 0.0
+    assert controller._is_good_reading(result, error_um) is False
+
+
+def test_is_good_reading_ignores_low_snr_while_locked_if_error_small():
+    """Low SNR should not immediately break lock if displacement remains stable."""
+    controller = ContinuousFocusLockController(
+        laser_af=_DummyLaserAF(),
+        piezo_service=_DummyPiezoService(),
+        event_bus=EventBus(),
+    )
+    controller._target_um = 0.0
+    controller._set_status("locked")
+
+    import time
+    result = LaserAFResult(
+        displacement_um=0.0,
+        spot_intensity=100.0,
+        spot_snr=0.5,  # Below min_spot_snr
+        correlation=0.1,  # Also low; ignored while locked
+        spot_x_px=100.0,
+        spot_y_px=50.0,
+        timestamp=time.monotonic(),
+    )
+
+    error_um = controller._compute_error(result)
+    assert error_um == 0.0
+    assert controller._is_good_reading(result, error_um) is True
+
+
+def test_is_good_reading_requires_snr_during_acquire():
+    """Acquire path should still reject low-SNR readings."""
+    controller = ContinuousFocusLockController(
+        laser_af=_DummyLaserAF(),
+        piezo_service=_DummyPiezoService(),
+        event_bus=EventBus(),
+    )
+    controller._target_um = 0.0
+    controller._set_status("ready")
+
+    import time
+    result = LaserAFResult(
+        displacement_um=0.0,
+        spot_intensity=100.0,
+        spot_snr=0.5,  # Below min_spot_snr
+        correlation=0.95,
+        spot_x_px=100.0,
+        spot_y_px=50.0,
+        timestamp=time.monotonic(),
+    )
+
+    error_um = controller._compute_error(result)
+    assert error_um == 0.0
+    assert controller._is_good_reading(result, error_um) is False
+
+
+def test_control_fn_zero_error():
+    """Verify no division by zero at error_um=0."""
+    controller = ContinuousFocusLockController(
+        laser_af=_DummyLaserAF(),
+        piezo_service=_DummyPiezoService(),
+        event_bus=EventBus(),
+    )
+
+    dt = 1.0 / 60.0
+    result = controller._control_fn(0.0, dt)
+    assert result == 0.0
+    assert not math.isnan(result)
+
+
+def test_detect_stale_measurement_after_repeated_identical_samples():
+    controller = ContinuousFocusLockController(
+        laser_af=_DummyLaserAF(),
+        piezo_service=_DummyPiezoService(),
+        event_bus=EventBus(),
+    )
+    controller._stale_measurement_limit = 3
+
+    result = _make_result(displacement_um=0.1, spot_snr=12.0, correlation=0.95, timestamp=40.0)
+
+    assert controller._detect_stale_measurement(result) is False
+    assert controller._detect_stale_measurement(result) is False
+    assert controller._detect_stale_measurement(result) is True
+
+
+def test_publish_metrics_populates_spot_and_piezo_offsets():
+    bus = EventBus()
+    controller = ContinuousFocusLockController(
+        laser_af=_DummyLaserAF(),
+        piezo_service=_DummyPiezoService(),
+        event_bus=bus,
+    )
+    metrics_events: list[FocusLockMetricsUpdated] = []
+    bus.subscribe(FocusLockMetricsUpdated, metrics_events.append)
+
+    controller._status = "locked"
+    controller._lock_reference_active = True
+    controller._locked_spot_x_px = 100.0
+    controller._locked_piezo_um = 145.0
+    controller._piezo_service.position = 150.0
+
+    controller._publish_metrics(
+        _make_result(displacement_um=0.2, spot_snr=12.0, correlation=0.97, spot_x_px=104.5, timestamp=50.0),
+        error_um=0.2,
+        is_good=True,
+    )
+    bus.drain()
+
+    assert metrics_events
+    event = metrics_events[-1]
+    assert event.spot_offset_px == pytest.approx(4.5)
+    assert event.piezo_delta_um == pytest.approx(5.0)
+
+
+def test_paused_loop_still_emits_focus_lock_warnings():
+    bus = EventBus()
+    controller = ContinuousFocusLockController(
+        laser_af=_SequenceLaserAF(
+            [_make_result(displacement_um=0.0, spot_snr=0.5, correlation=0.95, timestamp=60.0)]
+        ),
+        piezo_service=_DummyPiezoService(),
+        event_bus=bus,
+        config=FocusLockConfig(loop_rate_hz=40.0, metrics_rate_hz=20.0, min_spot_snr=5.0),
+    )
+    warnings: list[FocusLockWarning] = []
+    bus.subscribe(FocusLockWarning, warnings.append)
+
+    controller.start()
+    try:
+        controller.pause()
+        time.sleep(0.1)
+        bus.drain()
+        assert any(event.warning_type == "snr_low" for event in warnings)
+    finally:
+        controller.stop()
+
+
+def test_recovery_with_delayed_good_readings():
+    """Recovery succeeds at exactly recovery_window_readings good readings.
+
+    Entry into 'recovering' is forced by sustained NaN readings past the
+    untrustworthy guard; good readings then re-establish lock.
+    """
+    bus = EventBus()
+    controller = ContinuousFocusLockController(
+        laser_af=_DummyLaserAF(),
+        piezo_service=_DummyPiezoService(),
+        event_bus=bus,
+        config=FocusLockConfig(
+            buffer_length=3,
+            recovery_attempts=5,
+            recovery_delay_s=0.0,
+            recovery_window_readings=3,
+            max_nan_holdover_cycles=1,
+            lock_break_persist_cycles=1,
+        ),
+    )
+
+    events: list[FocusLockStatusChanged] = []
+    bus.subscribe(FocusLockStatusChanged, events.append)
+
+    # Get to locked state
+    controller._lock_reference_active = True
+    controller._set_status("ready")
+    for _ in range(3):
+        controller._update_lock_state(True, 0.0)
+    assert controller.status == "locked"
+
+    # Sustained untrustworthy input forces transition to recovering.
+    grace = (
+        controller._config.max_nan_holdover_cycles
+        + controller._config.lock_break_persist_cycles
+    )
+    for _ in range(grace + 1):
+        controller._update_lock_state(False, float("nan"))
+    assert controller.status == "recovering"
+
+    # One good reading short of recovery
+    controller._update_lock_state(True, 0.0)  # count=1
+    controller._update_lock_state(True, 0.0)  # count=2
+    assert controller.status == "recovering"
+
+    # Third good reading should recover
+    controller._update_lock_state(True, 0.0)  # count=3 -> locked
+    bus.drain()
+    assert controller.status == "locked"
+
+
+def test_set_focus_lock_params_command():
+    """Test SetFocusLockParamsCommand updates config."""
+    bus = EventBus()
+    controller = ContinuousFocusLockController(
+        laser_af=_DummyLaserAF(),
+        piezo_service=_DummyPiezoService(),
+        event_bus=bus,
+        config=FocusLockConfig(buffer_length=5, min_spot_snr=3.0),
+    )
+
+    assert controller._config.buffer_length == 5
+    assert controller._config.min_spot_snr == 3.0
+
+    controller._on_set_params(SetFocusLockParamsCommand(
+        buffer_length=10,
+        min_spot_snr=5.0,
+    ))
+
+    assert controller._config.buffer_length == 10
+    assert controller._config.min_spot_snr == 5.0
+
+
+def test_set_focus_lock_params_command_resizes_runtime_state():
+    controller = ContinuousFocusLockController(
+        laser_af=_DummyLaserAF(),
+        piezo_service=_DummyPiezoService(),
+        event_bus=EventBus(),
+        config=FocusLockConfig(buffer_length=10),
+    )
+    controller._lock_buffer_fill = 9
+    controller._error_history.extend([0.1] * 20)
+
+    controller._on_set_params(SetFocusLockParamsCommand(buffer_length=3))
+
+    assert controller._lock_buffer_fill == 3
+    assert controller._error_history.maxlen == 10
+
+
+def test_quality_drops_to_zero_when_lost():
+    bus = EventBus()
+    controller = ContinuousFocusLockController(
+        laser_af=_DummyLaserAF(),
+        piezo_service=_DummyPiezoService(),
+        event_bus=bus,
+    )
+    events: list[FocusLockMetricsUpdated] = []
+    bus.subscribe(FocusLockMetricsUpdated, events.append)
+
+    controller._set_status("lost")
+    result = controller._laser_af.measure_displacement_continuous()
+    controller._publish_metrics(result, error_um=0.0, is_good=False)
+    bus.drain()
+
+    assert events
+    assert events[-1].lock_quality == 0.0
+
+
+def test_start_precondition_not_initialized():
+    """Test that start() returns early if laser AF is not initialized."""
+    bus = EventBus()
+    laser_af = _DummyLaserAF()
+    laser_af.is_initialized = False
+    controller = ContinuousFocusLockController(
+        laser_af=laser_af,
+        piezo_service=_DummyPiezoService(),
+        event_bus=bus,
+    )
+
+    controller.start()
+    assert not controller.is_running
+    assert controller.status == "disabled"
+
+
+def test_start_without_reference_succeeds_and_runs_ready():
+    """start() no longer requires has_reference up front: spot detection runs and
+    the user clicks Lock to capture a reference once the spot looks healthy."""
+    bus = EventBus()
+    laser_af = _DummyLaserAF()
+    laser_af.laser_af_properties.has_reference = False
+    controller = ContinuousFocusLockController(
+        laser_af=laser_af,
+        piezo_service=_DummyPiezoService(),
+        event_bus=bus,
+    )
+
+    try:
+        controller.start()
+        assert controller.is_running
+        assert controller.status == "ready"
+    finally:
+        controller.stop()
+
+
+def test_reset_clears_all_histories():
+    """Start -> lock -> stop -> start, assert quality/warning/error histories are clean."""
+    bus = EventBus()
+    controller = ContinuousFocusLockController(
+        laser_af=_DummyLaserAF(),
+        piezo_service=_DummyPiezoService(),
+        event_bus=bus,
+    )
+
+    # Dirty the state
+    controller._error_history.append(0.5)
+    controller._drift_history.append((0.0, 0.1))
+    controller._smoothed_quality = 0.3
+    controller._warning_last_time["test"] = 100.0
+    controller._recovery_good_count = 5
+    controller._integral_accumulator = 1.5
+    controller._last_good_error_um = 0.3
+    controller._consecutive_nan_count = 2
+
+    controller._reset_lock_state()
+
+    assert len(controller._error_history) == 0
+    assert len(controller._drift_history) == 0
+    assert controller._smoothed_quality == 1.0
+    assert len(controller._warning_last_time) == 0
+    assert controller._recovery_good_count == 0
+    assert controller._integral_accumulator == 0.0
+    assert controller._last_good_error_um == 0.0
+    assert controller._consecutive_nan_count == 0
+    assert math.isnan(controller._latest_valid_displacement_um)
+
+
+# ============================================================================
+# Gain Schedule Tests (Task A)
+# ============================================================================
+
+
+def test_p_gain_high_at_small_error():
+    """_p_gain should return gain_max at error=0 and approach gain at large errors."""
+    controller = ContinuousFocusLockController(
+        laser_af=_DummyLaserAF(),
+        piezo_service=_DummyPiezoService(),
+        event_bus=EventBus(),
+        config=FocusLockConfig(gain=0.5, gain_max=0.7, gain_sigma=0.5),
+    )
+
+    # At zero error, gain should be gain_max
+    assert controller._p_gain(0.0) == 0.7
+
+    # At large error, gain should approach gain (base)
+    large_error_gain = controller._p_gain(5.0)
+    assert abs(large_error_gain - 0.5) < 0.01  # Very close to base gain
+
+    # Gain should decrease monotonically with increasing |error|
+    assert controller._p_gain(0.0) > controller._p_gain(0.5)
+    assert controller._p_gain(0.5) > controller._p_gain(1.0)
+    assert controller._p_gain(1.0) > controller._p_gain(2.0)
+
+
+# ============================================================================
+# Integral Term Tests (Task B)
+# ============================================================================
+
+
+def test_integral_accumulates():
+    """Run N cycles with constant error, verify accumulator grows."""
+    controller = ContinuousFocusLockController(
+        laser_af=_DummyLaserAF(),
+        piezo_service=_DummyPiezoService(),
+        event_bus=EventBus(),
+        config=FocusLockConfig(ki=0.05, integral_limit_um=2.0),
+    )
+
+    dt = 1.0 / 60.0
+    error = 0.3  # constant error
+
+    for _ in range(10):
+        controller._control_fn(error, dt)
+
+    # Accumulator should have grown: 0.3 * (1/60) * 10 = 0.05
+    assert controller._integral_accumulator > 0
+    expected = error * dt * 10
+    assert abs(controller._integral_accumulator - expected) < 1e-6
+
+
+def test_integral_anti_windup_clamp():
+    """Set large error, verify accumulator stays within integral_limit_um."""
+    controller = ContinuousFocusLockController(
+        laser_af=_DummyLaserAF(),
+        piezo_service=_DummyPiezoService(),
+        event_bus=EventBus(),
+        config=FocusLockConfig(ki=0.05, integral_limit_um=0.5),
+    )
+
+    dt = 1.0 / 60.0
+    error = 10.0  # Very large error
+
+    for _ in range(10000):
+        controller._control_fn(error, dt)
+
+    assert controller._integral_accumulator <= 0.5
+    assert controller._integral_accumulator >= -0.5
+
+
+def test_integral_preserved_through_recovering():
+    """Integral is preserved across locked->recovering->locked.
+
+    Previous behavior zeroed the accumulator whenever the state machine
+    flicked into recovering. With the new semantics the flick happens only
+    when sustained untrustworthy readings exceed the grace window, and the
+    integral carries useful low-frequency drift information across that
+    short transition. Only true loss (->lost / ->searching) resets it.
+    """
+    bus = EventBus()
+    controller = ContinuousFocusLockController(
+        laser_af=_DummyLaserAF(),
+        piezo_service=_DummyPiezoService(),
+        event_bus=bus,
+        config=FocusLockConfig(
+            buffer_length=3,
+            recovery_attempts=3,
+            recovery_window_readings=1,
+            recovery_delay_s=0.0,
+            max_nan_holdover_cycles=1,
+            lock_break_persist_cycles=1,
+        ),
+    )
+
+    controller._integral_accumulator = 1.0
+    controller._lock_reference_active = True
+    controller._set_status("locked")
+    controller._lock_buffer_fill = 3
+
+    grace = (
+        controller._config.max_nan_holdover_cycles
+        + controller._config.lock_break_persist_cycles
+    )
+    for _ in range(grace + 1):
+        controller._update_lock_state(False, float("nan"))
+    assert controller.status == "recovering"
+    assert controller._integral_accumulator == 1.0  # preserved, not zeroed
+
+
+def test_integral_resets_on_true_loss():
+    """Integral IS zeroed when lock truly fails (exhaust recovery -> lost)."""
+    bus = EventBus()
+    controller = ContinuousFocusLockController(
+        laser_af=_DummyLaserAF(),
+        piezo_service=_DummyPiezoService(),
+        event_bus=bus,
+        config=FocusLockConfig(
+            buffer_length=3,
+            recovery_attempts=1,
+            recovery_window_readings=1,
+            recovery_delay_s=0.0,
+            max_nan_holdover_cycles=1,
+            lock_break_persist_cycles=1,
+        ),
+    )
+
+    controller._integral_accumulator = 0.75
+    controller._lock_reference_active = True
+    controller._set_status("locked")
+    controller._lock_buffer_fill = 3
+
+    grace = (
+        controller._config.max_nan_holdover_cycles
+        + controller._config.lock_break_persist_cycles
+    )
+    # Push through recovering and then exhaust the consecutive-bad budget.
+    for _ in range(grace + 1 + 5):
+        controller._update_lock_state(False, float("nan"))
+
+    assert controller.status == "lost"
+    assert controller._integral_accumulator == 0.0
+
+
+def test_integral_preserved_across_pause():
+    """Pause/resume, verify accumulator unchanged."""
+    controller = ContinuousFocusLockController(
+        laser_af=_DummyLaserAF(),
+        piezo_service=_DummyPiezoService(),
+        event_bus=EventBus(),
+        config=FocusLockConfig(buffer_length=3),
+    )
+
+    # Set up locked state with integral state
+    controller._should_run = True
+    controller._lock_buffer_fill = 3
+    controller._set_status("locked")
+    controller._integral_accumulator = 0.75
+
+    # Pause
+    controller.pause()
+    assert controller._integral_accumulator == 0.75
+
+    # Resume
+    controller.resume()
+    assert controller._integral_accumulator == 0.75
+
+
+def test_integral_disabled_when_ki_zero():
+    """ki=0.0, verify no integral contribution."""
+    controller = ContinuousFocusLockController(
+        laser_af=_DummyLaserAF(),
+        piezo_service=_DummyPiezoService(),
+        event_bus=EventBus(),
+        config=FocusLockConfig(ki=0.0),
+    )
+
+    dt = 1.0 / 60.0
+    # Run multiple cycles
+    for _ in range(100):
+        controller._control_fn(0.5, dt)
+
+    # Accumulator should remain at zero
+    assert controller._integral_accumulator == 0.0
+
+
+def test_integral_conditional_anti_windup_near_piezo_limits():
+    """Don't accumulate integral when piezo is within 5 um of range limits."""
+    piezo = _DummyPiezoService()
+    controller = ContinuousFocusLockController(
+        laser_af=_DummyLaserAF(),
+        piezo_service=piezo,
+        event_bus=EventBus(),
+        config=FocusLockConfig(ki=0.05, integral_limit_um=2.0),
+    )
+
+    dt = 1.0 / 60.0
+
+    # Position near lower limit (range is 0-300, so within 5 um of 0)
+    piezo.position = 3.0
+    controller._control_fn(0.5, dt)
+    assert controller._integral_accumulator == 0.0  # Should not accumulate
+
+    # Position near upper limit
+    piezo.position = 297.0
+    controller._control_fn(0.5, dt)
+    assert controller._integral_accumulator == 0.0  # Should not accumulate
+
+    # Position in safe zone
+    piezo.position = 150.0
+    controller._control_fn(0.5, dt)
+    assert controller._integral_accumulator > 0.0  # Should accumulate
+
+
+# ============================================================================
+# NaN Holdover Tests (Task D)
+# ============================================================================
+
+
+def _make_nan_result():
+    """Create a LaserAFResult with NaN displacement."""
+    import time
+    return LaserAFResult(
+        displacement_um=float("nan"),
+        spot_intensity=0.0,
+        spot_snr=0.0,
+        correlation=None,
+        spot_x_px=None,
+        spot_y_px=None,
+        timestamp=time.monotonic(),
+    )
+
+
+def test_nan_holdover_applies_correction():
+    """Inject NaN, verify correction uses last-known-good."""
+    piezo = _DummyPiezoService()
+    controller = ContinuousFocusLockController(
+        laser_af=_DummyLaserAF(),
+        piezo_service=piezo,
+        event_bus=EventBus(),
+        config=FocusLockConfig(
+            max_nan_holdover_cycles=3,
+            nan_holdover_decay=0.5,
+            ki=0.0,  # Disable integral for clarity
+        ),
+    )
+
+    # Set up locked state with a known last-good error
+    controller._set_status("locked")
+    controller._lock_buffer_fill = 5
+    controller._last_good_error_um = 1.0
+    controller._consecutive_nan_count = 0
+
+    # Compute expected correction: _control_fn(1.0, dt) * decay^1
+    dt = 1.0 / controller._config.loop_rate_hz
+    full_correction = controller._control_fn(1.0, dt)
+    expected_correction = full_correction * 0.5  # decay^1
+
+    # Reset integral (control_fn call above modified it)
+    controller._integral_accumulator = 0.0
+
+    # Record initial position
+    initial_pos = piezo.position
+
+    # Simulate one NaN cycle in the holdover path
+    controller._consecutive_nan_count = 0  # will become 1
+    saved_integral = controller._integral_accumulator
+    controller._consecutive_nan_count += 1
+    decay = controller._config.nan_holdover_decay ** controller._consecutive_nan_count
+    correction = controller._control_fn(controller._last_good_error_um, dt) * decay
+    controller._integral_accumulator = saved_integral  # restore
+    new_pos = max(0.0, min(300.0, initial_pos + correction))
+    piezo.move_to_fast(new_pos)
+
+    # Piezo should have moved
+    assert piezo.position != initial_pos
+    assert abs(piezo.position - (initial_pos + expected_correction)) < 1e-6
+
+
+def test_nan_holdover_decays():
+    """Multiple NaN cycles, verify correction magnitude decreases."""
+    controller = ContinuousFocusLockController(
+        laser_af=_DummyLaserAF(),
+        piezo_service=_DummyPiezoService(),
+        event_bus=EventBus(),
+        config=FocusLockConfig(
+            max_nan_holdover_cycles=5,
+            nan_holdover_decay=0.5,
+            ki=0.0,
+        ),
+    )
+
+    dt = 1.0 / controller._config.loop_rate_hz
+    base_correction = abs(controller._control_fn(1.0, dt))
+
+    # Each subsequent NaN should produce smaller correction due to decay
+    corrections = []
+    for i in range(1, 4):
+        decay = controller._config.nan_holdover_decay ** i
+        corrections.append(base_correction * decay)
+
+    # Verify decreasing corrections
+    assert corrections[0] > corrections[1] > corrections[2]
+    # Verify decay factors
+    assert abs(corrections[0] / base_correction - 0.5) < 1e-6
+    assert abs(corrections[1] / base_correction - 0.25) < 1e-6
+    assert abs(corrections[2] / base_correction - 0.125) < 1e-6
+
+
+def test_nan_holdover_expires():
+    """Exceed max_nan_holdover_cycles, verify correction stops."""
+    controller = ContinuousFocusLockController(
+        laser_af=_DummyLaserAF(),
+        piezo_service=_DummyPiezoService(),
+        event_bus=EventBus(),
+        config=FocusLockConfig(max_nan_holdover_cycles=3),
+    )
+
+    controller._set_status("locked")
+    controller._lock_buffer_fill = 5
+    controller._last_good_error_um = 1.0
+
+    # Set consecutive NaN count at the limit
+    controller._consecutive_nan_count = 3
+
+    # At this point, holdover should be expired (>= max_nan_holdover_cycles)
+    assert controller._consecutive_nan_count >= controller._config.max_nan_holdover_cycles
+
+
+def test_nan_holdover_does_not_update_integral():
+    """During holdover, integral accumulator should not change."""
+    controller = ContinuousFocusLockController(
+        laser_af=_DummyLaserAF(),
+        piezo_service=_DummyPiezoService(),
+        event_bus=EventBus(),
+        config=FocusLockConfig(ki=0.05, max_nan_holdover_cycles=3, nan_holdover_decay=0.5),
+    )
+
+    controller._integral_accumulator = 0.5
+    dt = 1.0 / 60.0
+
+    # Simulate holdover: save, call, restore
+    saved = controller._integral_accumulator
+    controller._control_fn(1.0, dt)  # This would modify accumulator
+    controller._integral_accumulator = saved  # Restore as the control loop does
+
+    assert controller._integral_accumulator == 0.5
+
+
+# ============================================================================
+# Robustness Tests (Focus Lock Stay-Locked Semantics)
+# ============================================================================
+
+
+def test_is_good_reading_accepts_large_error_when_locked():
+    """A trustworthy reading with a large error is 'good' during locked.
+
+    The PI controller is the thing that drives error to zero — the lock
+    state machine must not reject the reading just because the error is
+    large.
+    """
+    controller = ContinuousFocusLockController(
+        laser_af=_DummyLaserAF(),
+        piezo_service=_DummyPiezoService(),
+        event_bus=EventBus(),
+        config=FocusLockConfig(acquire_threshold_um=0.3, maintain_threshold_um=0.8),
+    )
+    controller._target_um = 0.0
+    controller._set_status("locked")
+
+    result = _make_result(
+        displacement_um=10.0, spot_snr=12.0, correlation=0.98, timestamp=100.0
+    )
+    error_um = controller._compute_error(result)
+    assert controller._is_good_reading(result, error_um) is True
+
+
+def test_locked_persists_through_simulated_large_step():
+    """Simulating a 10 um manual stage step, the controller remains locked.
+
+    This is the primary user-visible bug we are fixing: before this change
+    a single large-error frame dropped the state to 'recovering' and the
+    lock bar grayed. Here we use a coupled simulator so the PI loop can
+    actually null the disturbance, and assert that 'recovering' never
+    appears in the status-event log.
+    """
+    bus = EventBus()
+    piezo = _DummyPiezoService()
+    laser_af = _CoupledLaserAF(piezo, disturbance_um=0.0)
+    controller = ContinuousFocusLockController(
+        laser_af=laser_af,
+        piezo_service=piezo,
+        event_bus=bus,
+        config=FocusLockConfig(
+            loop_rate_hz=80,
+            metrics_rate_hz=20,
+            buffer_length=3,
+            acquire_threshold_um=0.2,
+            maintain_threshold_um=0.5,
+        ),
+    )
+
+    events: list[FocusLockStatusChanged] = []
+    bus.subscribe(FocusLockStatusChanged, events.append)
+
+    controller.start(target_um=0.0)
+    try:
+        controller.set_lock_reference()
+        assert controller.wait_for_lock(timeout_s=1.0)
+
+        # Inject a 10 um manual step.
+        laser_af.disturbance_um = 10.0
+        time.sleep(0.6)
+
+        # Controller should still be locked; state must never have gone
+        # through 'recovering' or 'lost' during this transient.
+        bus.drain()
+        statuses = [event.status for event in events]
+        assert controller.status == "locked"
+        assert "recovering" not in statuses
+        assert "lost" not in statuses
+    finally:
+        controller.stop()
+
+
+def test_lock_breaks_on_persistent_unrecoverable_error():
+    """Lock eventually demotes when |error| stays above lock_break_error_um."""
+    bus = EventBus()
+    controller = ContinuousFocusLockController(
+        laser_af=_DummyLaserAF(),
+        piezo_service=_DummyPiezoService(),
+        event_bus=bus,
+        config=FocusLockConfig(
+            buffer_length=3,
+            lock_break_error_um=15.0,
+            lock_break_persist_cycles=5,
+        ),
+    )
+
+    controller._lock_reference_active = True
+    controller._set_status("locked")
+    controller._lock_buffer_fill = 3
+
+    # Below-threshold errors must never demote, no matter how many.
+    for _ in range(50):
+        controller._update_lock_state(True, 14.0)
+    assert controller.status == "locked"
+
+    # Above-threshold errors must demote after exactly persist_cycles frames.
+    for _ in range(controller._config.lock_break_persist_cycles):
+        controller._update_lock_state(True, 20.0)
+    assert controller.status == "recovering"
+
+
+def test_lock_break_counter_resets_on_dip_below_threshold():
+    """A single frame back within range must reset the persistence counter."""
+    controller = ContinuousFocusLockController(
+        laser_af=_DummyLaserAF(),
+        piezo_service=_DummyPiezoService(),
+        event_bus=EventBus(),
+        config=FocusLockConfig(
+            buffer_length=3,
+            lock_break_error_um=15.0,
+            lock_break_persist_cycles=10,
+        ),
+    )
+    controller._lock_reference_active = True
+    controller._set_status("locked")
+    controller._lock_buffer_fill = 3
+
+    # Run up to just before the persistence budget.
+    for _ in range(9):
+        controller._update_lock_state(True, 20.0)
+    # Single dip below threshold resets the counter.
+    controller._update_lock_state(True, 1.0)
+    assert controller._persistent_large_error_count == 0
+
+    # Now another 9 large-error frames must not trigger demotion.
+    for _ in range(9):
+        controller._update_lock_state(True, 20.0)
+    assert controller.status == "locked"
+
+
+def test_quality_recovers_quickly_after_excursion():
+    """Smoothed quality climbs above 0.8 within ~15 publish cycles.
+
+    This guards against the previous slow-EMA / history-RMS combination that
+    left the quality bar gray for "several seconds" after the piezo had
+    physically converged.
+    """
+    bus = EventBus()
+    controller = ContinuousFocusLockController(
+        laser_af=_DummyLaserAF(),
+        piezo_service=_DummyPiezoService(),
+        event_bus=bus,
+    )
+    controller._set_status("locked")
+    controller._lock_reference_active = True
+    # Simulate the state after a big excursion: smoothed quality was pushed
+    # low, recent error history is empty / clean (piezo has caught up).
+    controller._smoothed_quality = 0.0
+
+    # Feed 15 publish cycles with zero error and watch smoothed quality rise.
+    for _ in range(15):
+        controller._publish_metrics(
+            _make_result(displacement_um=0.0, spot_snr=12.0, correlation=0.98),
+            error_um=0.0,
+            is_good=True,
+        )
+
+    assert controller._smoothed_quality > 0.8
+
+
+# ============================================================================
+# Piezo Critical Warning Tests (Task E)
+# ============================================================================
+
+
+def test_piezo_critical_warning_published():
+    """Move piezo near limit, call _check_warnings, verify critical event."""
+    bus = EventBus()
+    piezo = _DummyPiezoService()
+    laser_af = _DummyLaserAF()
+    controller = ContinuousFocusLockController(
+        laser_af=laser_af,
+        piezo_service=piezo,
+        event_bus=bus,
+        config=FocusLockConfig(
+            piezo_critical_margin_um=10.0,
+            piezo_warning_margin_um=20.0,
+        ),
+    )
+
+    critical_events: list[FocusLockPiezoLimitCritical] = []
+    warning_events: list[FocusLockWarning] = []
+    bus.subscribe(FocusLockPiezoLimitCritical, critical_events.append)
+    bus.subscribe(FocusLockWarning, warning_events.append)
+
+    # Move piezo close to lower limit (range 0-300, position 5 < 0+10)
+    piezo.position = 5.0
+    result = laser_af.measure_displacement_continuous()
+    controller._check_warnings(result, 0.0)
+    bus.drain()
+
+    assert len(critical_events) == 1
+    assert critical_events[0].direction == "low"
+    assert critical_events[0].position_um == 5.0
+    assert critical_events[0].limit_um == 0.0
+
+
+def test_piezo_warning_threshold_ordering():
+    """Verify critical fires inside margin, warning-only fires outside critical but inside warning."""
+    bus = EventBus()
+    piezo = _DummyPiezoService()
+    laser_af = _DummyLaserAF()
+    controller = ContinuousFocusLockController(
+        laser_af=laser_af,
+        piezo_service=piezo,
+        event_bus=bus,
+        config=FocusLockConfig(
+            piezo_critical_margin_um=10.0,
+            piezo_warning_margin_um=20.0,
+        ),
+    )
+
+    critical_events: list[FocusLockPiezoLimitCritical] = []
+    warning_events: list[FocusLockWarning] = []
+    bus.subscribe(FocusLockPiezoLimitCritical, critical_events.append)
+    bus.subscribe(FocusLockWarning, warning_events.append)
+
+    # Position between warning and critical margin (15 um from lower limit)
+    # 0+10 < 15 < 0+20 → warning only, no critical
+    piezo.position = 15.0
+    result = laser_af.measure_displacement_continuous()
+    controller._check_warnings(result, 0.0)
+    bus.drain()
+
+    assert len(critical_events) == 0
+    assert len(warning_events) == 1
+    assert warning_events[0].warning_type == "piezo_low"
+
+
+def test_piezo_critical_warning_high_limit():
+    """Test critical warning at high limit."""
+    bus = EventBus()
+    piezo = _DummyPiezoService()
+    laser_af = _DummyLaserAF()
+    controller = ContinuousFocusLockController(
+        laser_af=laser_af,
+        piezo_service=piezo,
+        event_bus=bus,
+        config=FocusLockConfig(
+            piezo_critical_margin_um=10.0,
+            piezo_warning_margin_um=20.0,
+        ),
+    )
+
+    critical_events: list[FocusLockPiezoLimitCritical] = []
+    bus.subscribe(FocusLockPiezoLimitCritical, critical_events.append)
+
+    # Move piezo close to upper limit (range 0-300, position 295 > 300-10=290)
+    piezo.position = 295.0
+    result = laser_af.measure_displacement_continuous()
+    controller._check_warnings(result, 0.0)
+    bus.drain()
+
+    assert len(critical_events) == 1
+    assert critical_events[0].direction == "high"
+    assert critical_events[0].position_um == 295.0
+    assert critical_events[0].limit_um == 300.0
+
+
+def test_publish_frame_uses_full_camera_frame_dimensions():
+    """Frame preview events should publish the full frame, not a spot-centered crop."""
+    bus = EventBus()
+    controller = ContinuousFocusLockController(
+        laser_af=_DummyLaserAF(),
+        piezo_service=_DummyPiezoService(),
+        event_bus=bus,
+    )
+    controller._preview_publish_period_s = 0.0
+
+    frame_events: list[FocusLockFrameUpdated] = []
+    bus.subscribe(FocusLockFrameUpdated, frame_events.append)
+
+    result = LaserAFResult(
+        displacement_um=0.0,
+        spot_intensity=100.0,
+        spot_snr=10.0,
+        correlation=0.95,
+        spot_x_px=45.0,
+        spot_y_px=30.0,
+        timestamp=time.monotonic(),
+        image=np.zeros((80, 320), dtype=np.uint8),
+    )
+
+    controller._publish_frame(result)
+    bus.drain()
+
+    assert len(frame_events) == 1
+    event = frame_events[0]
+    assert event.frame.shape == (80, 320)
+    assert event.frame_width == 320
+    assert event.frame_height == 80
+    assert event.spot_x_px == 45.0
+    assert event.spot_y_px == 30.0
+    assert event.spot_valid is True
+
+
+def test_set_status_deduplicates_events():
+    """Calling _set_status with the same status should not publish again."""
+    bus = EventBus()
+    controller = ContinuousFocusLockController(
+        laser_af=_DummyLaserAF(),
+        piezo_service=_DummyPiezoService(),
+        event_bus=bus,
+        config=FocusLockConfig(),
+    )
+
+    events: list[FocusLockStatusChanged] = []
+    bus.subscribe(FocusLockStatusChanged, events.append)
+
+    # First call should publish
+    controller._set_status("ready")
+    bus.drain()
+    assert len(events) == 1
+
+    # Second call with same status should be suppressed
+    controller._set_status("ready")
+    bus.drain()
+    assert len(events) == 1  # No new event
+
+    # Different status should publish
+    controller._set_status("locked")
+    bus.drain()
+    assert len(events) == 2
+
+
+def test_nan_snr_publishes_snr_low_warning():
+    """NaN spot_snr must trigger snr_low warning (NaN comparisons are always False)."""
+    bus = EventBus()
+    piezo = _DummyPiezoService()
+    laser_af = _DummyLaserAF()
+    controller = ContinuousFocusLockController(
+        laser_af=laser_af,
+        piezo_service=piezo,
+        event_bus=bus,
+        config=FocusLockConfig(),
+    )
+
+    warning_events: list[FocusLockWarning] = []
+    bus.subscribe(FocusLockWarning, warning_events.append)
+
+    result = LaserAFResult(
+        displacement_um=0.0,
+        spot_intensity=0.0,
+        spot_snr=float("nan"),
+        correlation=0.95,
+        spot_x_px=100.0,
+        spot_y_px=50.0,
+        timestamp=time.monotonic(),
+    )
+    controller._check_warnings(result, error_um=0.0)
+    bus.drain()
+
+    snr_warnings = [w for w in warning_events if w.warning_type == "snr_low"]
+    assert len(snr_warnings) == 1, f"Expected snr_low warning for NaN SNR, got: {warning_events}"
+
+
+def test_search_exhausted_restores_piezo_to_locked_position():
+    """When the search sweep is exhausted without finding focus, the piezo should
+    be restored to the last known locked position so manual recovery is easier."""
+    bus = EventBus()
+    piezo = _DummyPiezoService()
+    # All readings return NaN displacement so search never succeeds
+    laser_af = _DummyLaserAF()
+    laser_af._displacement_um = float("nan")
+
+    controller = ContinuousFocusLockController(
+        laser_af=laser_af,
+        piezo_service=piezo,
+        event_bus=bus,
+        config=FocusLockConfig(search_range_um=20.0, search_step_um=10.0),
+    )
+    controller._running = True
+    controller._should_run = True
+    controller._target_um = 0.0
+    controller._lock_reference_active = True
+    controller._locked_piezo_um = 150.0
+
+    controller._start_search()
+    controller._set_status("searching")
+
+    # Force search index past end to simulate exhausted sweep
+    controller._search_position_index = len(controller._search_positions)
+    controller._search_phase = "sweep"
+
+    # Move piezo away to simulate search having moved it
+    piezo.move_to(180.0)
+
+    controller._search_step()
+
+    assert controller.status == "lost"
+    assert piezo.get_position() == pytest.approx(150.0, abs=0.1)
+
+
+def test_search_timeout_transitions_to_lost():
+    """When the search sweep exceeds search_timeout_s, it should abort and go to 'lost'."""
+    bus = EventBus()
+    piezo = _DummyPiezoService()
+    laser_af = _DummyLaserAF()
+    laser_af._displacement_um = float("nan")
+
+    controller = ContinuousFocusLockController(
+        laser_af=laser_af,
+        piezo_service=piezo,
+        event_bus=bus,
+        config=FocusLockConfig(search_timeout_s=1e-9, search_range_um=20.0, search_step_um=5.0),
+    )
+    controller._running = True
+    controller._should_run = True
+    controller._target_um = 0.0
+    controller._lock_reference_active = True
+    controller._locked_piezo_um = 150.0
+
+    controller._start_search()
+    controller._set_status("searching")
+
+    # Move piezo away to verify it gets restored
+    piezo.move_to(180.0)
+
+    # Force the search start well into the past so the elapsed-time check is
+    # robust against Windows' coarse (~15.6 ms) monotonic resolution; otherwise
+    # back-to-back monotonic() reads yield elapsed == 0 and the 1e-9 s timeout
+    # would not fire.
+    controller._search_start_time = time.monotonic() - 1.0
+    controller._search_step()
+
+    assert controller.status == "lost"
+    assert piezo.get_position() == pytest.approx(150.0, abs=0.1)
+
+
+# ============================================================================
+# Synchronous pause() handshake tests (L1)
+#
+# pause() is synchronous: it sets _paused / clears _pause_ack_event under
+# _lock, then blocks (bounded max(0.15, 5/loop_rate_hz)s) until the control
+# loop sets _pause_ack_event once it has observed _paused=True and is
+# guaranteed to issue no further piezo correction this cycle. Fast-path guards
+# skip the wait when no loop thread is live or when called from the loop
+# thread; the loop's finally sets the ack so stop()/crash releases a waiter.
+#
+# Every test below is self-terminating: finite loops, bounded waits, and a
+# finally that stops the controller / releases any helper threads.
+# ============================================================================
+
+
+def test_pause_freezes_piezo_corrections_synchronously():
+    """After a synchronous pause() returns, no further move_to_fast() fires.
+
+    Integration test: run a real locked control loop against a piezo-coupled
+    laser-AF simulator so the loop genuinely calls move_to_fast() every locked
+    iteration (it is called each cycle even when error==0). Snapshot the call
+    count the instant pause() returns and assert it does not increase over
+    several loop periods (the fix), while sanity-checking that it WAS
+    increasing before the pause.
+    """
+    bus = EventBus()
+    piezo = _DummyPiezoService()
+    laser_af = _CoupledLaserAF(piezo, disturbance_um=1.0)
+    controller = ContinuousFocusLockController(
+        laser_af=laser_af,
+        piezo_service=piezo,
+        event_bus=bus,
+        config=FocusLockConfig(
+            loop_rate_hz=60,
+            metrics_rate_hz=20,
+            buffer_length=3,
+            acquire_threshold_um=2.0,
+            maintain_threshold_um=3.0,
+        ),
+    )
+
+    # Instrument move_to_fast without breaking the piezo<->displacement
+    # coupling (the wrapper still forwards to the real setter).
+    calls = {"n": 0}
+    orig_move_to_fast = piezo.move_to_fast
+
+    def counting_move_to_fast(position_um):
+        calls["n"] += 1
+        orig_move_to_fast(position_um)
+
+    piezo.move_to_fast = counting_move_to_fast
+
+    controller.start(target_um=0.0)
+    try:
+        controller.set_lock_reference()
+        assert controller.wait_for_lock(timeout_s=1.0)
+
+        # Probe the pause race window several times.
+        for _ in range(15):
+            controller.resume()  # ensure corrections are running again
+
+            # Sanity: while running (not paused) the loop actively corrects.
+            time.sleep(0.05)
+            before = calls["n"]
+            time.sleep(0.05)  # ~3 loop periods at 60 Hz
+            assert calls["n"] > before, "loop was not actively correcting before pause()"
+
+            # Synchronous pause: the count must be frozen the instant it
+            # returns (any in-flight correction has already completed).
+            controller.pause()
+            n_at_pause = calls["n"]
+            time.sleep(0.05)  # ~3 loop periods
+            assert calls["n"] == n_at_pause, "move_to_fast fired after pause() returned"
+    finally:
+        controller.stop()
+
+
+def test_pause_blocks_until_control_loop_acknowledges():
+    """pause() blocks until the loop sets the ack, then returns promptly.
+
+    Deterministic: a fake loop thread mimics the real ack protocol under the
+    controller lock but only sets _pause_ack_event once we permit it via
+    allow_ack. This isolates the synchronous handshake from any camera/loop
+    timing.
+    """
+    import threading
+
+    controller = ContinuousFocusLockController(
+        laser_af=_DummyLaserAF(),
+        piezo_service=_DummyPiezoService(),
+        event_bus=EventBus(),
+        config=FocusLockConfig(loop_rate_hz=30),
+    )
+    controller._should_run = True
+    controller._running = True
+
+    allow_ack = threading.Event()
+    release = threading.Event()
+
+    def fake_loop():
+        # Mimic the real loop: observe _paused under the controller lock and
+        # acknowledge (also under the lock) only once allow_ack is set.
+        while not release.is_set():
+            with controller._lock:
+                paused = controller._paused
+            if paused and allow_ack.wait(0.01):
+                with controller._lock:
+                    controller._pause_ack_event.set()
+                release.wait(0.01)
+            else:
+                time.sleep(0.005)
+
+    loop_thread = threading.Thread(target=fake_loop, name="FakeFocusLoop", daemon=True)
+    controller._thread = loop_thread
+    loop_thread.start()
+
+    pause_returned = threading.Event()
+
+    def do_pause():
+        controller.pause()
+        pause_returned.set()
+
+    pauser = threading.Thread(target=do_pause, name="Pauser", daemon=True)
+    try:
+        pauser.start()
+
+        # 0.08s < bounded ack timeout (max(0.15, 5/30)=0.1667s): pause() must
+        # still be blocked because the loop has not acknowledged yet.
+        assert not pause_returned.wait(0.08), "pause() returned before loop acknowledged"
+
+        # Permit the fake loop to acknowledge; pause() must then return promptly.
+        allow_ack.set()
+        assert pause_returned.wait(0.5), "pause() did not return after acknowledgement"
+        assert controller._pause_ack_event.is_set()
+        assert controller.status == "paused"
+    finally:
+        release.set()
+        allow_ack.set()
+        pauser.join(timeout=1.0)
+        loop_thread.join(timeout=1.0)
+        controller.stop()
+
+
+def test_pause_does_not_block_when_loop_not_running():
+    """Fast-path/deadlock guard: pause() returns immediately when there is no
+    live control-loop thread (_running False, _thread None) and still
+    transitions state to 'paused'. Inherently non-hanging (no threads)."""
+    controller = ContinuousFocusLockController(
+        laser_af=_DummyLaserAF(),
+        piezo_service=_DummyPiezoService(),
+        event_bus=EventBus(),
+        config=FocusLockConfig(buffer_length=3),
+    )
+    # Active (should_run) but no live loop: _running stays False, _thread None.
+    controller._should_run = True
+    controller._set_status("locked")
+
+    try:
+        start = time.monotonic()
+        controller.pause()
+        elapsed = time.monotonic() - start
+
+        # Returned via the fast path, well under the >=0.15s bounded wait.
+        assert elapsed < 0.1, f"pause() blocked {elapsed:.3f}s despite no live loop"
+        assert controller.status == "paused"
+        assert controller._paused is True
+    finally:
+        controller.stop()

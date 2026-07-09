@@ -4,9 +4,10 @@ import time
 
 from squid.backend.controllers.multipoint.job_processing import CaptureInfo
 from squid.backend.managers import ScanCoordinates
-from squid.core.utils.config_utils import ChannelMode
+from squid.core.config.models import AcquisitionChannel
 from squid.core.abc import CameraFrame
 from _def import ZProjectionMode, DownsamplingMethod
+from squid.core.events import AutofocusMode, FocusLockSettings
 
 
 
@@ -29,7 +30,7 @@ class ScanPositionInformation:
 class AcquisitionParameters:
     experiment_ID: Optional[str]
     base_path: Optional[str]
-    selected_configurations: List[ChannelMode]
+    selected_configurations: List[AcquisitionChannel]
     acquisition_start_time: float
     scan_position_information: ScanPositionInformation
 
@@ -40,12 +41,13 @@ class AcquisitionParameters:
     deltaY: float
 
     NZ: int
-    deltaZ: float
+    deltaZ: float  # micrometers
     Nt: int
     deltat: float
 
-    do_autofocus: bool
-    do_reflection_autofocus: bool
+    autofocus_mode: AutofocusMode
+    autofocus_interval_fovs: int
+    focus_lock_settings: FocusLockSettings
 
     use_piezo: bool
     display_resolution_scaling: float
@@ -53,8 +55,24 @@ class AcquisitionParameters:
     z_stacking_config: str
     z_range: Tuple[float, float]
 
-    use_fluidics: bool
     skip_saving: bool = False
+    acquisition_order: str = "channel_first"  # "channel_first" or "z_first"
+
+    # --- Focus centering & autofocus outlier guard -------------------------------
+    # Signed micrometer shift added to the z-stack start so the true SAMPLE focal
+    # plane (which sits a fixed offset from the reflection-AF *reference* plane —
+    # the coverslip) lands at the CENTER of the acquired stack. Negative shifts
+    # the whole stack toward lower piezo Z. Default 0 = unchanged behavior.
+    af_focus_offset_um: float = 0.0
+    # Reject a per-FOV laser-AF result that deviates from the predicted focal
+    # plane (temporal same-FOV prior, else spatial neighbor prior) by more than
+    # af_guard_max_residual_um, then retry (seeded to the prediction) up to
+    # af_guard_max_retries times and finally fall back to the predicted plane.
+    # Only active in AutofocusMode.LASER_REFLECTION. Tolerance should sit in the
+    # gap between normal AF scatter (~few um) and aliased-lock jumps (~20-35 um).
+    af_guard_enabled: bool = True
+    af_guard_max_residual_um: float = 10.0
+    af_guard_max_retries: int = 1
 
     # Downsampled view generation parameters
     generate_downsampled_views: bool = False
@@ -81,4 +99,3 @@ class OverallProgressUpdate:
 class RegionProgressUpdate:
     current_fov: int
     region_fovs: int
-

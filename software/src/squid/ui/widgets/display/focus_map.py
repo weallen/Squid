@@ -27,6 +27,8 @@ from qtpy.QtWidgets import (
 
 from _def import SOFTWARE_POS_LIMIT
 from squid.core.events import (
+    handles,
+    ObjectiveChanged,
     StagePositionChanged,
     MoveStageToCommand,
     ScanCoordinatesUpdated,
@@ -34,18 +36,19 @@ from squid.core.events import (
     ScanCoordinatesSnapshot,
     FocusPointOverlaySet,
     FocusPointOverlayVisibilityChanged,
+    WellplateFormatChanged,
 )
+from squid.ui.widgets.base import EventBusFrame
 
 if TYPE_CHECKING:
     from squid.backend.managers import FocusMap
     from squid.ui.ui_event_bus import UIEventBus
 
 
-class FocusMapWidget(QFrame):
+class FocusMapWidget(EventBusFrame):
     """Widget for managing focus map points and surface fitting"""
 
     _allow_updating_focus_points_on_signal: bool
-    _event_bus: "UIEventBus"
     _cached_x_mm: float
     _cached_y_mm: float
     _cached_z_mm: float
@@ -77,12 +80,11 @@ class FocusMapWidget(QFrame):
         event_bus: "UIEventBus",
         initial_z_mm: float = 0.0,
     ) -> None:
-        super().__init__()
+        super().__init__(event_bus)
         self.setFrameStyle(QFrame.Panel | QFrame.Raised)
         self._allow_updating_focus_points_on_signal = True
 
-        # Store event bus and cached position
-        self._event_bus = event_bus
+        # Cached position
         self._cached_x_mm = 0.0
         self._cached_y_mm = 0.0
         self._cached_z_mm = initial_z_mm
@@ -104,22 +106,23 @@ class FocusMapWidget(QFrame):
         self.setEnabled(False)
         self.add_margin = True  # margin for focus grid makes it smaller, but will avoid points at the borders
 
-        # Subscribe to stage position events
-        self._event_bus.subscribe(StagePositionChanged, self._on_stage_position_changed)
-        self._event_bus.subscribe(ScanCoordinatesUpdated, self._on_scan_coordinates_updated)
-        self._event_bus.subscribe(ScanCoordinatesSnapshot, self._on_scan_coordinates_snapshot)
+        # Request initial scan coordinates snapshot
         self._request_scan_snapshot()
 
+    @handles(ScanCoordinatesUpdated)
     def _on_scan_coordinates_updated(self, event: ScanCoordinatesUpdated) -> None:
         """Handle scan coordinate changes by refreshing cached snapshot."""
+        if not self._allow_updating_focus_points_on_signal:
+            return
         self._refresh_on_snapshot = True
         self._request_scan_snapshot()
 
     def _request_scan_snapshot(self) -> None:
         request_id = str(uuid4())
         self._scan_snapshot_request_id = request_id
-        self._event_bus.publish(RequestScanCoordinatesSnapshotCommand(request_id=request_id))
+        self._publish(RequestScanCoordinatesSnapshotCommand(request_id=request_id))
 
+    @handles(ScanCoordinatesSnapshot)
     def _on_scan_coordinates_snapshot(self, event: ScanCoordinatesSnapshot) -> None:
         if self._scan_snapshot_request_id is None:
             return
@@ -127,7 +130,7 @@ class FocusMapWidget(QFrame):
             return
         self._scan_snapshot_request_id = None
         self._scan_region_centers = {
-            str(k): (float(v[0]), float(v[1]), float(v[2]))
+            str(k): (float(v[0]), float(v[1]), float(v[2]) if len(v) > 2 else 0.0)
             for k, v in event.region_centers.items()
         }
         self._scan_region_fov_coordinates = {
@@ -138,6 +141,25 @@ class FocusMapWidget(QFrame):
             self._refresh_on_snapshot = False
             self.on_regions_updated()
 
+    @handles(ObjectiveChanged)
+    def _on_objective_changed(self, _event: ObjectiveChanged) -> None:
+        """Invalidate focus points when objective changes — Z values are no longer valid."""
+        if self.focus_points:
+            self.focus_points.clear()
+            self.update_point_list()
+            self.update_focus_point_display()
+            self.status_label.setText("Focus points cleared (objective changed)")
+
+    @handles(WellplateFormatChanged)
+    def _on_wellplate_format_changed(self, _event: WellplateFormatChanged) -> None:
+        """Clear focus points when wellplate format changes — regions are invalidated."""
+        if self.focus_points:
+            self.focus_points.clear()
+            self.update_point_list()
+            self.update_focus_point_display()
+            self.status_label.setText("Focus points cleared (format changed)")
+
+    @handles(StagePositionChanged)
     def _on_stage_position_changed(self, event: StagePositionChanged) -> None:
         """Cache stage position from EventBus."""
         self._cached_x_mm = event.x_mm
@@ -323,14 +345,14 @@ class FocusMapWidget(QFrame):
     def update_focus_point_display(self) -> None:
         """Update all focus points on navigation viewer"""
         points = tuple((float(x), float(y)) for _rid, x, y, _z in self.focus_points)
-        self._event_bus.publish(FocusPointOverlaySet(points=points))
+        self._publish(FocusPointOverlaySet(points=points))
 
     def generate_grid(self, rows: int = 4, cols: int = 4) -> None:
         """Generate focus point grid that spans scan bounds"""
         if self.enabled:
             self.point_combo.blockSignals(True)
             self.focus_points.clear()
-            self._event_bus.publish(FocusPointOverlaySet(points=tuple()))
+            self._publish(FocusPointOverlaySet(points=tuple()))
             self.status_label.setText(" ")
             current_z = self._cached_z_mm
 
@@ -453,7 +475,7 @@ class FocusMapWidget(QFrame):
 
     def _move_stage_to(self, x: float, y: float, z: float) -> None:
         """Move stage to position via EventBus."""
-        self._event_bus.publish(MoveStageToCommand(x_mm=x, y_mm=y, z_mm=z))
+        self._publish(MoveStageToCommand(x_mm=x, y_mm=y, z_mm=z))
 
     def update_current_z(self) -> None:
         index = self.point_combo.currentIndex()
@@ -653,7 +675,7 @@ class FocusMapWidget(QFrame):
     def setEnabled(self, enabled: bool) -> None:
         self.enabled = enabled
         super().setEnabled(enabled)
-        self._event_bus.publish(FocusPointOverlayVisibilityChanged(enabled=enabled))
+        self._publish(FocusPointOverlayVisibilityChanged(enabled=enabled))
         self.on_regions_updated()
 
     def resizeEvent(self, event: Optional[QResizeEvent]) -> None:

@@ -1,18 +1,35 @@
-from squid.ui.widgets.wellplate._common import *
+from squid.ui.widgets.wellplate._common import (
+    Any,
+    List,
+    Optional,
+    QAbstractItemView,
+    QFont,
+    QHeaderView,
+    QModelIndex,
+    QResizeEvent,
+    QTableWidget,
+    QTableWidgetItem,
+    QWheelEvent,
+    Qt,
+    Tuple,
+    TYPE_CHECKING,
+)
 from _def import WELLPLATE_OFFSET_X_mm, WELLPLATE_OFFSET_Y_mm
 
 if TYPE_CHECKING:
     from squid.ui.ui_event_bus import UIEventBus
 
 from squid.core.events import (
+    handles,
     ClickToMoveEnabledChanged,
     MoveStageToCommand,
     SelectedWellsChanged,
     WellplateFormatChanged,
 )
+from squid.ui.widgets.base import EventBusSubscriptionMixin
 
 
-class WellSelectionWidget(QTableWidget):
+class WellSelectionWidget(EventBusSubscriptionMixin, QTableWidget):
     def __init__(
         self,
         event_bus: "UIEventBus",
@@ -26,11 +43,9 @@ class WellSelectionWidget(QTableWidget):
         a1_x_pixel: int = 0,
         a1_y_pixel: int = 0,
         number_of_skip: int = 0,
-        *args: Any,
-        **kwargs: Any,
     ) -> None:
-        super(WellSelectionWidget, self).__init__(*args, **kwargs)
-        self._bus = event_bus
+        QTableWidget.__init__(self)
+        self._init_subscriptions(event_bus)
         self._click_to_move_enabled: bool = True
         self.cellDoubleClicked.connect(self.onDoubleClick)
         self.itemSelectionChanged.connect(self.onSelectionChanged)
@@ -46,14 +61,13 @@ class WellSelectionWidget(QTableWidget):
         self.a1_y_pixel: int = int(a1_y_pixel)
         self.well_size_mm: float = float(well_size_mm)
         self._apply_format()
-        self._bus.subscribe(ClickToMoveEnabledChanged, self._on_click_to_move_enabled_changed)
-        self._bus.subscribe(WellplateFormatChanged, self._on_wellplate_format_changed)
 
+    @handles(ClickToMoveEnabledChanged)
     def _on_click_to_move_enabled_changed(self, event: ClickToMoveEnabledChanged) -> None:
         self._click_to_move_enabled = event.enabled
 
     def _publish_selection(self) -> None:
-        self._bus.publish(
+        self._publish(
             SelectedWellsChanged(
                 format_name=self.format,
                 selected_cells=tuple(self.get_selected_cells()),
@@ -65,6 +79,7 @@ class WellSelectionWidget(QTableWidget):
         self.setColumnCount(self.columns)
         self.initUI()
         self.setData()
+        self._update_row_headers()
 
     def initUI(self) -> None:
         # Disable editing, scrollbars, and other interactions
@@ -138,22 +153,30 @@ class WellSelectionWidget(QTableWidget):
         if viewport is not None:
             viewport.update()
 
+    @handles(WellplateFormatChanged)
     def _on_wellplate_format_changed(self, event: WellplateFormatChanged) -> None:
         # If the app switches to the 1536 selector widget, main_window replaces this widget.
         if event.format_name == "1536 well plate":
             return
-        self.format = event.format_name
-        self.rows = int(event.rows)
-        self.columns = int(event.cols)
-        self.spacing_mm = float(event.well_spacing_mm)
-        self.number_of_skip = int(event.number_of_skip)
-        self.a1_x_mm = float(event.a1_x_mm)
-        self.a1_y_mm = float(event.a1_y_mm)
-        self.a1_x_pixel = int(event.a1_x_pixel)
-        self.a1_y_pixel = int(event.a1_y_pixel)
-        self.well_size_mm = float(event.well_size_mm)
-        self._apply_format()
-        self._publish_selection()
+        try:
+            self.format = event.format_name
+            self.rows = int(event.rows)
+            self.columns = int(event.cols)
+            self.spacing_mm = float(event.well_spacing_mm)
+            self.number_of_skip = int(event.number_of_skip)
+            self.a1_x_mm = float(event.a1_x_mm)
+            self.a1_y_mm = float(event.a1_y_mm)
+            self.a1_x_pixel = int(event.a1_x_pixel)
+            self.a1_y_pixel = int(event.a1_y_pixel)
+            self.well_size_mm = float(event.well_size_mm)
+            self._apply_format()
+            self._publish_selection()
+        except RuntimeError as exc:
+            # A queued callback can fire briefly after deleteLater() during widget swaps.
+            if "has been deleted" in str(exc):
+                self._cleanup_subscriptions()
+                return
+            raise
 
     def setData(self) -> None:
         for i in range(self.rowCount()):
@@ -198,6 +221,11 @@ class WellSelectionWidget(QTableWidget):
                             )
                         )
 
+    def closeEvent(self, event: Any) -> None:
+        self._cleanup_subscriptions()
+        super().closeEvent(event)
+
+    def _update_row_headers(self) -> None:
         # Update row headers
         row_headers = []
         for i in range(self.rows):
@@ -228,20 +256,7 @@ class WellSelectionWidget(QTableWidget):
             y_mm = row * self.spacing_mm + self.a1_y_mm + WELLPLATE_OFFSET_Y_mm
             print("well location:", (x_mm, y_mm))
             if self._click_to_move_enabled:
-                self._bus.publish(MoveStageToCommand(x_mm=x_mm, y_mm=y_mm))
-            self._publish_selection()
-        else:
-            self._publish_selection()
-
-    def onSingleClick(self, row: int, col: int) -> None:
-        print("single click well", row, col)
-        if (
-            row >= 0 + self.number_of_skip
-            and row <= self.rows - 1 - self.number_of_skip
-        ) and (
-            col >= 0 + self.number_of_skip
-            and col <= self.columns - 1 - self.number_of_skip
-        ):
+                self._publish(MoveStageToCommand(x_mm=x_mm, y_mm=y_mm))
             self._publish_selection()
         else:
             self._publish_selection()

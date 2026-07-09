@@ -1,0 +1,34 @@
+# Demo Full Workflow (V2 Format)
+# Complete fluidics + imaging workflow (realistic but fast)
+# 3 rounds: Setup -> Imaging -> Cleanup
+# Recommended: 1-2 FOVs
+
+name: "Demo Full Workflow"
+version: "2.0"
+description: "Complete demonstration workflow with fluidics and imaging"
+
+error_handling:
+  focus_failure: skip
+  fluidics_failure: abort
+  imaging_failure: warn
+
+fov_file: ../fov_positions/test_2fov_simple.csv
+
+rounds:
+  # Setup: Prime and prepare sample
+  - name: "Sample Preparation"
+    steps:
+      - step_type: fluidics
+        protocol: sample_preparation
+
+  # Main imaging (no fluidics)
+  - name: "Main Acquisition"
+    steps:
+      - step_type: imaging
+        protocol: protocols/main_acquisition.yaml
+
+  # Cleanup
+  - name: "Sample Cleanup"
+    steps:
+      - step_type: fluidics
+        protocol: sample_cleanup

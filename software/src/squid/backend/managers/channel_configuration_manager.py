@@ -16,11 +16,13 @@ from squid.core.utils.config_utils import ChannelConfig, ChannelMode
 import squid.core.utils.config_utils as utils_config
 import _def
 import squid.core.logging
+from squid.backend.managers.base import BaseManager
 from squid.core.events import (
     UpdateChannelConfigurationCommand,
     ChannelConfigurationsChanged,
     SetConfocalModeCommand,
     ConfocalModeChanged,
+    handles,
 )
 
 if TYPE_CHECKING:
@@ -33,7 +35,7 @@ class ConfigType(Enum):
     WIDEFIELD = "widefield"
 
 
-class ChannelConfigurationManager:
+class ChannelConfigurationManager(BaseManager):
     """Manages channel configurations using a two-tier architecture.
 
     The two-tier architecture:
@@ -50,7 +52,6 @@ class ChannelConfigurationManager:
         configurations_path: Path to global configurations folder
     """
 
-    _log: logging.Logger
     config_root: Optional[Path]
     configurations_path: Optional[Path]
     channel_definitions: Optional[ChannelDefinitionsConfig]
@@ -58,15 +59,13 @@ class ChannelConfigurationManager:
     confocal_mode: bool
     all_configs: Dict[ConfigType, Dict[str, ChannelConfig]]
     active_config_type: ConfigType
-    _event_bus: Optional["EventBus"]
 
     def __init__(
         self,
         event_bus: Optional["EventBus"] = None,
         configurations_path: Optional[Path] = None,
     ) -> None:
-        self._log = squid.core.logging.get_logger(self.__class__.__name__)
-        self._event_bus = event_bus
+        super().__init__(event_bus)
         self.config_root = None
         self.configurations_path = configurations_path
 
@@ -89,17 +88,13 @@ class ChannelConfigurationManager:
         }
         self.active_config_type = ConfigType.CHANNEL if not _def.ENABLE_SPINNING_DISK_CONFOCAL else ConfigType.CONFOCAL
 
+        # Cache for ChannelMode objects: {(objective, channel_name): ChannelMode}
+        # This ensures consistent object identity when widgets modify configs
+        self._mode_cache: Dict[tuple, ChannelMode] = {}
+
         # Load global channel definitions if configurations_path is provided
         if configurations_path:
             self._load_channel_definitions()
-
-        # Subscribe to events if event_bus is provided
-        if self._event_bus:
-            self._event_bus.subscribe(UpdateChannelConfigurationCommand, self._on_update_configuration_command)
-            self._event_bus.subscribe(
-                SetConfocalModeCommand,
-                self._on_set_confocal_mode_command,
-            )
 
     def set_configurations_path(self, configurations_path: Path) -> None:
         """Set the path to the configurations folder."""
@@ -327,10 +322,20 @@ class ChannelConfigurationManager:
         Uses effective settings based on current confocal_mode - if confocal mode is active
         and the channel has confocal overrides, those values are used instead of base settings.
 
+        Returns cached ChannelMode if available to ensure consistent object identity.
+        This allows widgets to modify the object and have changes visible to other code
+        that queries for the same configuration.
+
         Note: Settings are lazily initialized with defaults when not found. These in-memory
         defaults are NOT persisted to disk until the user explicitly changes a value.
         This avoids creating files for channels the user hasn't configured yet.
         """
+        cache_key = (objective, channel_def.name, self.confocal_mode)
+
+        # Return cached mode if available
+        if cache_key in self._mode_cache:
+            return self._mode_cache[cache_key]
+
         base_settings = self.objective_settings.get(objective, {}).get(channel_def.name, ObjectiveChannelSettings())
 
         # Get effective settings based on current mode (applies confocal overrides if applicable)
@@ -350,7 +355,7 @@ class ChannelConfigurationManager:
         # disabling unused channels rather than renaming (documented in channel_configuration.md).
         channel_id = hashlib.sha256(channel_def.name.encode()).hexdigest()[:16]
 
-        return ChannelMode(
+        mode = ChannelMode(
             id=channel_id,
             name=channel_def.name,
             exposure_time=settings.exposure_time,
@@ -362,6 +367,10 @@ class ChannelConfigurationManager:
             emission_filter_position=channel_def.emission_filter_position,
             selected=False,
         )
+
+        # Cache the mode for future access
+        self._mode_cache[cache_key] = mode
+        return mode
 
     def get_configurations(self, objective: str, enabled_only: bool = False) -> List[ChannelMode]:
         """Get channel modes for current active type."""
@@ -493,7 +502,11 @@ class ChannelConfigurationManager:
                       for compatibility with hardware APIs that return int.
         """
         # Convert to bool for type safety (XLight returns int 0/1, Dragonfly returns bool)
-        self.confocal_mode = bool(confocal)
+        new_mode = bool(confocal)
+        if new_mode != self.confocal_mode:
+            # Clear cache when confocal mode changes since settings may differ
+            self._mode_cache.clear()
+        self.confocal_mode = new_mode
         self.active_config_type = ConfigType.CONFOCAL if self.confocal_mode else ConfigType.WIDEFIELD
         self._log.info(f"Imaging mode set to: {'confocal' if self.confocal_mode else 'widefield'}")
 
@@ -629,6 +642,7 @@ class ChannelConfigurationManager:
         """Enable or disable a channel."""
         self.update_channel_definition(channel_name, enabled=enabled)
 
+    @handles(SetConfocalModeCommand)
     def _on_set_confocal_mode_command(self, cmd: SetConfocalModeCommand) -> None:
         self.toggle_confocal_widefield(cmd.is_confocal)
         self._publish_configurations_changed(cmd.objective_name)
@@ -648,6 +662,7 @@ class ChannelConfigurationManager:
             )
         )
 
+    @handles(UpdateChannelConfigurationCommand)
     def _on_update_configuration_command(self, cmd: UpdateChannelConfigurationCommand) -> None:
         """Handle UpdateChannelConfigurationCommand event."""
         # Find the configuration by name
@@ -663,3 +678,60 @@ class ChannelConfigurationManager:
             self.update_configuration(cmd.objective_name, mode.id, "AnalogGain", cmd.analog_gain)
         if cmd.illumination_intensity is not None:
             self.update_configuration(cmd.objective_name, mode.id, "IlluminationIntensity", cmd.illumination_intensity)
+
+    def apply_channel_overrides(
+        self,
+        objective: str,
+        overrides: List[Dict[str, Any]],
+    ) -> None:
+        """Apply channel configuration overrides for an imaging step.
+
+        Used by orchestrator to apply protocol-defined channel overrides before imaging.
+        Only non-None fields in each override are applied.
+
+        Args:
+            objective: Objective name to apply overrides for
+            overrides: List of dicts with channel override info. Each dict should have:
+                - name: str (required) - Channel name
+                - exposure_time_ms: Optional[float]
+                - analog_gain: Optional[float]
+                - illumination_intensity: Optional[float]
+                - z_offset_um: Optional[float] (stored but not currently applied)
+
+        Example:
+            manager.apply_channel_overrides("10X", [
+                {"name": "DAPI", "exposure_time_ms": 50},
+                {"name": "Cy5", "exposure_time_ms": 200, "illumination_intensity": 80},
+            ])
+        """
+        for override in overrides:
+            channel_name = override.get("name")
+            if not channel_name:
+                self._log.warning("Channel override missing 'name' field, skipping")
+                continue
+
+            # Find the configuration by name
+            mode = self.get_channel_configuration_by_name(objective, channel_name)
+            if not mode:
+                self._log.warning(
+                    f"Channel '{channel_name}' not found for objective '{objective}', "
+                    "skipping override"
+                )
+                continue
+
+            # Apply each non-None override
+            if override.get("exposure_time_ms") is not None:
+                self.update_configuration(objective, mode.id, "ExposureTime", override["exposure_time_ms"])
+            if override.get("analog_gain") is not None:
+                self.update_configuration(objective, mode.id, "AnalogGain", override["analog_gain"])
+            if override.get("illumination_intensity") is not None:
+                self.update_configuration(
+                    objective,
+                    mode.id,
+                    "IlluminationIntensity",
+                    override["illumination_intensity"],
+                )
+            if override.get("z_offset_um") is not None:
+                self.update_configuration(objective, mode.id, "ZOffset", override["z_offset_um"])
+
+            self._log.debug(f"Applied overrides to channel '{channel_name}' for objective '{objective}'")

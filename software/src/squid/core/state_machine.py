@@ -41,14 +41,16 @@ from typing import (
     Dict,
     FrozenSet,
     Generic,
+    List,
     Optional,
     Set,
+    Tuple,
     Type,
     TypeVar,
 )
 
 import squid.core.logging
-from squid.core.events import Event, EventBus
+from squid.core.events import Event, EventBus, auto_subscribe, auto_unsubscribe
 
 _log = squid.core.logging.get_logger(__name__)
 
@@ -125,6 +127,11 @@ class StateMachine(ABC, Generic[S]):
 
         # State change callbacks
         self._on_state_change_callbacks: list[Callable[[S, S], None]] = []
+
+        # Subscription tracking for @handles decorated methods
+        self._subscriptions: List[Tuple[Type[Event], Callable]] = []
+        if event_bus:
+            self._subscriptions = auto_subscribe(self, event_bus)
 
     @property
     def state(self) -> S:
@@ -249,6 +256,29 @@ class StateMachine(ABC, Generic[S]):
         """
         pass
 
+    def _try_transition_to(self, new_state: S) -> bool:
+        """Attempt transition, return False on invalid (instead of raising).
+
+        Atomically checks validity and performs the transition if valid.
+        This avoids the race condition of separate _is_in_state() + _transition_to() calls.
+
+        Args:
+            new_state: The target state
+
+        Returns:
+            True if transition was performed, False if invalid
+        """
+        with self._lock:
+            valid_targets = self._transitions.get(self._state, frozenset())
+            if new_state not in valid_targets:
+                return False
+            old_state = self._state
+            self._state = new_state
+            _log.debug(f"[{self._name}] {old_state.name} -> {new_state.name}")
+
+        self._fire_state_change(old_state, new_state)
+        return True
+
     def _can_transition_to(self, target_state: S) -> bool:
         """Check if transition to target state is valid from current state.
 
@@ -288,3 +318,17 @@ class StateMachine(ABC, Generic[S]):
         """
         with self._lock:
             return set(self._transitions.get(self._state, frozenset()))
+
+    def shutdown(self) -> None:
+        """Unsubscribe from all events.
+
+        Subclasses with additional cleanup should override and call super().shutdown()
+        after their cleanup logic:
+
+            def shutdown(self) -> None:
+                self.stop()  # custom cleanup
+                super().shutdown()
+        """
+        if self._event_bus:
+            auto_unsubscribe(self._subscriptions, self._event_bus)
+            self._subscriptions = []

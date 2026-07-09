@@ -1,6 +1,5 @@
 import threading
 import time
-from pathlib import Path
 
 import pytest
 
@@ -45,17 +44,12 @@ def _move_stage_into_cacheable_range(ctx) -> None:
 
 
 def _pick_channel_name(ctx) -> str:
-    from squid.backend.managers.channel_configuration_manager import ChannelConfigurationManager
-    import _def
+    from squid.backend.managers.channel_config_service import ChannelConfigService
 
-    manager: ChannelConfigurationManager = ctx.controllers.channel_config_manager
+    manager: ChannelConfigService = ctx.controllers.channel_config_service
     objective = getattr(ctx.controllers.objective_store, "current_objective", None) or "20x"
 
     configs = manager.get_configurations(objective)
-    if not configs:
-        manager.set_profile_path(Path(_def.PROFILE_PATH))
-        manager.load_configurations(objective)
-        configs = manager.get_configurations(objective)
 
     assert configs, "No channel configurations available"
     return configs[0].name
@@ -87,6 +81,7 @@ def test_abort_during_acquisition_startup(simulated_application_context, tmp_pat
         StopAcquisitionCommand,
         AcquisitionStateChanged,
         AcquisitionWorkerFinished,
+        AutofocusMode,
     )
 
     ctx = simulated_application_context
@@ -108,10 +103,8 @@ def test_abort_during_acquisition_startup(simulated_application_context, tmp_pat
         SetAcquisitionParametersCommand(
             n_z=1,
             n_t=1,
-            use_autofocus=False,
-            use_reflection_af=False,
+            autofocus_mode=AutofocusMode.NONE,
             use_piezo=False,
-            use_fluidics=False,
         )
     )
 
@@ -138,6 +131,7 @@ def test_back_to_back_acquisitions(simulated_application_context, tmp_path):
         StartAcquisitionCommand,
         AcquisitionStateChanged,
         AcquisitionWorkerFinished,
+        AutofocusMode,
     )
 
     ctx = simulated_application_context
@@ -155,10 +149,8 @@ def test_back_to_back_acquisitions(simulated_application_context, tmp_path):
         SetAcquisitionParametersCommand(
             n_z=1,
             n_t=1,
-            use_autofocus=False,
-            use_reflection_af=False,
+            autofocus_mode=AutofocusMode.NONE,
             use_piezo=False,
-            use_fluidics=False,
         )
     )
     event_bus.drain(timeout_s=0.5)
@@ -191,6 +183,7 @@ def test_move_stage_command_blocked_during_acquisition(simulated_application_con
         SetAcquisitionParametersCommand,
         StartAcquisitionCommand,
         AcquisitionStateChanged,
+        AutofocusMode,
     )
     import squid.backend.controllers.multipoint.multi_point_worker as mpw
 
@@ -204,9 +197,23 @@ def test_move_stage_command_blocked_during_acquisition(simulated_application_con
     allow_finish = threading.Event()
     original_acquire_at_position = mpw.MultiPointWorker.acquire_at_position
 
-    def _gated_acquire_at_position(self, region_id, current_path, fov):  # type: ignore[no-untyped-def]
+    def _gated_acquire_at_position(  # type: ignore[no-untyped-def]
+        self,
+        region_id,
+        current_path,
+        fov,
+        fov_id=None,
+        attempt=1,
+    ):
         allow_finish.wait(timeout=2.0)
-        return original_acquire_at_position(self, region_id, current_path, fov)
+        return original_acquire_at_position(
+            self,
+            region_id,
+            current_path,
+            fov,
+            fov_id=fov_id,
+            attempt=attempt,
+        )
 
     monkeypatch.setattr(mpw.MultiPointWorker, "acquire_at_position", _gated_acquire_at_position)
 
@@ -223,10 +230,8 @@ def test_move_stage_command_blocked_during_acquisition(simulated_application_con
         SetAcquisitionParametersCommand(
             n_z=1,
             n_t=1,
-            use_autofocus=False,
-            use_reflection_af=False,
+            autofocus_mode=AutofocusMode.NONE,
             use_piezo=False,
-            use_fluidics=False,
         )
     )
 

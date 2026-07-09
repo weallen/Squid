@@ -10,18 +10,18 @@ import threading
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Optional
 
+from squid.backend.controllers.base import BaseController
 from squid.core.events import (
     SetObjectiveCommand,
     SetSpinningDiskPositionCommand,
     SetSpinningDiskSpinningCommand,
     SetDiskDichroicCommand,
     SetDiskEmissionFilterCommand,
-    SetPiezoPositionCommand,
-    MovePiezoRelativeCommand,
     ObjectiveChanged,
     SpinningDiskStateChanged,
     PiezoPositionChanged,
     PixelSizeChanged,
+    handles,
 )
 
 if TYPE_CHECKING:
@@ -55,7 +55,7 @@ class PeripheralsState:
     piezo_position_um: Optional[float] = None
 
 
-class PeripheralsController:
+class PeripheralsController(BaseController):
     """Handles peripheral hardware control.
 
     Manages: objective changer, spinning disk, piezo Z stage.
@@ -72,31 +72,14 @@ class PeripheralsController:
         objective_store: Optional["ObjectiveStore"],
         event_bus: "EventBus",
     ) -> None:
+        super().__init__(event_bus)
         self._objective_service = objective_service
         self._spinning_disk_service = spinning_disk_service
         self._piezo_service = piezo_service
         self._objective_store = objective_store
-        self._bus = event_bus
         self._lock = threading.RLock()
 
         self._state = self._read_initial_state()
-
-        # Subscribe to commands
-        self._subscribe_to_bus()
-
-    def _subscribe_to_bus(self) -> None:
-        if self._bus is None:
-            return
-        if self._objective_service:
-            self._bus.subscribe(SetObjectiveCommand, self._on_set_objective)
-        if self._spinning_disk_service:
-            self._bus.subscribe(SetSpinningDiskPositionCommand, self._on_set_disk_position)
-            self._bus.subscribe(SetSpinningDiskSpinningCommand, self._on_set_spinning)
-            self._bus.subscribe(SetDiskDichroicCommand, self._on_set_dichroic)
-            self._bus.subscribe(SetDiskEmissionFilterCommand, self._on_set_emission)
-        if self._piezo_service:
-            self._bus.subscribe(SetPiezoPositionCommand, self._on_set_piezo)
-            self._bus.subscribe(MovePiezoRelativeCommand, self._on_move_piezo_relative)
 
     @property
     def state(self) -> PeripheralsState:
@@ -147,6 +130,7 @@ class PeripheralsController:
 
     # --- Objective ---
 
+    @handles(SetObjectiveCommand)
     def _on_set_objective(self, cmd: SetObjectiveCommand) -> None:
         """Handle SetObjectiveCommand."""
         if not self._objective_service:
@@ -179,7 +163,7 @@ class PeripheralsController:
                     pass  # Objective name not in store
 
         # Publish outside lock
-        self._bus.publish(
+        self._event_bus.publish(
             ObjectiveChanged(
                 position=actual,
                 objective_name=obj_name,
@@ -188,10 +172,11 @@ class PeripheralsController:
         )
 
         if pixel_size:
-            self._bus.publish(PixelSizeChanged(pixel_size_um=pixel_size))
+            self._event_bus.publish(PixelSizeChanged(pixel_size_um=pixel_size))
 
     # --- Spinning Disk ---
 
+    @handles(SetSpinningDiskPositionCommand)
     def _on_set_disk_position(self, cmd: SetSpinningDiskPositionCommand) -> None:
         if not self._spinning_disk_service:
             return
@@ -200,6 +185,7 @@ class PeripheralsController:
             self._spinning_disk_service.set_disk_position(cmd.in_beam)
         self._update_disk_state()
 
+    @handles(SetSpinningDiskSpinningCommand)
     def _on_set_spinning(self, cmd: SetSpinningDiskSpinningCommand) -> None:
         if not self._spinning_disk_service:
             return
@@ -208,6 +194,7 @@ class PeripheralsController:
             self._spinning_disk_service.set_spinning(cmd.spinning)
         self._update_disk_state()
 
+    @handles(SetDiskDichroicCommand)
     def _on_set_dichroic(self, cmd: SetDiskDichroicCommand) -> None:
         if not self._spinning_disk_service:
             return
@@ -216,6 +203,7 @@ class PeripheralsController:
             self._spinning_disk_service.set_dichroic(cmd.position)
         self._update_disk_state()
 
+    @handles(SetDiskEmissionFilterCommand)
     def _on_set_emission(self, cmd: SetDiskEmissionFilterCommand) -> None:
         if not self._spinning_disk_service:
             return
@@ -241,7 +229,7 @@ class PeripheralsController:
             self._state = replace(self._state, spinning_disk=disk_state)
 
         # Publish outside lock
-        self._bus.publish(
+        self._event_bus.publish(
             SpinningDiskStateChanged(
                 is_disk_in=disk_state.is_disk_in,
                 is_spinning=disk_state.is_spinning,
@@ -252,34 +240,13 @@ class PeripheralsController:
         )
 
     # --- Piezo ---
+    # PiezoService is the single source of truth for piezo movement.
+    # We only track state reactively from PiezoPositionChanged events.
 
-    def _on_set_piezo(self, cmd: SetPiezoPositionCommand) -> None:
-        if not self._piezo_service:
-            return
-
+    @handles(PiezoPositionChanged)
+    def _on_piezo_position_changed(self, event: PiezoPositionChanged) -> None:
         with self._lock:
-            min_pos, max_pos = self._piezo_service.get_range()
-            clamped = max(min_pos, min(max_pos, cmd.position_um))
-            self._piezo_service.move_to(clamped)
-            actual = self._piezo_service.get_position()
-            # Update state inside lock
-            self._state = replace(self._state, piezo_position_um=actual)
-
-        # Publish outside lock
-        self._bus.publish(PiezoPositionChanged(position_um=actual))
-
-    def _on_move_piezo_relative(self, cmd: MovePiezoRelativeCommand) -> None:
-        if not self._piezo_service:
-            return
-
-        with self._lock:
-            self._piezo_service.move_relative(cmd.delta_um)
-            actual = self._piezo_service.get_position()
-            # Update state inside lock
-            self._state = replace(self._state, piezo_position_um=actual)
-
-        # Publish outside lock
-        self._bus.publish(PiezoPositionChanged(position_um=actual))
+            self._state = replace(self._state, piezo_position_um=event.position_um)
 
     # --- Convenience methods ---
 

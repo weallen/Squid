@@ -49,6 +49,11 @@ class UIEventBus:
     def _on_dispatcher_destroyed(self, _obj: object = None) -> None:
         self._dispatcher_alive = False
 
+    @property
+    def core_bus(self) -> EventBus:
+        """Expose underlying core EventBus for backend-only service wiring."""
+        return self._core_bus
+
     def publish(self, event: Event) -> None:
         """Publish an event to the core bus.
 
@@ -73,15 +78,9 @@ class UIEventBus:
             def wrapper(event: Event, _handler=handler) -> None:
                 if not self._dispatcher_alive:
                     return
-                is_main = self._dispatcher.is_main_thread()
-                thread_name = threading.current_thread().name
-                if is_main:
-                    # Already on main thread, call directly (optimization)
-                    _log.debug(f"UIEventBus: {type(event).__name__} on main thread ({thread_name}), calling directly")
+                if self._dispatcher.is_main_thread():
                     _handler(event)
                 else:
-                    # Marshal to main thread via Qt signal
-                    _log.debug(f"UIEventBus: {type(event).__name__} from {thread_name}, dispatching to main thread")
                     try:
                         self._dispatcher.dispatch.emit(_handler, event)
                     except RuntimeError:
@@ -89,7 +88,6 @@ class UIEventBus:
 
             self._wrapper_map[(event_type, handler)] = wrapper
             self._core_bus.subscribe(event_type, wrapper)
-            _log.debug(f"UIEventBus: subscribed {handler} to {event_type.__name__}")
 
     def unsubscribe(
         self,
@@ -107,7 +105,6 @@ class UIEventBus:
 
         if wrapper is not None:
             self._core_bus.unsubscribe(event_type, wrapper)
-            _log.debug(f"UIEventBus: unsubscribed {handler} from {event_type.__name__}")
         else:
             _log.warning(
                 f"UIEventBus: tried to unsubscribe unknown handler {handler} "

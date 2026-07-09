@@ -1,10 +1,20 @@
 from enum import Enum
 import json
+from typing import List
+
 import numpy as np
 import pandas as pd
 from pathlib import Path
 
+import _def
+from _def import ILLUMINATION_CODE
 from squid.backend.microcontroller import Microcontroller
+import squid.core.logging
+
+_log = squid.core.logging.get_logger("squid.illumination")
+
+# Number of illumination ports supported (matches firmware)
+NUM_ILLUMINATION_PORTS = 16
 
 
 class LightSourceType(Enum):
@@ -28,6 +38,16 @@ class ShutterControlMode(Enum):
 
 
 class IlluminationController:
+    """Controls illumination hardware via the microcontroller.
+
+    Supports both legacy single-source illumination (SET_ILLUMINATION / TURN_ON / TURN_OFF)
+    and multi-port illumination (firmware v1.0+) where multiple ports can be independently
+    controlled with per-port intensity and on/off state.
+
+    Multi-port methods require firmware v1.0+ and will raise RuntimeError if the firmware
+    does not support them. Use microcontroller.supports_multi_port() to check.
+    """
+
     def __init__(
         self,
         microcontroller: Microcontroller,
@@ -46,24 +66,27 @@ class IlluminationController:
         self.light_source_type = light_source_type
         self.light_source = light_source
         self.disable_intensity_calibration = disable_intensity_calibration
-        # Default channel mappings
+        # Default channel mappings: wavelength -> illumination source code
         default_mappings = {
-            405: 11,
-            470: 12,
-            488: 12,
-            545: 14,
-            550: 14,
-            555: 14,
-            561: 14,
-            638: 13,
-            640: 13,
-            730: 15,
-            735: 15,
-            750: 15,
+            405: ILLUMINATION_CODE.ILLUMINATION_D1,
+            470: ILLUMINATION_CODE.ILLUMINATION_D2,
+            488: ILLUMINATION_CODE.ILLUMINATION_D2,
+            545: ILLUMINATION_CODE.ILLUMINATION_D3,
+            550: ILLUMINATION_CODE.ILLUMINATION_D3,
+            555: ILLUMINATION_CODE.ILLUMINATION_D3,
+            561: ILLUMINATION_CODE.ILLUMINATION_D3,
+            638: ILLUMINATION_CODE.ILLUMINATION_D4,
+            640: ILLUMINATION_CODE.ILLUMINATION_D4,
+            730: ILLUMINATION_CODE.ILLUMINATION_D5,
+            735: ILLUMINATION_CODE.ILLUMINATION_D5,
+            750: ILLUMINATION_CODE.ILLUMINATION_D5,
         }
 
         # Try to load mappings from file
         self.channel_mappings_TTL = self._load_channel_mappings(default_mappings)
+        # Build reverse lookup: illumination source code -> wavelength key
+        # This allows callers to pass either wavelength (405) or source code (11)
+        self._source_code_to_channel = {v: k for k, v in self.channel_mappings_TTL.items()}
 
         self.channel_mappings_software = {}
         self.is_on = {}
@@ -71,6 +94,10 @@ class IlluminationController:
         self.current_channel = None
         self.intensity_luts = {}  # Store LUTs for each wavelength
         self.max_power = {}  # Store max power for each wavelength
+
+        # Multi-port illumination state tracking (16 ports max)
+        self.port_is_on = {i: False for i in range(NUM_ILLUMINATION_PORTS)}
+        self.port_intensity = {i: 0.0 for i in range(NUM_ILLUMINATION_PORTS)}
 
         if self.light_source_type is not None:
             self._configure_light_source()
@@ -80,6 +107,53 @@ class IlluminationController:
             and self.disable_intensity_calibration is False
         ):
             self._load_intensity_calibrations()
+
+    def _resolve_channel(self, channel):
+        """Resolve a channel identifier to a wavelength key in channel_mappings_TTL.
+
+        Accepts either a wavelength (405, 488, etc.) or an illumination source code
+        (11, 12, etc.). Returns the wavelength key, or None if not found.
+        """
+        if channel in self.channel_mappings_TTL:
+            return channel
+        # Check if it's an illumination source code (e.g., 11 for D1)
+        if channel in self._source_code_to_channel:
+            return self._source_code_to_channel[channel]
+        return None
+
+    @staticmethod
+    def _is_led_matrix_source(channel) -> bool:
+        """Return True if ``channel`` is an LED-array pattern source code (0-9).
+
+        LED-array patterns (brightfield/darkfield) are driven directly by the
+        microcontroller's LED-matrix command rather than the fluorescence D-code
+        DAC mapping held in channel_mappings_TTL.
+        """
+        return isinstance(channel, int) and not isinstance(channel, bool) and 0 <= channel < 10
+
+    def _set_led_matrix_intensity(self, illumination_source: int, intensity: float) -> None:
+        """Select the LED-matrix pattern and set its intensity (brightfield/darkfield).
+
+        RGB channel weights come from LED_MATRIX_{R,G,B}_FACTOR so a monochrome LED
+        matrix (default: blue only) is lit with the correct color at the requested
+        fraction of full scale.
+
+        Mirrors the DAC/fluorescence set_intensity path: it only *selects* the source
+        and does NOT wait for a command ack here. Synchronization happens in
+        turn_on_illumination() (which waits after the global TURN_ON). Waiting on the
+        SET_ILLUMINATION_LED_MATRIX ack here would stall for the full command timeout
+        on any device (e.g. the simulator) that does not acknowledge that command.
+        """
+        # Read the RGB channel weights LIVE from _def (not import-time constants):
+        # the Config dialog can mutate _def.LED_MATRIX_*_FACTOR at runtime with
+        # needs_restart=False, so the driver must pick up the current values.
+        factor = max(0.0, min(float(intensity), 100.0)) / 100.0
+        self.microcontroller.set_illumination_led_matrix(
+            illumination_source,
+            r=factor * _def.LED_MATRIX_R_FACTOR,
+            g=factor * _def.LED_MATRIX_G_FACTOR,
+            b=factor * _def.LED_MATRIX_B_FACTOR,
+        )
 
     def _load_channel_mappings(self, default_mappings):
         """Load channel mappings from JSON file, fallback to default if file not found."""
@@ -130,38 +204,58 @@ class IlluminationController:
         if channel is None:
             channel = self.current_channel
 
-        # Check if channel is mapped
-        if channel not in self.channel_mappings_TTL:
+        # LED-array patterns (0-9) and the external FET (20) are driven directly by
+        # the microcontroller; turn_on_illumination() enables whichever source was
+        # selected by the preceding set_intensity() call.
+        if self._is_led_matrix_source(channel) or channel == ILLUMINATION_CODE.ILLUMINATION_SOURCE_LED_EXTERNAL_FET:
+            self.microcontroller.turn_on_illumination()
+            self.microcontroller.wait_till_operation_is_completed()
+            self.is_on[channel] = True
+            return
+
+        resolved = self._resolve_channel(channel)
+        if resolved is None:
+            _log.warning("turn_on_illumination: channel %s could not be resolved, skipping", channel)
             return
 
         if self.shutter_control_mode == ShutterControlMode.Software:
-            if channel in self.channel_mappings_software:
+            if resolved in self.channel_mappings_software:
                 self.light_source.set_shutter_state(
-                    self.channel_mappings_software[channel], on=True
+                    self.channel_mappings_software[resolved], on=True
                 )
         elif self.shutter_control_mode == ShutterControlMode.TTL:
-            # self.microcontroller.set_illumination(self.channel_mappings_TTL[channel], self.intensity_settings[channel])
             self.microcontroller.turn_on_illumination()
+            self.microcontroller.wait_till_operation_is_completed()
 
-        self.is_on[channel] = True
+        self.is_on[resolved] = True
 
     def turn_off_illumination(self, channel=None):
         if channel is None:
             channel = self.current_channel
 
-        # Check if channel is mapped
-        if channel not in self.channel_mappings_TTL:
+        # LED-array patterns (0-9) and the external FET (20) are driven directly by
+        # the microcontroller (not via channel_mappings_TTL).
+        if self._is_led_matrix_source(channel) or channel == ILLUMINATION_CODE.ILLUMINATION_SOURCE_LED_EXTERNAL_FET:
+            self.microcontroller.turn_off_illumination()
+            self.microcontroller.wait_till_operation_is_completed()
+            self.is_on[channel] = False
+            return
+
+        # Resolve channel (accepts wavelength or illumination source code)
+        resolved = self._resolve_channel(channel)
+        if resolved is None:
             return
 
         if self.shutter_control_mode == ShutterControlMode.Software:
-            if channel in self.channel_mappings_software:
+            if resolved in self.channel_mappings_software:
                 self.light_source.set_shutter_state(
-                    self.channel_mappings_software[channel], on=False
+                    self.channel_mappings_software[resolved], on=False
                 )
         elif self.shutter_control_mode == ShutterControlMode.TTL:
             self.microcontroller.turn_off_illumination()
+            self.microcontroller.wait_till_operation_is_completed()
 
-        self.is_on[channel] = False
+        self.is_on[resolved] = False
 
     def _load_intensity_calibrations(self):
         """Load intensity calibrations for all available wavelengths."""
@@ -215,43 +309,157 @@ class IlluminationController:
         return np.clip(dac_percent, 0, 100)
 
     def set_intensity(self, channel, intensity):
-        # Check if channel is mapped before attempting to set intensity
-        if channel not in self.channel_mappings_TTL:
-            # Channel not configured - log warning and return silently
-            # This can happen when illumination_source is an index (0, 1, 2)
-            # rather than a wavelength (405, 488, etc.)
+        # LED-array patterns (0-9) drive the LED matrix; the external FET (20) uses the
+        # plain DAC command. Neither is a key in channel_mappings_TTL (fluorescence
+        # D-codes only), so route them here before wavelength-based resolution.
+        if self._is_led_matrix_source(channel):
+            self._set_led_matrix_intensity(channel, intensity)
+            self.intensity_settings[channel] = intensity
+            return
+        if channel == ILLUMINATION_CODE.ILLUMINATION_SOURCE_LED_EXTERNAL_FET:
+            # Clamp to [0,100] (like the LED-matrix path) so an out-of-range
+            # caller/config cannot overflow the single intensity byte in
+            # microcontroller.set_illumination (int((intensity/100)*65535) >> 8).
+            self.microcontroller.set_illumination(channel, max(0.0, min(float(intensity), 100.0)))
+            self.intensity_settings[channel] = intensity
+            return
+
+        resolved = self._resolve_channel(channel)
+        if resolved is None:
+            _log.warning("set_intensity: channel %s could not be resolved, skipping", channel)
             return
 
         # initialize intensity setting for this channel if it doesn't exist
-        if channel not in self.intensity_settings:
-            self.intensity_settings[channel] = -1
+        if resolved not in self.intensity_settings:
+            self.intensity_settings[resolved] = -1
         if self.intensity_control_mode == IntensityControlMode.Software:
-            if intensity != self.intensity_settings[channel]:
+            if intensity != self.intensity_settings[resolved]:
                 self.light_source.set_intensity(
-                    self.channel_mappings_software[channel], intensity
+                    self.channel_mappings_software[resolved], intensity
                 )
-                self.intensity_settings[channel] = intensity
+                self.intensity_settings[resolved] = intensity
             if self.shutter_control_mode == ShutterControlMode.TTL:
                 # This is needed, because we select the channel in microcontroller set_illumination().
                 # Otherwise, the wrong channel will be opened when turn_on_illumination() is called.
                 self.microcontroller.set_illumination(
-                    self.channel_mappings_TTL[channel], intensity
+                    self.channel_mappings_TTL[resolved], intensity
                 )
         else:
-            if channel in self.intensity_luts:
+            if resolved in self.intensity_luts:
                 # Apply LUT to convert power percentage to DAC percent (0-100)
-                dac_percent = self._apply_lut(channel, intensity)
+                dac_percent = self._apply_lut(resolved, intensity)
                 self.microcontroller.set_illumination(
-                    self.channel_mappings_TTL[channel], dac_percent
+                    self.channel_mappings_TTL[resolved], dac_percent
                 )
             else:
                 self.microcontroller.set_illumination(
-                    self.channel_mappings_TTL[channel], intensity
+                    self.channel_mappings_TTL[resolved], intensity
                 )
-            self.intensity_settings[channel] = intensity
+            self.intensity_settings[resolved] = intensity
 
     def get_shutter_state(self):
         return self.is_on
+
+    # Multi-port illumination methods (firmware v1.0+)
+
+    def _check_multi_port_support(self):
+        """Check if firmware supports multi-port commands, raise if not."""
+        if not self.microcontroller.supports_multi_port():
+            raise RuntimeError(
+                "Firmware does not support multi-port illumination commands. "
+                "Update firmware to version 1.0 or later."
+            )
+
+    def set_port_intensity(self, port_index: int, intensity: float):
+        """Set intensity for a specific port without changing on/off state.
+
+        Args:
+            port_index: Port index (0=D1, 1=D2, etc.)
+            intensity: Intensity percentage (0-100)
+        """
+        self._check_multi_port_support()
+        if port_index < 0 or port_index >= NUM_ILLUMINATION_PORTS:
+            raise ValueError(f"Invalid port index: {port_index}")
+        self.microcontroller.set_port_intensity(port_index, intensity)
+        self.microcontroller.wait_till_operation_is_completed()
+        self.port_intensity[port_index] = intensity
+
+    def turn_on_port(self, port_index: int):
+        """Turn on a specific illumination port.
+
+        Args:
+            port_index: Port index (0=D1, 1=D2, etc.)
+        """
+        self._check_multi_port_support()
+        if port_index < 0 or port_index >= NUM_ILLUMINATION_PORTS:
+            raise ValueError(f"Invalid port index: {port_index}")
+        self.microcontroller.turn_on_port(port_index)
+        self.microcontroller.wait_till_operation_is_completed()
+        self.port_is_on[port_index] = True
+
+    def turn_off_port(self, port_index: int):
+        """Turn off a specific illumination port.
+
+        Args:
+            port_index: Port index (0=D1, 1=D2, etc.)
+        """
+        self._check_multi_port_support()
+        if port_index < 0 or port_index >= NUM_ILLUMINATION_PORTS:
+            raise ValueError(f"Invalid port index: {port_index}")
+        self.microcontroller.turn_off_port(port_index)
+        self.microcontroller.wait_till_operation_is_completed()
+        self.port_is_on[port_index] = False
+
+    def set_port_illumination(self, port_index: int, intensity: float, turn_on: bool):
+        """Set intensity and on/off state for a specific port in one command.
+
+        Args:
+            port_index: Port index (0=D1, 1=D2, etc.)
+            intensity: Intensity percentage (0-100)
+            turn_on: Whether to turn the port on
+        """
+        self._check_multi_port_support()
+        if port_index < 0 or port_index >= NUM_ILLUMINATION_PORTS:
+            raise ValueError(f"Invalid port index: {port_index}")
+        self.microcontroller.set_port_illumination(port_index, intensity, turn_on)
+        self.microcontroller.wait_till_operation_is_completed()
+        self.port_intensity[port_index] = intensity
+        self.port_is_on[port_index] = turn_on
+
+    def turn_on_multiple_ports(self, port_indices: List[int]):
+        """Turn on multiple ports simultaneously.
+
+        Args:
+            port_indices: List of port indices to turn on (0=D1, 1=D2, etc.)
+        """
+        if not port_indices:
+            return
+
+        self._check_multi_port_support()
+        port_mask = 0
+        on_mask = 0
+        for port_index in port_indices:
+            if port_index < 0 or port_index >= NUM_ILLUMINATION_PORTS:
+                raise ValueError(f"Invalid port index: {port_index}")
+            port_mask |= 1 << port_index
+            on_mask |= 1 << port_index
+
+        self.microcontroller.set_multi_port_mask(port_mask, on_mask)
+        self.microcontroller.wait_till_operation_is_completed()
+        for port_index in port_indices:
+            self.port_is_on[port_index] = True
+
+    def turn_off_all_ports(self):
+        """Turn off all illumination ports."""
+        self._check_multi_port_support()
+        self.microcontroller.turn_off_all_ports()
+        self.microcontroller.wait_till_operation_is_completed()
+        for i in range(NUM_ILLUMINATION_PORTS):
+            self.port_is_on[i] = False
+
+    def get_active_ports(self) -> List[int]:
+        """Get list of currently active (on) port indices."""
+        return [i for i in range(NUM_ILLUMINATION_PORTS) if self.port_is_on[i]]
 
     def close(self):
         if self.light_source is not None:

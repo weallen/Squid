@@ -4,7 +4,7 @@ import math
 from typing import Optional, TYPE_CHECKING, Tuple
 
 import numpy as np
-from qtpy.QtCore import Qt
+from qtpy.QtCore import Qt, QRect
 from qtpy.QtGui import QColor, QImage, QPainter, QPen, QPixmap
 from qtpy.QtWidgets import (
     QCheckBox,
@@ -23,6 +23,7 @@ from qtpy.QtWidgets import (
 import _def
 from squid.core.config.focus_lock import FocusLockConfig
 from squid.core.events import (
+    handles,
     FocusLockFrameUpdated,
     FocusLockMetricsUpdated,
     FocusLockModeChanged,
@@ -34,6 +35,7 @@ from squid.core.events import (
     ReleaseFocusLockReferenceCommand,
     ResumeFocusLockCommand,
     SetFocusLockAutoSearchCommand,
+    SetFocusLockParamsCommand,
     SetFocusLockReferenceCommand,
     SetPiezoPositionCommand,
     StartFocusLockCommand,
@@ -249,15 +251,20 @@ class SpotPreviewWidget(QWidget):
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self._frame: Optional[np.ndarray] = None
+        self._frame_bytes: Optional[bytes] = None
         self._spot_x: float = 0.0
         self._spot_y: float = 0.0
         self._spot_valid: bool = False
         self._pixmap: Optional[QPixmap] = None
+        self._zoomed: bool = False
+        self._zoom_factor: float = 4.0
 
         # Expand horizontally to fill available width
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.setFixedHeight(70)  # Taller for better visibility
         self.setStyleSheet("background-color: #000;")
+        self.setCursor(Qt.PointingHandCursor)
+        self.setToolTip("Click to toggle 4x zoom on the spot")
 
     def set_frame(
         self, frame: np.ndarray, spot_x: float, spot_y: float, spot_valid: bool = True
@@ -274,26 +281,39 @@ class SpotPreviewWidget(QWidget):
         """Convert numpy array to QPixmap."""
         if self._frame is None:
             self._pixmap = None
+            self._frame_bytes = None
             return
 
-        frame = self._frame
+        frame = np.asarray(self._frame)
+        if frame.dtype != np.uint8:
+            frame = frame.astype(np.uint8, copy=False)
+        frame = np.ascontiguousarray(frame)
         h, w = frame.shape[:2]
 
         # Handle grayscale
         if len(frame.shape) == 2:
-            # Convert to RGB for QImage
             bytes_per_line = w
+            self._frame_bytes = frame.tobytes()
             qimg = QImage(
-                frame.data, w, h, bytes_per_line, QImage.Format_Grayscale8
+                self._frame_bytes, w, h, bytes_per_line, QImage.Format_Grayscale8
             )
         else:
             # RGB image
             bytes_per_line = 3 * w
+            self._frame_bytes = frame.tobytes()
             qimg = QImage(
-                frame.data, w, h, bytes_per_line, QImage.Format_RGB888
+                self._frame_bytes, w, h, bytes_per_line, QImage.Format_RGB888
             )
 
         self._pixmap = QPixmap.fromImage(qimg)
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.LeftButton:
+            self._zoomed = not self._zoomed
+            self.update()
+            event.accept()
+            return
+        super().mousePressEvent(event)
 
     def paintEvent(self, event) -> None:
         painter = QPainter(self)
@@ -301,26 +321,71 @@ class SpotPreviewWidget(QWidget):
 
         widget_w = self.width()
         widget_h = self.height()
+        painter.fillRect(0, 0, widget_w, widget_h, QColor(0, 0, 0))
 
-        if self._pixmap is not None and not self._pixmap.isNull():
-            # Scale pixmap to fill widget width (ignore aspect ratio for full width)
-            scaled = self._pixmap.scaled(
-                widget_w, widget_h, Qt.IgnoreAspectRatio, Qt.SmoothTransformation
-            )
-            painter.drawPixmap(0, 0, scaled)
+        if self._pixmap is not None and not self._pixmap.isNull() and self._frame is not None:
+            frame_h, frame_w = self._frame.shape[:2]
 
-            # Draw small circle at spot centroid position (only if spot detection was valid)
-            if self._frame is not None and self._spot_valid:
-                frame_h, frame_w = self._frame.shape[:2]
-                scale_x = widget_w / frame_w
-                scale_y = widget_h / frame_h
-                spot_x = int(self._spot_x * scale_x)
-                spot_y = int(self._spot_y * scale_y)
+            if self._zoomed and self._zoom_factor > 1.0:
+                # Zoomed view: crop a window around the spot (or frame center if
+                # the spot reading isn't valid right now) and stretch to fit.
+                crop_w = max(1, int(round(frame_w / self._zoom_factor)))
+                crop_h = max(1, int(round(frame_h / self._zoom_factor)))
+                if self._spot_valid:
+                    cx, cy = self._spot_x, self._spot_y
+                else:
+                    cx, cy = frame_w / 2.0, frame_h / 2.0
+                src_x = int(round(cx - crop_w / 2.0))
+                src_y = int(round(cy - crop_h / 2.0))
+                src_x = max(0, min(src_x, frame_w - crop_w))
+                src_y = max(0, min(src_y, frame_h - crop_h))
+                source_rect = QRect(src_x, src_y, crop_w, crop_h)
 
-                # Draw green circle at spot center
-                painter.setPen(QPen(QColor(0, 255, 0), 2))
-                painter.setBrush(Qt.NoBrush)
-                painter.drawEllipse(spot_x - 6, spot_y - 6, 12, 12)
+                # Letterbox the zoomed crop to keep the aspect ratio consistent.
+                src_aspect = crop_w / crop_h if crop_h else 1.0
+                widget_aspect = widget_w / widget_h if widget_h else 1.0
+                if src_aspect > widget_aspect:
+                    target_w = widget_w
+                    target_h = max(1, int(round(widget_w / src_aspect)))
+                else:
+                    target_h = widget_h
+                    target_w = max(1, int(round(widget_h * src_aspect)))
+                tx = (widget_w - target_w) // 2
+                ty = (widget_h - target_h) // 2
+                target_rect = QRect(tx, ty, target_w, target_h)
+
+                painter.drawPixmap(target_rect, self._pixmap, source_rect)
+
+                if self._spot_valid:
+                    scale_x = target_w / crop_w
+                    scale_y = target_h / crop_h
+                    spot_x = int(tx + (self._spot_x - src_x) * scale_x)
+                    spot_y = int(ty + (self._spot_y - src_y) * scale_y)
+                    painter.setPen(QPen(QColor(0, 255, 0), 2))
+                    painter.setBrush(Qt.NoBrush)
+                    painter.drawEllipse(spot_x - 8, spot_y - 8, 16, 16)
+
+                painter.setPen(QPen(QColor(255, 215, 0), 1))
+                painter.drawText(
+                    4, 12, f"ZOOM {int(self._zoom_factor)}x"
+                )
+            else:
+                # Default view: keep camera geometry intact (no distortion).
+                scaled = self._pixmap.scaled(
+                    widget_w, widget_h, Qt.KeepAspectRatio, Qt.SmoothTransformation
+                )
+                x_offset = (widget_w - scaled.width()) // 2
+                y_offset = (widget_h - scaled.height()) // 2
+                painter.drawPixmap(x_offset, y_offset, scaled)
+
+                if self._spot_valid:
+                    scale_x = scaled.width() / frame_w
+                    scale_y = scaled.height() / frame_h
+                    spot_x = int(x_offset + self._spot_x * scale_x)
+                    spot_y = int(y_offset + self._spot_y * scale_y)
+                    painter.setPen(QPen(QColor(0, 255, 0), 2))
+                    painter.setBrush(Qt.NoBrush)
+                    painter.drawEllipse(spot_x - 6, spot_y - 6, 12, 12)
         else:
             # Draw placeholder text
             painter.setPen(QPen(QColor(85, 85, 85)))
@@ -332,13 +397,19 @@ class SpotPreviewWidget(QWidget):
         """Clear the preview."""
         self._frame = None
         self._pixmap = None
+        self._frame_bytes = None
         self.update()
 
 
 class FocusLockStatusWidget(EventBusFrame):
     """Focus lock widget with vertical bars and space for laser spot view."""
 
-    def __init__(self, event_bus: "UIEventBus", parent: Optional[QWidget] = None) -> None:
+    def __init__(
+        self,
+        event_bus: "UIEventBus",
+        parent: Optional[QWidget] = None,
+        initial_laser_af_properties: Optional[dict] = None,
+    ) -> None:
         super().__init__(event_bus, parent)
         self._config = FocusLockConfig()
         self._mode: str = self._config.default_mode
@@ -353,6 +424,8 @@ class FocusLockStatusWidget(EventBusFrame):
         self._z_error_rms_um: Optional[float] = None
         self._drift_rate_um_per_s: Optional[float] = None
         self._collapsed = False
+        self._initial_laser_af_properties: dict = dict(initial_laser_af_properties or {})
+        self._settings_dialog = None  # Lazy-constructed FocusLockSettingsDialog
 
         self._setup_ui()
         self._connect_events()
@@ -518,7 +591,15 @@ class FocusLockStatusWidget(EventBusFrame):
             "Automatically search to recover focus when lock is lost"
         )
         self._auto_recover_checkbox.toggled.connect(self._on_auto_recover_toggled)
-        controls_grid.addWidget(self._auto_recover_checkbox, 0, 2, 1, 2)
+        controls_grid.addWidget(self._auto_recover_checkbox, 0, 2)
+
+        self._settings_btn = QPushButton("Settings…")
+        self._settings_btn.setFixedWidth(75)
+        self._settings_btn.setToolTip(
+            "Open camera, spot detection, and lock loop parameters"
+        )
+        self._settings_btn.clicked.connect(self._on_settings_clicked)
+        controls_grid.addWidget(self._settings_btn, 0, 3)
 
         # Row 1: Adjust target (nudge) controls
         adjust_label = QLabel("Adjust target:")
@@ -626,12 +707,8 @@ class FocusLockStatusWidget(EventBusFrame):
         self._update_collapsed_ui()
 
     def _connect_events(self) -> None:
-        self._subscribe(FocusLockStatusChanged, self._on_status_changed)
-        self._subscribe(FocusLockMetricsUpdated, self._on_metrics_updated)
-        self._subscribe(FocusLockFrameUpdated, self._on_frame_updated)
-        self._subscribe(FocusLockWarning, self._on_warning)
-        self._subscribe(FocusLockModeChanged, self._on_mode_changed)
-        self._subscribe(FocusLockSearchProgress, self._on_search_progress)
+        # Subscriptions are now handled automatically by EventBusFrame base class
+        pass
 
     def _toggle_collapsed(self) -> None:
         self._collapsed = not self._collapsed
@@ -700,33 +777,70 @@ class FocusLockStatusWidget(EventBusFrame):
         self._collapsed_lock_btn.setText(lock_label)
 
     def _on_start_stop(self) -> None:
-        if self._is_running:
+        if self._status == "paused":
+            self._publish(ResumeFocusLockCommand())
+        elif self._is_running:
             self._publish(StopFocusLockCommand())
         else:
             self._publish(StartFocusLockCommand())
 
     def _on_lock_release(self) -> None:
-        if self._status == "locked":
+        if self._status in ("locked", "recovering"):
             self._publish(ReleaseFocusLockReferenceCommand())
         else:
             self._publish(SetFocusLockReferenceCommand())
+
+    def _on_settings_clicked(self) -> None:
+        if self._settings_dialog is None:
+            from squid.ui.widgets.hardware.focus_lock_settings_dialog import (
+                FocusLockSettingsDialog,
+            )
+
+            self._settings_dialog = FocusLockSettingsDialog(
+                event_bus=self._bus,
+                initial_laser_af_properties=self._initial_laser_af_properties,
+                initial_focus_lock_config=self._config,
+                parent=self,
+            )
+        self._settings_dialog.show()
+        self._settings_dialog.raise_()
+        self._settings_dialog.activateWindow()
 
     def _nudge(self, direction: float) -> None:
         delta = direction * float(self._nudge_step.value())
         if delta != 0.0:
             self._publish(AdjustFocusLockTargetCommand(delta_um=delta))
 
+    @handles(FocusLockModeChanged)
     def _on_mode_changed(self, event: FocusLockModeChanged) -> None:
         self._mode = event.mode
         self._sync_mode_ui()
 
+    @handles(FocusLockStatusChanged)
     def _on_status_changed(self, event: FocusLockStatusChanged) -> None:
         self._status = event.status
-        self._is_running = event.status in ("ready", "locked", "recovering", "searching", "lost")
+        self._is_running = event.status in ("ready", "locked", "recovering", "searching", "lost", "paused")
         self._lock_buffer_fill = event.lock_buffer_fill
         self._lock_buffer_length = event.lock_buffer_length
         self._sync_status_ui()
 
+    @handles(SetFocusLockParamsCommand)
+    def _on_focus_lock_params_changed(self, event: SetFocusLockParamsCommand) -> None:
+        updates = {}
+        if event.buffer_length is not None:
+            updates["buffer_length"] = event.buffer_length
+        if event.recovery_attempts is not None:
+            updates["recovery_attempts"] = event.recovery_attempts
+        if event.min_spot_snr is not None:
+            updates["min_spot_snr"] = event.min_spot_snr
+        if event.acquire_threshold_um is not None:
+            updates["acquire_threshold_um"] = event.acquire_threshold_um
+        if event.maintain_threshold_um is not None:
+            updates["maintain_threshold_um"] = event.maintain_threshold_um
+        if updates:
+            self._config = self._config.model_copy(update=updates)
+
+    @handles(FocusLockMetricsUpdated)
     def _on_metrics_updated(self, event: FocusLockMetricsUpdated) -> None:
         self._z_position_um = event.z_position_um
         self._z_error_um = event.z_error_um
@@ -764,7 +878,7 @@ class FocusLockStatusWidget(EventBusFrame):
         if self._spot_snr is not None and not math.isnan(self._spot_snr):
             self._snr_label.setText(f"SNR: {self._spot_snr:.0f}")
             self._collapsed_snr.setText(f"SNR: {self._spot_snr:.0f}")
-            if self._spot_snr < 5.0:
+            if self._spot_snr < self._config.min_spot_snr:
                 self._snr_label.setStyleSheet("color: #ff6666;")
             else:
                 self._snr_label.setStyleSheet("")
@@ -837,6 +951,7 @@ class FocusLockStatusWidget(EventBusFrame):
         self._lock_label.setText(lock_text)
         self._collapsed_lock.setText(f"Lock: {lock_text}")
 
+    @handles(FocusLockFrameUpdated)
     def _on_frame_updated(self, event: FocusLockFrameUpdated) -> None:
         """Handle frame update events from focus lock controller."""
         self._spot_preview.set_frame(
@@ -867,6 +982,7 @@ class FocusLockStatusWidget(EventBusFrame):
             self._jump_btn.setToolTip("Move piezo to center + offset")
             self._center_btn.setToolTip("Move piezo to center of range")
 
+    @handles(FocusLockWarning)
     def _on_warning(self, event: FocusLockWarning) -> None:
         # Log warnings from backend but no separate indicator
         pass
@@ -889,16 +1005,16 @@ class FocusLockStatusWidget(EventBusFrame):
         center = self._piezo_range_um / 2.0
         self._publish(SetPiezoPositionCommand(position_um=center))
 
+    @handles(FocusLockSearchProgress)
     def _on_search_progress(self, event: FocusLockSearchProgress) -> None:
         """Handle search progress events."""
         # Update status label to show search progress
         if event.phase == "last_position":
-            self._status_label.setText(f"SEARCH: last pos")
+            self._status_label.setText("SEARCH: last pos")
         else:
             # Show progress through sweep
-            progress = (event.current_position_um - event.search_min_um) / (
-                event.search_max_um - event.search_min_um
-            )
+            span = event.search_max_um - event.search_min_um
+            progress = (event.current_position_um - event.search_min_um) / span if span > 0 else 0.0
             self._status_label.setText(f"SEARCH: {progress * 100:.0f}%")
 
     def pause(self) -> None:

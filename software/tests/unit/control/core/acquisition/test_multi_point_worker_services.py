@@ -1,11 +1,17 @@
-"""Tests for MultiPointWorker service routing and abort handling."""
+"""Tests for MultiPointWorker service usage and abort handling."""
 
 from types import SimpleNamespace
+import queue
 from unittest.mock import MagicMock
 
 import numpy as np
 
-from squid.core.events import EventBus, AcquisitionWorkerFinished
+from squid.core.events import (
+    EventBus,
+    AcquisitionWorkerFinished,
+    AutofocusMode,
+    FocusLockSettings,
+)
 import _def as _def
 
 # Avoid spawning JobRunner processes in tests
@@ -16,6 +22,7 @@ from squid.backend.controllers.multipoint.multi_point_utils import (
     AcquisitionParameters,
     ScanPositionInformation,
 )
+from squid.backend.controllers.multipoint.job_processing import JobResult
 
 
 def _make_params() -> AcquisitionParameters:
@@ -39,13 +46,13 @@ def _make_params() -> AcquisitionParameters:
         deltaZ=0.0,
         Nt=1,
         deltat=0.0,
-        do_autofocus=False,
-        do_reflection_autofocus=False,
+        autofocus_mode=AutofocusMode.NONE,
+        autofocus_interval_fovs=1,
+        focus_lock_settings=FocusLockSettings(),
         use_piezo=False,
         display_resolution_scaling=1.0,
         z_stacking_config="FROM BOTTOM",
         z_range=(0.0, 0.0),
-        use_fluidics=False,
     )
 
 
@@ -55,6 +62,7 @@ def _make_worker(
     stage_service: MagicMock | None = None,
     peripheral_service: MagicMock | None = None,
     event_bus: EventBus | None = None,
+    abort_on_failed_jobs: bool = True,
 ) -> MultiPointWorker:
     """Helper to build a worker with injectable services."""
     objective_store = SimpleNamespace(
@@ -84,42 +92,62 @@ def _make_worker(
         stage_service=stage_service,
         peripheral_service=peripheral_service,
         event_bus=event_bus,
+        abort_on_failed_jobs=abort_on_failed_jobs,
     )
 
 
-def test_camera_helpers_use_service_not_hardware():
+def test_worker_instantiation():
+    """Test that MultiPointWorker can be instantiated without errors."""
     cam_service = MagicMock()
-    cam_service.add_frame_callback.return_value = "svc_cb"
     cam_service.get_pixel_size_binned_um.return_value = 1.0
+    cam_service.get_total_frame_time.return_value = 10.0
     stage_service = MagicMock()
     stage_service.get_position.return_value = SimpleNamespace(
         x_mm=0.0, y_mm=0.0, z_mm=0.0
     )
+
     worker = _make_worker(
-        camera_service=cam_service, stage_service=stage_service, peripheral_service=MagicMock()
+        camera_service=cam_service,
+        stage_service=stage_service,
+        peripheral_service=MagicMock(),
     )
 
-    cb_id = worker._camera_add_frame_callback(lambda *_: None)
-    worker._camera_start_streaming()
+    # Verify domain objects are created
+    assert worker._progress_tracker is not None
+    assert worker._coordinate_tracker is not None
+    assert worker._position_controller is not None
+    assert worker._zstack_executor is not None
+    assert worker._autofocus_executor is not None
 
+
+def test_run_uses_camera_service_directly():
+    """Test that run() uses camera service directly (not via wrappers)."""
+    cam_service = MagicMock()
+    cam_service.add_frame_callback.return_value = "cb_id"
+    cam_service.get_pixel_size_binned_um.return_value = 1.0
+    cam_service.get_total_frame_time.return_value = 10.0
+    stage_service = MagicMock()
+    stage_service.get_position.return_value = SimpleNamespace(
+        x_mm=0.0, y_mm=0.0, z_mm=0.0
+    )
+
+    worker = _make_worker(
+        camera_service=cam_service,
+        stage_service=stage_service,
+        peripheral_service=MagicMock(),
+    )
+    worker.request_abort()  # Abort immediately
+    worker.run()
+
+    # Verify camera service was called directly
     cam_service.add_frame_callback.assert_called_once()
     cam_service.start_streaming.assert_called_once()
-    assert cb_id == "svc_cb"
-
-
-def test_stage_helpers_wait_and_use_service():
-    stage_service = MagicMock()
-    stage_service.get_position.return_value = SimpleNamespace(
-        x_mm=0.0, y_mm=0.0, z_mm=0.0
-    )
-    worker = _make_worker(stage_service=stage_service)
-
-    worker._stage_move_x_to(1.0)
-    stage_service.move_x_to.assert_called_once_with(1.0)
-    stage_service.wait_for_idle.assert_called()
+    cam_service.stop_streaming.assert_called_once()
+    cam_service.remove_frame_callback.assert_called_once_with("cb_id")
 
 
 def test_abort_sets_finished_event_success_false():
+    """Test that aborting an acquisition publishes a failure event."""
     bus = EventBus()
     events: list[AcquisitionWorkerFinished] = []
     bus.subscribe(AcquisitionWorkerFinished, events.append)
@@ -148,6 +176,7 @@ def test_abort_sets_finished_event_success_false():
 
 
 def test_acquire_rgb_image_emits_stream_handler_frame(tmp_path):
+    """Test that RGB image acquisition emits proper stream handler frame."""
     cam_service = MagicMock()
     cam_service.get_pixel_size_binned_um.return_value = 1.0
     cam_service.get_total_frame_time.return_value = 10.0
@@ -194,3 +223,63 @@ def test_acquire_rgb_image_emits_stream_handler_frame(tmp_path):
     args, kwargs = stream_handler.on_new_image.call_args
     assert args[0].shape == (8, 12, 3)
     assert kwargs["capture_info"].configuration.name == "BF LED matrix full_RGB"
+
+
+def test_abort_on_failed_job_requests_abort() -> None:
+    """Worker requests abort when a job fails and abort_on_failed_jobs is True."""
+
+    class DummyJob:
+        __name__ = "DummyJob"
+
+    class DummyRunner:
+        def __init__(self, out_queue):
+            self._out_queue = out_queue
+
+        def output_queue(self):
+            return self._out_queue
+
+    worker = _make_worker()
+    out_queue = queue.Queue()
+    out_queue.put(JobResult(job_id="job-1", result=None, exception=RuntimeError("fail")))
+    worker._job_runners = [(DummyJob, DummyRunner(out_queue))]
+
+    worker._summarize_runner_outputs()
+
+    assert worker._abort_requested.is_set()
+
+
+def test_failed_job_does_not_abort_when_disabled() -> None:
+    """Worker does not abort on job failure when abort_on_failed_jobs is False."""
+
+    class DummyJob:
+        __name__ = "DummyJob"
+
+    class DummyRunner:
+        def __init__(self, out_queue):
+            self._out_queue = out_queue
+
+        def output_queue(self):
+            return self._out_queue
+
+    worker = _make_worker(abort_on_failed_jobs=False)
+    out_queue = queue.Queue()
+    out_queue.put(JobResult(job_id="job-1", result=None, exception=RuntimeError("fail")))
+    worker._job_runners = [(DummyJob, DummyRunner(out_queue))]
+
+    worker._summarize_runner_outputs()
+
+    assert not worker._abort_requested.is_set()
+
+
+def test_handle_z_offset_moves_relative() -> None:
+    """handle_z_offset applies per-channel offsets via position controller."""
+    worker = _make_worker()
+    worker._position_controller = MagicMock()
+    config = SimpleNamespace(z_offset=50.0)
+
+    worker.handle_z_offset(config, True)
+    worker._position_controller.move_z_relative.assert_called_once_with(0.05)
+
+    worker._position_controller.move_z_relative.reset_mock()
+    worker.handle_z_offset(config, False)
+    worker._position_controller.move_z_relative.assert_called_once_with(-0.05)

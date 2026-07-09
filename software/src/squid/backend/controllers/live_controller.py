@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from dataclasses import dataclass, replace
 from enum import Enum, auto
 from typing import Optional, Set, TYPE_CHECKING
@@ -12,10 +13,12 @@ from squid.backend.services.peripheral_service import PeripheralService
 from squid.backend.services.illumination_service import IlluminationService
 from squid.backend.services.filter_wheel_service import FilterWheelService
 from squid.backend.services.nl5_service import NL5Service
+from squid.backend.services.acquisition_service import AcquisitionService
 from squid.core.events import (
     EventBus,
     StartLiveCommand,
     StopLiveCommand,
+    SetMicroscopeModeCommand,
     SetTriggerModeCommand,
     SetTriggerFPSCommand,
     SetFilterAutoSwitchCommand,
@@ -25,15 +28,21 @@ from squid.core.events import (
     TriggerModeChanged,
     TriggerFPSChanged,
     FilterAutoSwitchChanged,
+    handles,
 )
 from squid.core.state_machine import StateMachine, InvalidStateForOperation
 from squid.core.mode_gate import GlobalMode, GlobalModeGate
 
-from _def import *
+from _def import (
+    NL5_USE_AOUT,
+    NL5_USE_DOUT,
+    NL5_WAVENLENGTH_MAP,
+    TriggerMode,
+)
 from squid.core.utils import utils_channel
 
 if TYPE_CHECKING:
-    from squid.core.utils.config_utils import ChannelMode
+    from squid.core.config.models import AcquisitionChannel
 
 
 class LiveControllerState(Enum):
@@ -71,6 +80,7 @@ class LiveController(StateMachine[LiveControllerState]):
         for_displacement_measurement: bool = False,
         *,
         camera: str = "main",
+        acquisition_service: Optional[AcquisitionService] = None,
     ) -> None:
         # Initialize state machine with transitions
         transitions = {
@@ -87,9 +97,7 @@ class LiveController(StateMachine[LiveControllerState]):
         )
 
         self._log = squid.core.logging.get_logger(self.__class__.__name__)
-        # Note: StateMachine base class provides self._lock
-        self._bus: EventBus = event_bus
-        self._bus_subscribed: bool = False
+        # Note: StateMachine base class provides self._lock and _event_bus
         self._camera_service: CameraService = camera_service
         self._camera: str = camera
         self._illumination_service = illumination_service
@@ -97,7 +105,9 @@ class LiveController(StateMachine[LiveControllerState]):
         self._filter_wheel_service = filter_wheel_service
         self._nl5_service = nl5_service
         self._mode_gate = mode_gate
-        self.currentConfiguration: Optional["ChannelMode"] = None
+        self._acquisition_service = acquisition_service
+        self._channel_configs: dict = {}  # Set via set_channel_configs()
+        self.currentConfiguration: Optional["AcquisitionChannel"] = None
         self.trigger_mode: Optional[TriggerMode] = (
             TriggerMode.SOFTWARE
         )  # @@@ change to None
@@ -109,9 +119,17 @@ class LiveController(StateMachine[LiveControllerState]):
         )
         self.for_displacement_measurement: bool = for_displacement_measurement
 
-        self.fps_trigger: float = 1
+        self.fps_trigger: float = 10
         self.timer_trigger_interval: float = (1.0 / self.fps_trigger) * 1000
         self._trigger_skip_count: int = 0
+        # Frozen-live-view auto-recovery: timestamp of the first of an unbroken
+        # run of "camera not ready" ticks while live. None means the live view is
+        # healthy. A sustained stall (readiness stuck, or callbacks disabled e.g.
+        # by the laser-AF controller and never re-enabled) means frames stopped
+        # arriving; we re-arm the camera instead of counting skips forever.
+        self._live_stall_since: Optional[float] = None
+        self._live_stall_recovery_min_s: float = 2.0
+        self._live_stall_recovery_max_s: float = 10.0
         self.timer_trigger: Optional[threading.Timer] = None
         self._illumination_off_pending: bool = False
 
@@ -146,34 +164,15 @@ class LiveController(StateMachine[LiveControllerState]):
             {StopLiveCommand, SetTriggerModeCommand, SetTriggerFPSCommand, UpdateIlluminationCommand}
         )
 
-        # Subscribe to commands if event bus provided
-        self._subscribe_to_bus(self._bus)
-
     def _publish_state_changed(self, old_state: LiveControllerState, new_state: LiveControllerState) -> None:
         """Publish state change event (StateMachine abstract method)."""
-        if self._bus:
+        if self._event_bus:
             is_live = new_state == LiveControllerState.LIVE
-            self._bus.publish(LiveStateChanged(
+            self._event_bus.publish(LiveStateChanged(
                 camera=self._camera,
                 is_live=is_live,
                 configuration=self.currentConfiguration.name if self.currentConfiguration else None,
             ))
-
-    def _subscribe_to_bus(self, bus: Optional[EventBus]) -> None:
-        """Subscribe to command events once for the provided bus."""
-        if bus is None or self._bus_subscribed:
-            return
-        bus.subscribe(StartLiveCommand, self._on_start_live_command)
-        bus.subscribe(StopLiveCommand, self._on_stop_live_command)
-        bus.subscribe(SetTriggerModeCommand, self._on_set_trigger_mode_command)
-        bus.subscribe(SetTriggerFPSCommand, self._on_set_trigger_fps_command)
-        bus.subscribe(SetFilterAutoSwitchCommand, self._on_set_filter_auto_switch)
-        bus.subscribe(UpdateIlluminationCommand, self._on_update_illumination)
-        bus.subscribe(
-            SetDisplayResolutionScalingCommand,
-            self._on_set_display_resolution_scaling,
-        )
-        self._bus_subscribed = True
 
     # illumination control
     def _get_illumination_channel(self) -> Optional[int]:
@@ -213,6 +212,14 @@ class LiveController(StateMachine[LiveControllerState]):
     def turn_on_illumination(self) -> None:
         if self.currentConfiguration is None:
             return
+
+        # Use AcquisitionService if available (preferred path)
+        if self._acquisition_service is not None:
+            if self._acquisition_service.turn_on_illumination(self.currentConfiguration):
+                self.illumination_on = True
+            return
+
+        # Fallback to direct service access
         if self._illumination_service is None:
             return
         channel = self._get_illumination_channel()
@@ -231,10 +238,22 @@ class LiveController(StateMachine[LiveControllerState]):
     def turn_off_illumination(self) -> None:
         if self.currentConfiguration is None:
             return
+
+        # Use AcquisitionService if available (preferred path)
+        if self._acquisition_service is not None:
+            if self._acquisition_service.turn_off_illumination(self.currentConfiguration):
+                self.illumination_on = False
+            return
+
+        # Fallback to direct service access
         if self._illumination_service is None:
             return
         channel = self._get_illumination_channel()
         if channel is None:
+            self._log.warning(
+                "turn_off_illumination() skipped - no illumination channel configured for '%s'",
+                getattr(self.currentConfiguration, "name", "None"),
+            )
             return
         try:
             self._illumination_service.turn_off_channel(channel)
@@ -352,6 +371,42 @@ class LiveController(StateMachine[LiveControllerState]):
                 )
         except Exception:
             self._log.exception("Failed to start live; cleaning up")
+            # Best-effort undo of the partial startup. Without this, is_live stays
+            # True (set above before the hardware calls), which makes a later
+            # stop_live() return early (state != LIVE) and leaves streaming,
+            # callbacks, illumination and the AF laser running. is_live is cleared
+            # first so any in-flight trigger-timer callback observes the stop and
+            # does not re-arm. Every step is guarded so cleanup cannot itself raise.
+            with self._lock:
+                self.is_live = False
+                try:
+                    self._stop_triggerred_acquisition()
+                except Exception:
+                    self._log.exception("Cleanup: failed to stop triggered acquisition")
+                try:
+                    self._camera_service.stop_streaming()
+                except Exception:
+                    self._log.exception("Cleanup: failed to stop camera streaming")
+                try:
+                    self._camera_service.enable_callbacks(False)
+                except Exception:
+                    self._log.exception("Cleanup: failed to disable camera callbacks")
+                if self.control_illumination:
+                    try:
+                        self.turn_off_illumination()
+                    except Exception:
+                        self._log.exception("Cleanup: failed to turn off illumination")
+                self._illumination_off_pending = False
+                if self.for_displacement_measurement and self._peripheral_service:
+                    try:
+                        self._peripheral_service.turn_off_af_laser()
+                    except Exception:
+                        self._log.exception("Cleanup: failed to turn off AF laser")
+                self._observable_state = replace(
+                    self._observable_state,
+                    is_live=False,
+                    illumination_on=False,
+                )
             if self._mode_gate and previous_mode is not None:
                 self._mode_gate.restore_mode(previous_mode, reason="live start failed")
             self._transition_to(LiveControllerState.STOPPED)
@@ -437,9 +492,12 @@ class LiveController(StateMachine[LiveControllerState]):
                     self._log.debug(
                         f"Not ready for trigger, skipping (_trigger_skip_count={self._trigger_skip_count}, total frame time = {total_frame_time} [ms])."
                     )
+                self._handle_trigger_not_ready()
                 return False
 
+            # A successful trigger means the live view is healthy: clear stall tracking.
             self._trigger_skip_count = 0
+            self._live_stall_since = None
             if self.trigger_mode == TriggerMode.SOFTWARE and self.control_illumination:
                 if not self.illumination_on:
                     self.turn_on_illumination()
@@ -449,6 +507,79 @@ class LiveController(StateMachine[LiveControllerState]):
             self._camera_service.send_trigger()
 
             return True
+
+    def _handle_trigger_not_ready(self) -> None:
+        """Auto-recover a stalled live view on a 'camera not ready' tick.
+
+        A single skipped trigger is normal over-triggering. But an *unbroken* run
+        of skips while live means the live view has silently stopped receiving
+        frames (frozen/black) - historically this only recovered when the user
+        changed channel/exposure. Detect a sustained stall and re-arm the camera
+        automatically. Called while holding self._lock.
+        """
+        if not self.is_live:
+            return
+
+        now = time.time()
+        if self._live_stall_since is None:
+            self._live_stall_since = now
+            return
+
+        stalled_for = now - self._live_stall_since
+        if stalled_for < self._live_stall_recovery_threshold():
+            return
+
+        exposure_ms = float("nan")
+        try:
+            exposure_ms = self._camera_service.get_exposure_time()
+        except Exception:
+            pass
+        self._log.warning(
+            f"Live view stalled for {stalled_for:.1f}s with no camera frame "
+            f"(exposure={exposure_ms:.0f}ms) - re-arming camera trigger."
+        )
+        self._recover_stalled_live()
+        # Restart the stall clock so recovery is rate-limited to once per threshold.
+        self._live_stall_since = now
+
+    def _live_stall_recovery_threshold(self) -> float:
+        """Seconds of continuous 'not ready' to tolerate before treating the live
+        view as stalled.
+
+        Scales with the frame time so a legitimately long exposure is not mistaken
+        for a stall, but is clamped so a bogus/huge reported frame time cannot
+        disable recovery entirely.
+        """
+        frame_time_s = 0.0
+        try:
+            frame_time_s = self._camera_service.get_total_frame_time() / 1000.0
+        except Exception:
+            pass
+        return min(
+            self._live_stall_recovery_max_s,
+            max(self._live_stall_recovery_min_s, 3.0 * frame_time_s),
+        )
+
+    def _recover_stalled_live(self) -> None:
+        """Re-arm a stalled software-trigger live view (mirrors a manual
+        channel/exposure change). Re-enabling callbacks clears the most common
+        cause - callbacks disabled by the laser-AF controller and never restored -
+        and a restart of streaming clears a camera whose readiness is stuck."""
+        try:
+            self._camera_service.enable_callbacks(True)
+        except Exception:
+            self._log.exception("enable_callbacks failed during live-view stall recovery.")
+        # Some cameras expose an explicit trigger-readiness reset; use it if present.
+        reset_trigger_readiness = getattr(
+            self._camera_service, "reset_trigger_readiness", None
+        )
+        if callable(reset_trigger_readiness):
+            try:
+                reset_trigger_readiness()
+            except Exception:
+                self._log.exception(
+                    "reset_trigger_readiness failed during live-view stall recovery."
+                )
 
     def _stop_existing_timer(self) -> None:
         with self._lock:
@@ -545,16 +676,24 @@ class LiveController(StateMachine[LiveControllerState]):
 
     # set microscope mode
     # @@@ to do: change softwareTriggerGenerator to TriggerGeneratror
-    def set_microscope_mode(self, configuration: "ChannelMode") -> None:
+    def set_microscope_mode(self, configuration: "AcquisitionChannel") -> None:
+        if configuration is None:
+            self._log.error("set_microscope_mode() called with None configuration - this is a bug in the caller")
+            return
         with self._lock:
-            self.currentConfiguration = configuration
-            self._log.info("setting microscope mode to " + self.currentConfiguration.name)
+            self._log.info("setting microscope mode to " + configuration.name)
 
             # temporarily stop live while changing mode
             if self.is_live is True:
                 self._stop_existing_timer()
                 if self.control_illumination:
+                    # Turn off illumination BEFORE switching self.currentConfiguration.
+                    # turn_off_illumination() reads self.currentConfiguration to determine which
+                    # illumination channel to turn off. If we switch first, we'd turn off the NEW
+                    # channel's illumination instead of the OLD channel's (which is still on).
                     self.turn_off_illumination()
+
+            self.currentConfiguration = configuration
 
             # set camera exposure time and analog gain
             exposure = self.currentConfiguration.exposure_time
@@ -621,21 +760,27 @@ class LiveController(StateMachine[LiveControllerState]):
 
     @staticmethod
     def _str_to_trigger_mode(mode_str: str) -> TriggerMode:
-        """Convert string to TriggerMode enum."""
-        mode_str_lower = mode_str.lower()
-        if mode_str_lower == "software":
+        """Convert a trigger-mode string to its canonical TriggerMode value.
+
+        Delegates to TriggerMode.convert_to_var, which accepts BOTH the full
+        value published by the UI dropdowns ("Hardware Trigger") AND the short
+        name ("Hardware"/"hardware") used by the backend/tests. Previously this
+        only matched the lowercased short names, so full values like
+        "Hardware Trigger"/"Continuous Acquisition" from the live-view dropdowns
+        silently fell through to SOFTWARE. Falls back to SOFTWARE for anything
+        unrecognized (preserving the prior defensive default).
+        """
+        try:
+            return TriggerMode.convert_to_var(mode_str)
+        except (ValueError, AttributeError):
             return TriggerMode.SOFTWARE
-        elif mode_str_lower == "hardware":
-            return TriggerMode.HARDWARE
-        elif mode_str_lower == "continuous":
-            return TriggerMode.CONTINUOUS
-        return TriggerMode.SOFTWARE
 
     @property
     def observable_state(self) -> LiveStateData:
         """Get current observable state data."""
         return self._observable_state
 
+    @handles(StartLiveCommand)
     def _on_start_live_command(self, cmd: StartLiveCommand) -> None:
         """Handle StartLiveCommand from EventBus."""
         if getattr(cmd, "camera", "main") != self._camera:
@@ -643,6 +788,7 @@ class LiveController(StateMachine[LiveControllerState]):
         self._log.info(f"_on_start_live_command: is_live={self.is_live}, config={cmd.configuration}")
         self._start_live(cmd.configuration)
 
+    @handles(StopLiveCommand)
     def _on_stop_live_command(self, cmd: StopLiveCommand) -> None:
         """Handle StopLiveCommand from EventBus."""
         if getattr(cmd, "camera", "main") != self._camera:
@@ -650,6 +796,7 @@ class LiveController(StateMachine[LiveControllerState]):
         self._log.info(f"_on_stop_live_command: is_live={self.is_live}")
         self._stop_live()
 
+    @handles(SetTriggerModeCommand)
     def _on_set_trigger_mode_command(self, cmd: SetTriggerModeCommand) -> None:
         """Handle SetTriggerModeCommand from EventBus."""
         if getattr(cmd, "camera", "main") != self._camera:
@@ -701,9 +848,10 @@ class LiveController(StateMachine[LiveControllerState]):
             self._observable_state = replace(self._observable_state, trigger_mode=cmd.mode)
 
         # Publish outside lock
-        if self._bus:
-            self._bus.publish(TriggerModeChanged(camera=self._camera, mode=cmd.mode))
+        if self._event_bus:
+            self._event_bus.publish(TriggerModeChanged(camera=self._camera, mode=cmd.mode))
 
+    @handles(SetTriggerFPSCommand)
     def _on_set_trigger_fps_command(self, cmd: SetTriggerFPSCommand) -> None:
         """Handle SetTriggerFPSCommand from EventBus."""
         if getattr(cmd, "camera", "main") != self._camera:
@@ -735,22 +883,43 @@ class LiveController(StateMachine[LiveControllerState]):
             self._observable_state = replace(self._observable_state, trigger_fps=cmd.fps)
 
         # Publish outside lock
-        if self._bus:
-            self._bus.publish(TriggerFPSChanged(camera=self._camera, fps=cmd.fps))
+        if self._event_bus:
+            self._event_bus.publish(TriggerFPSChanged(camera=self._camera, fps=cmd.fps))
 
+    @handles(SetFilterAutoSwitchCommand)
     def _on_set_filter_auto_switch(self, cmd: SetFilterAutoSwitchCommand) -> None:
         """Handle SetFilterAutoSwitchCommand from EventBus."""
         with self._lock:
             self.enable_channel_auto_filter_switching = cmd.enabled
 
         # Publish state change outside lock
-        if self._bus:
-            self._bus.publish(FilterAutoSwitchChanged(enabled=cmd.enabled))
+        if self._event_bus:
+            self._event_bus.publish(FilterAutoSwitchChanged(enabled=cmd.enabled))
 
+    @handles(SetMicroscopeModeCommand)
+    def _on_set_microscope_mode_command(self, cmd: SetMicroscopeModeCommand) -> None:
+        """Handle SetMicroscopeModeCommand from EventBus."""
+        if getattr(cmd, "camera", "main") != self._camera:
+            return
+        config = self._channel_configs.get(cmd.configuration_name)
+        if config is None:
+            self._log.warning(
+                "SetMicroscopeModeCommand: config '%s' not found", cmd.configuration_name
+            )
+            return
+        self.set_microscope_mode(config)
+
+    def set_channel_configs(self, channel_configs: dict) -> None:
+        """Set channel configuration mapping for event-driven mode switching."""
+        self._channel_configs = channel_configs
+
+    @handles(UpdateIlluminationCommand)
     def _on_update_illumination(self, cmd: UpdateIlluminationCommand) -> None:
         """Handle UpdateIlluminationCommand from EventBus."""
         self.update_illumination()
 
+    @handles(SetDisplayResolutionScalingCommand)
     def _on_set_display_resolution_scaling(self, cmd: SetDisplayResolutionScalingCommand) -> None:
         """Handle SetDisplayResolutionScalingCommand from EventBus."""
         self.set_display_resolution_scaling(cmd.scaling)
+

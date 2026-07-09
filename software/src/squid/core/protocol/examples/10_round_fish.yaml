@@ -1,0 +1,136 @@
+# 10-Round FISH Protocol (V2 Format)
+# Example protocol for fluorescence in situ hybridization experiments
+
+name: "10-Round FISH"
+version: "2.0"
+description: |
+  Standard 10-round FISH protocol with DAPI and Cy5 imaging.
+  Includes wash steps between imaging rounds.
+author: "Squid Team"
+
+error_handling:
+  focus_failure: skip
+  fluidics_failure: abort
+  imaging_failure: warn
+
+# NOTE: Fluidics protocols are loaded separately into the FluidicsController.
+# This protocol references named fluidics protocols by name only.
+imaging_protocols:
+  fish_standard:
+    description: "Standard FISH imaging"
+    channels:
+      - name: "Fluorescence 405 nm Ex"
+        exposure_time_ms: 200.0
+      - name: "Fluorescence 638 nm Ex"
+        exposure_time_ms: 200.0
+    z_stack:
+      planes: 15
+      step_um: 1.5
+      direction: from_center
+    focus:
+      enabled: true
+      method: laser
+      interval_fovs: 1
+
+rounds:
+  # Round 1
+  - name: "Round 1"
+    steps:
+      - step_type: fluidics
+        protocol: probe_1
+      - step_type: fluidics
+        protocol: wash
+      - step_type: imaging
+        protocol: fish_standard
+
+  # Round 2
+  - name: "Round 2"
+    steps:
+      - step_type: fluidics
+        protocol: probe_2
+      - step_type: fluidics
+        protocol: wash
+      - step_type: imaging
+        protocol: fish_standard
+
+  # Round 3
+  - name: "Round 3"
+    steps:
+      - step_type: fluidics
+        protocol: probe_3
+      - step_type: fluidics
+        protocol: wash
+      - step_type: imaging
+        protocol: fish_standard
+
+  # Round 4
+  - name: "Round 4"
+    steps:
+      - step_type: fluidics
+        protocol: probe_4
+      - step_type: fluidics
+        protocol: wash
+      - step_type: imaging
+        protocol: fish_standard
+
+  # Round 5
+  - name: "Round 5"
+    steps:
+      - step_type: fluidics
+        protocol: probe_5
+      - step_type: fluidics
+        protocol: wash
+      - step_type: imaging
+        protocol: fish_standard
+
+  # Round 6 - with operator intervention
+  - name: "Round 6"
+    steps:
+      - step_type: intervention
+        message: "Please check sample condition before continuing"
+      - step_type: fluidics
+        protocol: probe_6
+      - step_type: fluidics
+        protocol: wash
+      - step_type: imaging
+        protocol: fish_standard
+
+  # Round 7
+  - name: "Round 7"
+    steps:
+      - step_type: fluidics
+        protocol: probe_7
+      - step_type: fluidics
+        protocol: wash
+      - step_type: imaging
+        protocol: fish_standard
+
+  # Round 8
+  - name: "Round 8"
+    steps:
+      - step_type: fluidics
+        protocol: probe_8
+      - step_type: fluidics
+        protocol: wash
+      - step_type: imaging
+        protocol: fish_standard
+
+  # Round 9
+  - name: "Round 9"
+    steps:
+      - step_type: fluidics
+        protocol: probe_9
+      - step_type: fluidics
+        protocol: wash
+      - step_type: imaging
+        protocol: fish_standard
+
+  # Round 10 - final round
+  - name: "Round 10"
+    steps:
+      - step_type: fluidics
+        protocol: probe_10
+      - step_type: fluidics
+        protocol: final_wash
+      - step_type: imaging
+        protocol: fish_standard

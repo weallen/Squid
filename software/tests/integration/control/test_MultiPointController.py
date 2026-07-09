@@ -11,9 +11,17 @@ from squid.core.events import (
     AcquisitionWorkerFinished,
     CurrentFOVRegistered,
     AcquisitionCoordinates,
+    AutofocusMode,
 )
 
 import tests.control.test_stubs as ts
+
+# Generous ceiling for "acquisition finished" waits. Simulated acquisitions are
+# bounded and deterministic, so this is a safety net against a genuine hang, not
+# a performance budget: the wait returns as soon as the event fires, so a large
+# ceiling costs nothing when the machine is fast but prevents false failures when
+# it is slow/loaded (e.g. a heavy 2200x2200 sim camera with contrast autofocus).
+ACQUISITION_COMPLETION_TIMEOUT_S = 120
 
 
 def test_multi_point_controller_image_count_calculation():
@@ -215,7 +223,7 @@ def test_multi_point_controller_basic_acquisition():
 
     mpc.run_acquisition()
 
-    timeout_s = 5
+    timeout_s = ACQUISITION_COMPLETION_TIMEOUT_S
     assert tt.started_event.wait(timeout_s)
     assert tt.finished_event.wait(timeout_s)
 
@@ -237,7 +245,7 @@ def test_multi_point_with_laser_af():
 
     add_some_coordinates(mpc)
     select_some_configs(mpc, scope.objective_store.current_objective)
-    mpc.set_reflection_af_flag(True)
+    mpc.set_autofocus_mode(AutofocusMode.LASER_REFLECTION)
     scope.addons.camera_focus.send_trigger()
     laser_af_ref_image = scope.addons.camera_focus.read_frame()
     assert laser_af_ref_image is not None
@@ -247,7 +255,7 @@ def test_multi_point_with_laser_af():
 
     mpc.run_acquisition()
 
-    timeout_s = 5
+    timeout_s = ACQUISITION_COMPLETION_TIMEOUT_S
     assert tt.started_event.wait(timeout_s)
     assert tt.finished_event.wait(timeout_s)
 
@@ -269,10 +277,10 @@ def test_multi_point_with_contrast_af():
 
     add_some_coordinates(mpc)
     select_some_configs(mpc, scope.objective_store.current_objective)
-    mpc.set_af_flag(True)
+    mpc.set_autofocus_mode(AutofocusMode.CONTRAST)
     mpc.run_acquisition()
 
-    timeout_s = 5
+    timeout_s = ACQUISITION_COMPLETION_TIMEOUT_S
     assert tt.started_event.wait(timeout_s)
     assert tt.finished_event.wait(timeout_s)
 

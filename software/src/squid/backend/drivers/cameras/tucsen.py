@@ -1,8 +1,23 @@
-from ctypes import *
+import ctypes
+from ctypes import (
+    c_char,
+    c_char_p,
+    c_double,
+    c_int,
+    c_int32,
+    c_void_p,
+    cast,
+    create_string_buffer,
+    memmove,
+    memset,
+    pointer,
+    string_at,
+)
 import numpy as np
 import threading
 import time
-from typing import Optional, Callable, Sequence, Tuple, Dict
+from typing import Optional, Callable, Sequence, Tuple, Dict, Union
+from enum import Enum
 
 import pydantic
 
@@ -15,9 +30,51 @@ from squid.core.abc import (
     CameraGainRange,
 )
 import squid.core.logging
-from squid.backend.drivers.cameras.tucam_sdk import *
+from squid.backend.drivers.cameras.tucam_sdk import (
+    TUCAMRET,
+    TUCAM_Api_Init,
+    TUCAM_Api_Uninit,
+    TUCAM_Buf_AbortWait,
+    TUCAM_Buf_Alloc,
+    TUCAM_Buf_Release,
+    TUCAM_Buf_WaitForFrame,
+    TUCAM_CAPTURE_MODES,
+    TUCAM_Cap_DoSoftwareTrigger,
+    TUCAM_Cap_GetROI,
+    TUCAM_Cap_GetTrigger,
+    TUCAM_Cap_SetROI,
+    TUCAM_Cap_SetTrigger,
+    TUCAM_Cap_Start,
+    TUCAM_Cap_Stop,
+    TUCAM_Capa_GetValue,
+    TUCAM_Capa_SetValue,
+    TUCAM_Dev_Close,
+    TUCAM_Dev_GetInfo,
+    TUCAM_Dev_Open,
+    TUCAM_ELEMENT,
+    TUCAM_FRAME,
+    TUCAM_GenICam_ElementAttr,
+    TUCAM_GenICam_GetElementValue,
+    TUCAM_GenICam_SetElementValue,
+    TUCAM_IDCAPA,
+    TUCAM_IDINFO,
+    TUCAM_IDPROP,
+    TUCAM_INIT,
+    TUCAM_OPEN,
+    TUCAM_PROP_ATTR,
+    TUCAM_Prop_GetAttr,
+    TUCAM_Prop_GetValue,
+    TUCAM_Prop_SetValue,
+    TUCAM_REG_RW,
+    TUCAM_ROI_ATTR,
+    TUCAM_TRIGGER_ATTR,
+    TUCAM_VALUE_INFO,
+    TUELEM_TYPE,
+    TUFRM_FORMATS,
+    TUSDKdll,
+    TUXML_DEVICE,
+)
 import squid.core.utils.hardware_utils
-from _def import *
 
 
 class Mode400BSIV3(Enum):
@@ -55,10 +112,21 @@ class ModeAries(Enum):
     SENSITIVITY = 2
 
 
+class ModeLibra(Enum):
+    """
+    Store setting values for TUIDC_RESOLUTION here.
+    Libra25 has two binning modes: Sensitive (2600 x 2048), and Resolution (5200 x 4096).
+    Libra22: Sensitive (2048 x 2048), Resolution (4096 x 4096)
+    """
+
+    RESOLUTION = 0
+    SENSITIVE = 1
+
+
 class TucsenModelProperties(pydantic.BaseModel):
     binning_to_resolution: Dict[Tuple[int, int], Tuple[int, int]]
     binning_to_set_value: Dict[Tuple[int, int], int]
-    mode_to_line_rate_us: Dict[Union[Mode400BSIV3, ModeFL26BW, ModeAries], float]
+    mode_to_line_rate_us: Dict[Union[Mode400BSIV3, ModeFL26BW, ModeAries, ModeLibra], float]
     pixel_size_um: float
     has_temperature_control: bool
     is_genicam: bool
@@ -179,6 +247,11 @@ class TucsenCamera(AbstractCamera):
             or self._config.camera_model == TucsenCameraModel.ARIES_6510
         ):
             self._camera_mode = ModeAries.HDR  # HDR as default
+        elif (
+            self._config.camera_model == TucsenCameraModel.LIBRA_25
+            or self._config.camera_model == TucsenCameraModel.LIBRA_22
+        ):
+            self._camera_mode = ModeLibra.SENSITIVE  # SENSITIVE as default
 
         self._m_frame = None  # image buffer
         # We need to keep trigger attribute for starting and stopping streaming
@@ -269,6 +342,23 @@ class TucsenCamera(AbstractCamera):
                     (2, 2): (1600, 1600),
                     (4, 4): (800, 800),
                 }
+        elif camera_model == TucsenCameraModel.LIBRA_25 or camera_model == TucsenCameraModel.LIBRA_22:
+            # TODO: Support additional binning modes for LIBRA_25 and LIBRA_22
+            binning_to_resolution = {
+                (1, 1): (5200, 4096),
+                (2, 2): (2600, 2048),  # 2x2 binning is the default (SENSITIVE mode)
+            }
+            binning_to_set_value = {
+                (1, 1): ModeLibra.RESOLUTION.value,
+                (2, 2): ModeLibra.SENSITIVE.value,
+            }
+            mode_to_line_rate_us = {
+                ModeLibra.RESOLUTION: 34.67,
+                ModeLibra.SENSITIVE: 6.31,
+            }
+            pixel_size_um = 3.76
+            has_temperature_control = True
+            is_genicam = False
         else:
             raise ValueError(f"Unsupported camera model: {camera_model}")
 
@@ -945,9 +1035,9 @@ class TucsenCamera(AbstractCamera):
                 raise CameraError("Failed to set auto exposure")
 
         if enable:
-            self.log.info("Auto exposure enabled")
+            self._log.info("Auto exposure enabled")
         else:
-            self.log.info("Auto exposure disabled")
+            self._log.info("Auto exposure disabled")
 
     def _raw_set_analog_gain_fl26bw(self, gain: float):
         # For FL26BW model

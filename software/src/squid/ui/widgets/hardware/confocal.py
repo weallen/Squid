@@ -16,6 +16,9 @@ from qtpy.QtWidgets import (
 )
 
 from squid.core.events import (
+    auto_subscribe,
+    auto_unsubscribe,
+    handles,
     ObjectiveChanged,
     SetConfocalModeCommand,
 )
@@ -37,18 +40,21 @@ class SpinningDiskConfocalWidget(QWidget):
         self.xlight: Any = xlight
         self._event_bus = event_bus
         self._current_objective = initial_objective
+        self._subscriptions = []
 
         self.init_ui()
 
-        self.dropdown_emission_filter.setCurrentText(
-            str(self.xlight.get_emission_filter())
-        )
-        self.dropdown_dichroic.setCurrentText(str(self.xlight.get_dichroic()))
+        if self.xlight.has_emission_filters_wheel:
+            self.dropdown_emission_filter.setCurrentText(
+                str(self.xlight.get_emission_filter())
+            )
+            self.dropdown_emission_filter.currentIndexChanged.connect(
+                self.set_emission_filter
+            )
 
-        self.dropdown_emission_filter.currentIndexChanged.connect(
-            self.set_emission_filter
-        )
-        self.dropdown_dichroic.currentIndexChanged.connect(self.set_dichroic)
+        if self.xlight.has_dichroic_filters_wheel:
+            self.dropdown_dichroic.setCurrentText(str(self.xlight.get_dichroic()))
+            self.dropdown_dichroic.currentIndexChanged.connect(self.set_dichroic)
 
         self.disk_position_state = self.xlight.get_disk_position()
         if self._event_bus is not None and self._current_objective is not None:
@@ -65,11 +71,13 @@ class SpinningDiskConfocalWidget(QWidget):
         self.btn_toggle_widefield.clicked.connect(self.toggle_disk_position)
         self.btn_toggle_motor.clicked.connect(self.toggle_motor)
 
-        self.dropdown_filter_slider.valueChanged.connect(self.set_filter_slider)
+        if self.xlight.has_dichroic_filter_slider:
+            self.dropdown_filter_slider.valueChanged.connect(self.set_filter_slider)
 
         if self._event_bus is not None:
-            self._event_bus.subscribe(ObjectiveChanged, self._on_objective_changed)
+            self._subscriptions = auto_subscribe(self, self._event_bus)
 
+    @handles(ObjectiveChanged)
     def _on_objective_changed(self, event: ObjectiveChanged) -> None:
         if event.objective_name:
             self._current_objective = event.objective_name
@@ -106,17 +114,26 @@ class SpinningDiskConfocalWidget(QWidget):
             )
 
     def init_ui(self) -> None:
-        emissionFilterLayout = QHBoxLayout()
-        emissionFilterLayout.addWidget(QLabel("Emission Position"))
-        self.dropdown_emission_filter = QComboBox(self)
-        self.dropdown_emission_filter.addItems([str(i + 1) for i in range(8)])
-        emissionFilterLayout.addWidget(self.dropdown_emission_filter)
+        from _def import XLIGHT_EMISSION_FILTER_POSITIONS
 
-        dichroicLayout = QHBoxLayout()
-        dichroicLayout.addWidget(QLabel("Dichroic Position"))
-        self.dropdown_dichroic = QComboBox(self)
-        self.dropdown_dichroic.addItems([str(i + 1) for i in range(5)])
-        dichroicLayout.addWidget(self.dropdown_dichroic)
+        self.dropdown_emission_filter = None
+        self.dropdown_dichroic = None
+
+        if self.xlight.has_emission_filters_wheel:
+            emissionFilterLayout = QHBoxLayout()
+            emissionFilterLayout.addWidget(QLabel("Emission Position"))
+            self.dropdown_emission_filter = QComboBox(self)
+            self.dropdown_emission_filter.addItems(
+                [str(i + 1) for i in range(XLIGHT_EMISSION_FILTER_POSITIONS)]
+            )
+            emissionFilterLayout.addWidget(self.dropdown_emission_filter)
+
+        if self.xlight.has_dichroic_filters_wheel:
+            dichroicLayout = QHBoxLayout()
+            dichroicLayout.addWidget(QLabel("Dichroic Position"))
+            self.dropdown_dichroic = QComboBox(self)
+            self.dropdown_dichroic.addItems([str(i + 1) for i in range(5)])
+            dichroicLayout.addWidget(self.dropdown_dichroic)
 
         illuminationIrisLayout = QHBoxLayout()
         illuminationIrisLayout.addWidget(QLabel("Illumination Iris"))
@@ -180,15 +197,18 @@ class SpinningDiskConfocalWidget(QWidget):
         self.setLayout(layout)
 
     def enable_all_buttons(self, enable: bool) -> None:
-        self.dropdown_emission_filter.setEnabled(enable)
-        self.dropdown_dichroic.setEnabled(enable)
+        if self.dropdown_emission_filter is not None:
+            self.dropdown_emission_filter.setEnabled(enable)
+        if self.dropdown_dichroic is not None:
+            self.dropdown_dichroic.setEnabled(enable)
         self.btn_toggle_widefield.setEnabled(enable)
         self.btn_toggle_motor.setEnabled(enable)
         self.slider_illumination_iris.setEnabled(enable)
         self.spinbox_illumination_iris.setEnabled(enable)
         self.slider_emission_iris.setEnabled(enable)
         self.spinbox_emission_iris.setEnabled(enable)
-        self.dropdown_filter_slider.setEnabled(enable)
+        if self.xlight.has_dichroic_filter_slider:
+            self.dropdown_filter_slider.setEnabled(enable)
 
     def block_iris_control_signals(self, block: bool) -> None:
         self.slider_illumination_iris.blockSignals(block)
@@ -222,12 +242,16 @@ class SpinningDiskConfocalWidget(QWidget):
         self.enable_all_buttons(True)
 
     def set_emission_filter(self, index: int) -> None:
+        if self.dropdown_emission_filter is None:
+            return
         self.enable_all_buttons(False)
         selected_pos = self.dropdown_emission_filter.currentText()
         self.xlight.set_emission_filter(selected_pos)
         self.enable_all_buttons(True)
 
     def set_dichroic(self, index: int) -> None:
+        if self.dropdown_dichroic is None:
+            return
         self.enable_all_buttons(False)
         selected_pos = self.dropdown_dichroic.currentText()
         self.xlight.set_dichroic(selected_pos)
@@ -267,6 +291,12 @@ class SpinningDiskConfocalWidget(QWidget):
         self.xlight.set_filter_slider(position)
         self.enable_all_buttons(True)
 
+    def closeEvent(self, event) -> None:
+        if self._event_bus is not None and self._subscriptions:
+            auto_unsubscribe(self._subscriptions, self._event_bus)
+            self._subscriptions.clear()
+        super().closeEvent(event)
+
 
 class DragonflyConfocalWidget(QWidget):
     def __init__(
@@ -281,6 +311,7 @@ class DragonflyConfocalWidget(QWidget):
         self.confocal_mode: bool = False
         self._event_bus = event_bus
         self._current_objective = initial_objective
+        self._subscriptions = []
 
         self.init_ui()
 
@@ -346,8 +377,9 @@ class DragonflyConfocalWidget(QWidget):
                     is_confocal=self.confocal_mode,
                 )
             )
-            self._event_bus.subscribe(ObjectiveChanged, self._on_objective_changed)
+            self._subscriptions = auto_subscribe(self, self._event_bus)
 
+    @handles(ObjectiveChanged)
     def _on_objective_changed(self, event: ObjectiveChanged) -> None:
         if event.objective_name:
             self._current_objective = event.objective_name
@@ -499,3 +531,9 @@ class DragonflyConfocalWidget(QWidget):
             print(f"Error setting port 1 field aperture: {e}")
         finally:
             self.enable_all_buttons(True)
+
+    def closeEvent(self, event) -> None:
+        if self._event_bus is not None and self._subscriptions:
+            auto_unsubscribe(self._subscriptions, self._event_bus)
+            self._subscriptions.clear()
+        super().closeEvent(event)

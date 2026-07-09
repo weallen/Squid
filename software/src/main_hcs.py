@@ -24,14 +24,11 @@ squid.core.logging.setup_uncaught_exception_logging()
 
 # app specific libraries
 import squid.ui.main_window as gui
-from _def import USE_TERMINAL_CONSOLE
 from _def import SQUID_ICON_PATH
+from _def import SIMULATED_DISK_IO_ENABLED
+from _def import SIMULATION_FORCE_SAVE_IMAGES
 import squid.core.utils.hardware_utils
 from squid.application import ApplicationContext
-
-
-if USE_TERMINAL_CONSOLE:
-    from squid.ui.console import ConsoleThread
 
 
 if __name__ == "__main__":
@@ -49,6 +46,23 @@ if __name__ == "__main__":
         "--debug-bus",
         help="Print all messages going through the event bus",
         action="store_true",
+    )
+    parser.add_argument(
+        "--start-server",
+        help="Start TCP control server for headless automation",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--server-port",
+        type=int,
+        default=5050,
+        help="TCP server port (default: 5050)",
+    )
+    parser.add_argument(
+        "--skip-init",
+        action="store_true",
+        help="Skip hardware initialization (MCU reset, homing, limits). "
+        "Used when restarting after settings change.",
     )
     args = parser.parse_args()
 
@@ -68,14 +82,14 @@ if __name__ == "__main__":
         f"Squid Repository State: {squid.core.utils.hardware_utils.get_squid_repo_state_description()}"
     )
 
-    app = QApplication([])
+    app = QApplication(["Squid"])
     app.setStyle("Fusion")
     app.setWindowIcon(QIcon(str(SQUID_ICON_PATH)))
     # This allows shutdown via ctrl+C even after the gui has popped up.
     signal.signal(signal.SIGINT, signal.SIG_DFL)
 
     # Create application context (centralizes microscope and controller creation)
-    context = ApplicationContext(simulation=args.simulation)
+    context = ApplicationContext(simulation=args.simulation, skip_init=args.skip_init)
 
     # Enable event bus debug mode if requested
     if args.debug_bus:
@@ -95,42 +109,25 @@ if __name__ == "__main__":
         live_only_mode=args.live_only,
     )
 
-    file_menu = QMenu("File", win)
-
     microscope_utils_menu = QMenu("Utils", win)
 
     stage_utils_action = QAction("Stage Utils", win)
     stage_utils_action.triggered.connect(win.stageUtils.show)
     microscope_utils_menu.addAction(stage_utils_action)
 
-    try:
-        csw = win.cswWindow
-        if csw is not None:
-            csw_action = QAction("Camera Settings", win)
-            csw_action.triggered.connect(csw.show)
-            file_menu.addAction(csw_action)
-    except AttributeError:
-        pass
-
-    try:
-        csw_fc = win.cswfcWindow
-        if csw_fc is not None:
-            csw_fc_action = QAction("Camera Settings (Focus Camera)", win)
-            csw_fc_action.triggered.connect(csw_fc.show)
-            file_menu.addAction(csw_fc_action)
-    except AttributeError:
-        pass
+    workflow_runner_action = QAction("Workflow Runner...", win)
+    workflow_runner_action.triggered.connect(win._open_workflow_runner)
+    microscope_utils_menu.addAction(workflow_runner_action)
 
     menu_bar = win.menuBar()
-    menu_bar.addMenu(file_menu)
     menu_bar.addMenu(microscope_utils_menu)
 
-    # Settings menu with MCP integration
-    settings_menu = QMenu("Settings", win)
-    menu_bar.addMenu(settings_menu)
+    # Add MCP actions to the existing Settings menu created by the main window
+    settings_menu = win.settings_menu
+    settings_menu.addSeparator()
 
     # MCP Control Server state (using dict for mutable state in closures)
-    mcp_state = {"process": None, "python_exec_enabled": False}
+    mcp_state = {"process": None}
 
     def on_toggle_mcp_server(checked):
         if checked:
@@ -156,24 +153,6 @@ if __name__ == "__main__":
                     mcp_state["process"].kill()
                 log.info("MCP server stopped")
                 mcp_state["process"] = None
-
-    def on_toggle_python_exec(checked):
-        if checked:
-            reply = QMessageBox.warning(
-                win,
-                "Security Warning",
-                "Enabling Python exec allows Claude to run arbitrary code.\n\n"
-                "Only enable this if you trust the AI agent completely.\n\n"
-                "Continue?",
-                QMessageBox.Yes | QMessageBox.No,
-            )
-            if reply != QMessageBox.Yes:
-                action_enable_python_exec.setChecked(False)
-                return
-        mcp_state["python_exec_enabled"] = checked
-        # Note: This sets a local flag. The MCP server would need to be restarted
-        # or communicate via IPC to actually toggle this. For now, this is a placeholder.
-        log.info(f"MCP Python exec {'enabled' if checked else 'disabled'}")
 
     def on_launch_claude_code():
         # Ensure MCP server is running
@@ -234,22 +213,46 @@ if __name__ == "__main__":
     action_enable_mcp.triggered.connect(on_toggle_mcp_server)
     settings_menu.addAction(action_enable_mcp)
 
-    action_enable_python_exec = QAction("Enable MCP Python Exec", win, checkable=True)
-    action_enable_python_exec.triggered.connect(on_toggle_python_exec)
-    settings_menu.addAction(action_enable_python_exec)
-
     settings_menu.addSeparator()
 
     action_launch_claude = QAction("Launch Claude Code", win)
     action_launch_claude.triggered.connect(on_launch_claude_code)
     settings_menu.addAction(action_launch_claude)
 
-    win.show()
+    # TCP Control Server state
+    tcp_server = None
 
-    if USE_TERMINAL_CONSOLE:
-        console_locals = {"microscope": context.microscope, "context": context}
-        console_thread = ConsoleThread(console_locals)
-        console_thread.start()
+    if args.start_server:
+        try:
+            from squid.backend.services.tcp_control_server import TCPControlServer
+            from squid.core.events import event_bus
+
+            tcp_server = TCPControlServer(
+                event_bus=event_bus,
+                objective_store=context.microscope.objective_store,
+                camera=context.microscope.camera,
+                stage=context.microscope.stage,
+                channel_config_manager=context.microscope.channel_configuration_manager,
+                port=args.server_port,
+            )
+            tcp_server.start()
+            log.info(f"TCP control server started on port {args.server_port}")
+        except Exception as e:
+            log.error(f"Failed to start TCP control server: {e}")
+
+    # Show startup warning if simulated disk I/O is enabled (but not if force save is on)
+    if SIMULATED_DISK_IO_ENABLED and not SIMULATION_FORCE_SAVE_IMAGES:
+        QMessageBox.warning(
+            win,
+            "Simulated Disk I/O Mode",
+            "SIMULATED DISK I/O IS ENABLED\n\n"
+            "Images are encoded but NOT saved to disk!\n\n"
+            "This mode is for testing acquisition speed only.\n"
+            "NO DATA WILL BE SAVED during acquisitions.\n\n"
+            "To disable: Configuration > Advanced > Development Settings",
+        )
+
+    win.showMaximized()
 
     # Use os._exit() to prevent segfault during Python's shutdown sequence.
     # PyQt5's C++ destructor order conflicts with Python's garbage collector.
@@ -259,10 +262,30 @@ if __name__ == "__main__":
     # - aboutToQuit signal fires before app.exec_() returns
     # All hardware cleanup (camera, stage, microcontroller) happens in closeEvent,
     # which completes before os._exit() is called.
+    exit_code = 0
     try:
         exit_code = app.exec_()
     finally:
+        # Stop TCP server if running
+        try:
+            if tcp_server is not None:
+                tcp_server.stop()
+                log.info("TCP control server stopped")
+        except Exception:
+            log.exception("Error stopping TCP control server during shutdown")
+
         # Clean shutdown of application context
-        context.shutdown()
-    logging.shutdown()  # Flush log handlers before os._exit() bypasses Python cleanup
-    os._exit(exit_code)
+        try:
+            context.shutdown()
+        except Exception:
+            log.exception("Error during application context shutdown")
+
+        # Flush log handlers before os._exit() bypasses Python cleanup.
+        try:
+            logging.shutdown()
+        except Exception:
+            pass
+
+        # Use os._exit() to prevent segfault during Python/PyQt5 teardown. This
+        # MUST always run, even if the cleanup above raised.
+        os._exit(exit_code)

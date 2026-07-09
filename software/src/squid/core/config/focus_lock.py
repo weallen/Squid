@@ -15,7 +15,7 @@ Usage:
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
 import _def
 
@@ -46,6 +46,18 @@ class FocusLockConfig(BaseModel):
         acquire_threshold_um: Tighter threshold to acquire lock.
         maintain_threshold_um: Looser threshold to maintain lock.
 
+        Unrecoverable-error guard:
+        lock_break_error_um: Error magnitude beyond which the measurement
+            is considered unrecoverable for lock maintenance. Only fires
+            after ``lock_break_persist_cycles`` consecutive cycles so the
+            PI controller has time to correct normal disturbances.
+        lock_break_persist_cycles: Consecutive cycles of |error| >
+            lock_break_error_um required before demoting from locked.
+        settle_correction_threshold_um: Correction magnitude above which
+            the control loop inserts a brief piezo settle before the next
+            measurement. Reduces deadtime-driven ringing on large steps.
+        settle_delay_s: Settle duration after a large correction.
+
         Auto-search parameters:
         auto_search_enabled: Enable auto-search on lock loss.
         search_range_um: Search range ±um around last known position.
@@ -60,13 +72,23 @@ class FocusLockConfig(BaseModel):
     # Core parameters
     gain: float = _def.FOCUS_LOCK_GAIN
     gain_max: float = _def.FOCUS_LOCK_GAIN_MAX
+    gain_sigma: float = _def.FOCUS_LOCK_GAIN_SIGMA
     buffer_length: int = _def.FOCUS_LOCK_BUFFER_LENGTH
     offset_threshold_um: float = _def.FOCUS_LOCK_OFFSET_THRESHOLD_UM
     min_spot_snr: float = _def.FOCUS_LOCK_MIN_SPOT_SNR
     loop_rate_hz: float = _def.FOCUS_LOCK_LOOP_RATE_HZ
     metrics_rate_hz: float = _def.FOCUS_LOCK_METRICS_RATE_HZ
     piezo_warning_margin_um: float = _def.FOCUS_LOCK_PIEZO_WARNING_MARGIN_UM
+    piezo_critical_margin_um: float = _def.FOCUS_LOCK_PIEZO_CRITICAL_MARGIN_UM
     default_mode: FocusLockMode = _def.FOCUS_LOCK_DEFAULT_MODE
+
+    # PI controller parameters
+    ki: float = _def.FOCUS_LOCK_KI
+    integral_limit_um: float = _def.FOCUS_LOCK_INTEGRAL_LIMIT_UM
+
+    # NaN holdover parameters
+    max_nan_holdover_cycles: int = _def.FOCUS_LOCK_MAX_NAN_HOLDOVER_CYCLES
+    nan_holdover_decay: float = _def.FOCUS_LOCK_NAN_HOLDOVER_DECAY
 
     # Recovery parameters
     recovery_attempts: int = _def.FOCUS_LOCK_RECOVERY_ATTEMPTS
@@ -77,6 +99,14 @@ class FocusLockConfig(BaseModel):
     acquire_threshold_um: float = _def.FOCUS_LOCK_ACQUIRE_THRESHOLD_UM
     maintain_threshold_um: float = _def.FOCUS_LOCK_MAINTAIN_THRESHOLD_UM
 
+    # Unrecoverable-error guard (true lock break)
+    lock_break_error_um: float = _def.FOCUS_LOCK_LOCK_BREAK_ERROR_UM
+    lock_break_persist_cycles: int = _def.FOCUS_LOCK_LOCK_BREAK_PERSIST_CYCLES
+
+    # Piezo settle after large corrections
+    settle_correction_threshold_um: float = _def.FOCUS_LOCK_SETTLE_CORRECTION_THRESHOLD_UM
+    settle_delay_s: float = _def.FOCUS_LOCK_SETTLE_DELAY_S
+
     # Auto-search parameters
     auto_search_enabled: bool = _def.FOCUS_LOCK_AUTO_SEARCH_ENABLED
     search_range_um: float = _def.FOCUS_LOCK_SEARCH_RANGE_UM
@@ -84,6 +114,7 @@ class FocusLockConfig(BaseModel):
     search_max_percent: float = _def.FOCUS_LOCK_SEARCH_MAX_PERCENT
     search_step_um: float = _def.FOCUS_LOCK_SEARCH_STEP_UM
     search_settle_ms: float = _def.FOCUS_LOCK_SEARCH_SETTLE_MS
+    search_timeout_s: float = _def.FOCUS_LOCK_SEARCH_TIMEOUT_S
 
     @field_validator("default_mode")
     @classmethod
@@ -93,7 +124,7 @@ class FocusLockConfig(BaseModel):
             raise ValueError(f"Invalid mode: {v}. Must be 'off' or 'on'")
         return v
 
-    @field_validator("gain", "gain_max")
+    @field_validator("gain", "gain_max", "gain_sigma")
     @classmethod
     def validate_gain(cls, v: float) -> float:
         """Validate gain is positive."""
@@ -148,3 +179,59 @@ class FocusLockConfig(BaseModel):
         if v < 0 or v > 100:
             raise ValueError(f"search percent must be between 0 and 100, got {v}")
         return v
+
+    @model_validator(mode="after")
+    def _validate_cross_fields(self) -> "FocusLockConfig":
+        if self.gain > self.gain_max:
+            raise ValueError(f"gain ({self.gain}) must be <= gain_max ({self.gain_max})")
+        if self.acquire_threshold_um <= 0:
+            raise ValueError(f"acquire_threshold_um must be positive, got {self.acquire_threshold_um}")
+        if self.acquire_threshold_um > self.maintain_threshold_um:
+            raise ValueError(
+                f"acquire_threshold_um ({self.acquire_threshold_um}) must be <= "
+                f"maintain_threshold_um ({self.maintain_threshold_um})"
+            )
+        if self.search_min_percent >= self.search_max_percent:
+            raise ValueError(
+                f"search_min_percent ({self.search_min_percent}) must be < "
+                f"search_max_percent ({self.search_max_percent})"
+            )
+        if self.recovery_delay_s < 0:
+            raise ValueError(f"recovery_delay_s must be non-negative, got {self.recovery_delay_s}")
+        if self.piezo_critical_margin_um <= 0:
+            raise ValueError(
+                f"piezo_critical_margin_um must be positive, got {self.piezo_critical_margin_um}"
+            )
+        if self.piezo_critical_margin_um >= self.piezo_warning_margin_um:
+            raise ValueError(
+                f"piezo_critical_margin_um ({self.piezo_critical_margin_um}) must be < "
+                f"piezo_warning_margin_um ({self.piezo_warning_margin_um})"
+            )
+        if self.ki < 0:
+            raise ValueError(f"ki must be non-negative, got {self.ki}")
+        if self.integral_limit_um <= 0:
+            raise ValueError(f"integral_limit_um must be positive, got {self.integral_limit_um}")
+        if self.nan_holdover_decay < 0 or self.nan_holdover_decay > 1:
+            raise ValueError(f"nan_holdover_decay must be in [0, 1], got {self.nan_holdover_decay}")
+        if self.max_nan_holdover_cycles < 0:
+            raise ValueError(
+                f"max_nan_holdover_cycles must be non-negative, got {self.max_nan_holdover_cycles}"
+            )
+        if self.search_timeout_s <= 0:
+            raise ValueError(f"search_timeout_s must be positive, got {self.search_timeout_s}")
+        if self.lock_break_error_um <= self.maintain_threshold_um:
+            raise ValueError(
+                f"lock_break_error_um ({self.lock_break_error_um}) must be > "
+                f"maintain_threshold_um ({self.maintain_threshold_um})"
+            )
+        if self.lock_break_persist_cycles < 1:
+            raise ValueError(
+                f"lock_break_persist_cycles must be >= 1, got {self.lock_break_persist_cycles}"
+            )
+        if self.settle_correction_threshold_um < 0:
+            raise ValueError(
+                f"settle_correction_threshold_um must be >= 0, got {self.settle_correction_threshold_um}"
+            )
+        if self.settle_delay_s < 0:
+            raise ValueError(f"settle_delay_s must be >= 0, got {self.settle_delay_s}")
+        return self

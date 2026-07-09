@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional, Tuple, TYPE_CHECKING
 
-import squid.core.logging
+from squid.backend.managers.base import BaseManager
 from squid.core.events import (
     EventBus,
     StagePositionChanged,
@@ -11,6 +11,7 @@ from squid.core.events import (
     BinningChanged,
     WellplateFormatChanged,
     NavigationViewerStateChanged,
+    handles,
 )
 
 if TYPE_CHECKING:
@@ -27,7 +28,7 @@ class _NavState:
     wellplate_format: Optional[str]
 
 
-class NavigationViewerStateService:
+class NavigationViewerStateService(BaseManager):
     """Backend publisher for NavigationViewerStateChanged.
 
     This keeps other UI widgets from needing direct references to NavigationViewer
@@ -40,10 +41,9 @@ class NavigationViewerStateService:
         camera_service: "CameraService",
         event_bus: EventBus,
     ) -> None:
-        self._log = squid.core.logging.get_logger(self.__class__.__name__)
+        super().__init__(event_bus)
         self._objective_store = objective_store
         self._camera_service = camera_service
-        self._bus = event_bus
 
         self._x_mm: float = 0.0
         self._y_mm: float = 0.0
@@ -52,25 +52,27 @@ class NavigationViewerStateService:
 
         self._last_published: Optional[_NavState] = None
 
-        self._bus.subscribe(StagePositionChanged, self._on_stage_position_changed)
-        self._bus.subscribe(ObjectiveChanged, lambda _e: self._publish_if_changed())
-        self._bus.subscribe(BinningChanged, self._on_binning_changed)
-        self._bus.subscribe(WellplateFormatChanged, self._on_wellplate_format_changed)
-
         self._publish_if_changed()
 
+    @handles(StagePositionChanged)
     def _on_stage_position_changed(self, event: StagePositionChanged) -> None:
         self._x_mm = float(event.x_mm)
         self._y_mm = float(event.y_mm)
         self._publish_if_changed()
 
+    @handles(BinningChanged)
     def _on_binning_changed(self, event: BinningChanged) -> None:
         if event.pixel_size_binned_um is not None:
             self._pixel_size_binned_um = float(event.pixel_size_binned_um)
         self._publish_if_changed()
 
+    @handles(WellplateFormatChanged)
     def _on_wellplate_format_changed(self, event: WellplateFormatChanged) -> None:
         self._wellplate_format = str(event.format_name)
+        self._publish_if_changed()
+
+    @handles(ObjectiveChanged)
+    def _on_objective_changed(self, _event: ObjectiveChanged) -> None:
         self._publish_if_changed()
 
     def _get_fov_size_mm(self) -> Tuple[float, float]:
@@ -109,7 +111,7 @@ class NavigationViewerStateService:
         if state == self._last_published:
             return
         self._last_published = state
-        self._bus.publish(
+        self._event_bus.publish(
             NavigationViewerStateChanged(
                 x_mm=state.x_mm,
                 y_mm=state.y_mm,

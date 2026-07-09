@@ -1,0 +1,20 @@
+# Quick Tiled Z-Stack Simulation (V2 Format)
+# Single imaging round with 2x2 grid + 7-plane z-stack
+# Total: 4 FOVs x 7 z-planes = 28 images per channel
+
+name: "Quick Tiled Z-Stack"
+version: "2.0"
+description: "Fast tiled imaging with z-stack for manual testing"
+
+error_handling:
+  focus_failure: skip
+  fluidics_failure: abort
+  imaging_failure: warn
+
+fov_file: ../fov_positions/test_4fov_grid.csv
+
+rounds:
+  - name: "Tiled Acquisition"
+    steps:
+      - step_type: imaging
+        protocol: protocols/tiled_zstack.yaml

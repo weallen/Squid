@@ -1,5 +1,23 @@
-from squid.ui.widgets.wellplate._common import *
+from squid.ui.widgets.wellplate._common import (
+    CACHE_DIR,
+    Dict,
+    Optional,
+    QComboBox,
+    QDialog,
+    QFont,
+    QHBoxLayout,
+    QLabel,
+    QSizePolicy,
+    Qt,
+    SAMPLE_FORMATS_CSV_PATH,
+    TYPE_CHECKING,
+    Union,
+    WELLPLATE_FORMAT,
+    WELLPLATE_FORMAT_SETTINGS,
+    handles,
+)
 from squid.ui.widgets.base import EventBusWidget
+from squid.ui.widgets.wellplate.calibration import WellplateCalibration
 from squid.core.events import LiveStateChanged, SaveWellplateCalibrationCommand, WellplateFormatChanged
 import csv
 
@@ -32,14 +50,9 @@ class WellplateFormatWidget(EventBusWidget):
         self.label: QLabel
         self.comboBox: QComboBox
 
-        # Subscribe to live state events
-        self._subscribe(LiveStateChanged, self._on_live_state_changed)
-        self._subscribe(
-            SaveWellplateCalibrationCommand, self._on_save_calibration  # type: ignore[arg-type]
-        )
-
         self.initUI()
 
+    @handles(LiveStateChanged)
     def _on_live_state_changed(self, event: LiveStateChanged) -> None:
         """Track live state for passing to calibration dialog."""
         if getattr(event, "camera", "main") != "main":
@@ -59,6 +72,7 @@ class WellplateFormatWidget(EventBusWidget):
         if index >= 0:
             self.comboBox.setCurrentIndex(index)
 
+    @handles(SaveWellplateCalibrationCommand)
     def _on_save_calibration(self, event: SaveWellplateCalibrationCommand) -> None:
         """Handle calibration save event."""
         name = event.name

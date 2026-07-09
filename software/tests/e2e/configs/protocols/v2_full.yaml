@@ -1,0 +1,42 @@
+name: "V2 Full Workflow"
+version: "3.0"
+description: "Comprehensive self-loading workflow covering fluidics, imaging, repeats, overrides, and intervention."
+output_directory: ../outputs
+
+resources:
+  fluidics_protocols_file: ../fluidics/test_fluidics_protocols.yaml
+  fluidics_config_file: ../fluidics/simulation_fluidics.json
+  fov_file: ../fov_positions/test_2fov_simple.csv
+
+rounds:
+  - name: "Setup"
+    steps:
+      - step_type: fluidics
+        protocol: initial_wash
+      - step_type: intervention
+        message: "Verify the sample is mounted, centered, and safe to continue."
+      - step_type: imaging
+        protocol: resource_files/protocols/fluorescence_405.yaml
+        output_label: setup_reference
+  - name: "Hybridization Round {i}"
+    repeat: 2
+    steps:
+      - step_type: fluidics
+        protocol: probe_hybridize_{i}
+      - step_type: fluidics
+        protocol: stringent_wash
+      - step_type: imaging
+        protocol: resource_files/protocols/fish_multichannel.yaml
+        focus_gate_override:
+          max_focus_attempts: 3
+        capture_policy_override:
+          max_capture_attempts: 2
+          retry_delay_s: 0.1
+      - step_type: fluidics
+        protocol: strip
+  - name: "Final QC"
+    steps:
+      - step_type: imaging
+        protocol: resource_files/protocols/qc_single_plane.yaml
+      - step_type: intervention
+        message: "Review the run summary and image quality before closing out the session."

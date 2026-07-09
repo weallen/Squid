@@ -12,22 +12,27 @@ from napari.utils.events import Event
 from qtpy.QtGui import QIcon
 from qtpy.QtWidgets import QWidget, QVBoxLayout
 
-from _def import CHANNEL_COLORS_MAP, USE_NAPARI_FOR_LIVE_VIEW, SQUID_ICON_PATH
+from _def import CHANNEL_COLORS_MAP, SQUID_ICON_PATH
+from squid.core.config.feature_flags import get_feature_flags
 
 from squid.backend.managers import ContrastManager
 from squid.core.events import (
-    EventBus,
+    handles,
     BinningChanged,
     ObjectiveChanged,
     SetAcquisitionChannelsCommand,
     SetAcquisitionParametersCommand,
 )
+from squid.ui.widgets.base import EventBusWidget
 
 if TYPE_CHECKING:
-    pass
+    from squid.ui.ui_event_bus import UIEventBus
 
 
-class NapariMultiChannelWidget(QWidget):
+_FEATURE_FLAGS = get_feature_flags()
+
+
+class NapariMultiChannelWidget(EventBusWidget):
     """Multi-channel Z-stack viewer using napari.
 
     Subscribes to BinningChanged and ObjectiveChanged events to update pixel size.
@@ -53,15 +58,14 @@ class NapariMultiChannelWidget(QWidget):
 
     def __init__(
         self,
-        event_bus: EventBus,
+        event_bus: "UIEventBus",
         contrastManager: ContrastManager,
         initial_pixel_size_factor: float = 1.0,
         initial_pixel_size_binned_um: float = 1.0,
         grid_enabled: bool = False,
         parent: Optional[QWidget] = None,
     ) -> None:
-        super().__init__(parent)
-        self._event_bus = event_bus
+        super().__init__(event_bus, parent)
 
         # Cached values from events (initialized with provided initial values)
         self._pixel_size_factor = initial_pixel_size_factor
@@ -82,32 +86,34 @@ class NapariMultiChannelWidget(QWidget):
         self.update_layer_count = 0
         self.grid_enabled = grid_enabled
 
-        # Subscribe to events for dynamic values
-        self._event_bus.subscribe(BinningChanged, self._on_binning_changed)
-        self._event_bus.subscribe(ObjectiveChanged, self._on_objective_changed)
-        self._event_bus.subscribe(
-            SetAcquisitionChannelsCommand, self._on_set_acquisition_channels
-        )
-        self._event_bus.subscribe(
-            SetAcquisitionParametersCommand, self._on_set_acquisition_parameters
-        )
-
         # Initialize a napari Viewer without showing its standalone window.
         self.initNapariViewer()
 
+    @handles(BinningChanged)
     def _on_binning_changed(self, event: BinningChanged) -> None:
         """Update cached pixel size when binning changes."""
         if event.pixel_size_binned_um is not None:
             self._pixel_size_binned_um = event.pixel_size_binned_um
+            pixel_size_um = self._pixel_size_factor * self._pixel_size_binned_um
+            if self.pixel_size_um != pixel_size_um:
+                self.pixel_size_um = pixel_size_um
+                self.acquisition_initialized = False
 
+    @handles(ObjectiveChanged)
     def _on_objective_changed(self, event: ObjectiveChanged) -> None:
         """Update cached pixel size factor when objective changes."""
         if event.pixel_size_um is not None:
             self._pixel_size_factor = event.pixel_size_um
+            pixel_size_um = self._pixel_size_factor * self._pixel_size_binned_um
+            if self.pixel_size_um != pixel_size_um:
+                self.pixel_size_um = pixel_size_um
+                self.acquisition_initialized = False
 
+    @handles(SetAcquisitionChannelsCommand)
     def _on_set_acquisition_channels(self, event: SetAcquisitionChannelsCommand) -> None:
         self.initChannels(set(event.channel_names))
 
+    @handles(SetAcquisitionParametersCommand)
     def _on_set_acquisition_parameters(
         self, event: SetAcquisitionParametersCommand
     ) -> None:
@@ -183,7 +189,7 @@ class NapariMultiChannelWidget(QWidget):
         else:
             self.viewer.layers.clear()
             self.acquisition_initialized = True
-            if self.dtype != np.dtype(image_dtype) and not USE_NAPARI_FOR_LIVE_VIEW:
+            if self.dtype != np.dtype(image_dtype) and not _FEATURE_FLAGS.is_enabled("USE_NAPARI_FOR_LIVE_VIEW"):
                 self.contrastManager.scale_contrast_limits(image_dtype)
 
         self.image_width = image_width
@@ -197,15 +203,35 @@ class NapariMultiChannelWidget(QWidget):
     ) -> None:
         """Updates the appropriate slice of the canvas with the new image data."""
         rgb = len(image.shape) == 3
+        image_height, image_width = image.shape[0], image.shape[1]
+        if k < 0:
+            return
 
-        # Check if the layer exists and has a different dtype
-        if self.dtype != np.dtype(image.dtype):
-            # Remove the existing layer
+        # Reinitialize if dtype/shape changed (e.g., camera binning changed).
+        if (
+            self.dtype != np.dtype(image.dtype)
+            or self.image_height != image_height
+            or self.image_width != image_width
+        ):
             self.layers_initialized = False
             self.acquisition_initialized = False
 
-        if not self.layers_initialized:
-            self.initLayers(image.shape[0], image.shape[1], image.dtype)
+        # Be defensive when z-index arrives before acquisition parameters.
+        if k >= self.Nz:
+            self.Nz = k + 1
+            self.acquisition_initialized = False
+
+        # Reinitialize if an existing layer has incompatible channel shape (e.g., mono<->RGB).
+        if channel_name in self.viewer.layers:
+            layer = self.viewer.layers[channel_name]
+            layer_is_rgb = bool(getattr(layer, "rgb", False))
+            if layer_is_rgb != rgb:
+                self.layers_initialized = False
+                self.acquisition_initialized = False
+
+        # Reinitialize when acquisition metadata changed (Nz/dz/pixel size).
+        if not self.layers_initialized or not self.acquisition_initialized:
+            self.initLayers(image_height, image_width, image.dtype)
 
         if channel_name not in self.viewer.layers:
             self.channels.add(channel_name)
@@ -250,6 +276,11 @@ class NapariMultiChannelWidget(QWidget):
                 layer.refresh()
 
         layer = self.viewer.layers[channel_name]
+        if k >= layer.data.shape[0]:
+            self.Nz = k + 1
+            self.acquisition_initialized = False
+            self.initLayers(image_height, image_width, image.dtype)
+            layer = self.viewer.layers[channel_name]
         layer.data[k] = image
         layer.contrast_limits = self.contrastManager.get_limits(channel_name)
         self.update_layer_count += 1

@@ -1,0 +1,31 @@
+name: "Multi-Round FISH"
+version: "3.0"
+description: "Two hybridization rounds with stripping and final wash."
+output_directory: ../outputs
+
+resources:
+  fluidics_protocols_file: ../fluidics/test_fluidics_protocols.yaml
+  fluidics_config_file: ../fluidics/simulation_fluidics.json
+  fov_file: ../fov_positions/test_4fov_grid.csv
+
+rounds:
+  - name: "Round 1 Hybridization"
+    steps:
+      - step_type: fluidics
+        protocol: probe_1_hybridization
+      - step_type: imaging
+        protocol: resource_files/protocols/fluorescence_405.yaml
+  - name: "Strip After Round 1"
+    steps:
+      - step_type: fluidics
+        protocol: strip_fluorophores
+  - name: "Round 2 Hybridization"
+    steps:
+      - step_type: fluidics
+        protocol: probe_2_hybridization
+      - step_type: imaging
+        protocol: resource_files/protocols/fluorescence_488_561.yaml
+  - name: "Final Wash"
+    steps:
+      - step_type: fluidics
+        protocol: final_wash

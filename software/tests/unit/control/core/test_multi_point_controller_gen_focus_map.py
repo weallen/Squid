@@ -10,10 +10,12 @@ import pytest
 from squid.core.events import (
     EventBus,
     AcquisitionWorkerFinished,
+    AutofocusMode,
 )
 from squid.core.mode_gate import GlobalModeGate, GlobalMode
 from squid.backend.controllers.multipoint import multi_point_controller
 from squid.backend.controllers.multipoint.multi_point_controller import MultiPointController
+from squid.backend.controllers.multipoint.focus_operations import AutofocusExecutor
 
 
 @dataclass
@@ -61,6 +63,20 @@ class _FakePeripheralService:
     pass
 
 
+class _FakeLaserAFController:
+    def __init__(self, *, has_reference: bool) -> None:
+        self.laser_af_properties = type(
+            "_LaserAFProps",
+            (),
+            {"has_reference": has_reference},
+        )()
+
+
+class _FakeFocusLockController:
+    def __init__(self, status: str = "ready") -> None:
+        self.status = status
+
+
 class _FakeLiveController:
     def __init__(self) -> None:
         self.is_live = False
@@ -82,13 +98,24 @@ class _FakeAutoFocusController:
     def __init__(self) -> None:
         self.use_focus_map = False
         self.focus_map_coords = []
-        self._gen_focus_map_calls = 0
+        self._sample_focus_map_calls = 0
+        self._focus_map_surface = None
+        self.sampled_coords = []
 
-    def gen_focus_map(self, _coord1, _coord2, _coord3) -> None:
-        self._gen_focus_map_calls += 1
+    def sample_focus_map_points(self, coords) -> None:
+        self._sample_focus_map_calls += 1
+        self.sampled_coords = list(coords)
+        self.focus_map_coords = [(x, y, 0.0) for x, y in coords]
 
     def set_focus_map_use(self, enabled: bool) -> None:
         self.use_focus_map = enabled
+
+    def set_focus_map_surface(self, focus_map) -> None:
+        self._focus_map_surface = focus_map
+
+    @property
+    def focus_map_surface(self):
+        return self._focus_map_surface
 
     def clear_focus_map(self) -> None:
         self.focus_map_coords = []
@@ -108,7 +135,20 @@ class _FakeScanCoordinates:
 
 class _FakeObjectiveStore:
     current_objective = "10x"
-    objectives_dict = {}
+    objectives_dict = {
+        "10x": {
+            "magnification": 10,
+            "NA": 0.25,
+            "tube_lens_f_mm": 180.0,
+            "name": "10x",
+        }
+    }
+
+    def get_current_objective_info(self) -> dict:
+        # Mirror ObjectiveStore.get_current_objective_info(): return the dict of
+        # parameters for the current objective. MultiPointController.start_new_experiment()
+        # now calls this to attach objective metadata to acquisition parameters.
+        return self.objectives_dict[self.current_objective]
 
 
 class _FakeChannelConfigurationManager:
@@ -156,6 +196,13 @@ def test_gen_focus_map_invalid_bounds_publishes_failure(tmp_path: Path) -> None:
         peripheral_service = _FakePeripheralService()
         mode_gate = GlobalModeGate(bus)
 
+        scan_coordinates = _FakeScanCoordinates()
+        # Non-empty FOVs so validate_acquisition_settings() passes and the run reaches
+        # the gen_focus_map bounds check. get_scan_bounds() returns None (degenerate /
+        # invalid), which drives the "Invalid scan bounds" failure path that publishes
+        # AcquisitionWorkerFinished(success=False).
+        scan_coordinates.region_fov_coordinates = {"region_1": [(0.0, 0.0, 0.0)]}
+
         controller = MultiPointController(
             live_controller=live,
             autofocus_controller=af,
@@ -165,14 +212,14 @@ def test_gen_focus_map_invalid_bounds_publishes_failure(tmp_path: Path) -> None:
             stage_service=stage_service,
             peripheral_service=peripheral_service,
             event_bus=bus,
-            scan_coordinates=_FakeScanCoordinates(),
+            scan_coordinates=scan_coordinates,
             mode_gate=mode_gate,
         )
 
         controller.set_base_path(str(tmp_path))
         controller.start_new_experiment("unit_test")
         controller.set_gen_focus_map_flag(True)
-        controller.set_reflection_af_flag(False)
+        controller.set_autofocus_mode(AutofocusMode.NONE)
 
         controller.run_acquisition()
 
@@ -182,11 +229,47 @@ def test_gen_focus_map_invalid_bounds_publishes_failure(tmp_path: Path) -> None:
         assert finished[0].experiment_id.startswith("unit_test_")
         assert finished[0].success is False
         assert finished[0].error == "Invalid scan bounds"
-        assert af._gen_focus_map_calls == 0
+        assert af._sample_focus_map_calls == 0
         assert controller.state.name == "IDLE"
         assert mode_gate.get_mode() == GlobalMode.IDLE
     finally:
         bus.stop()
+
+
+def test_generate_focus_map_builds_surface(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _FakeFocusMap:
+        def __init__(self) -> None:
+            self.is_fitted = False
+            self.fit_points = None
+
+        def fit(self, points) -> None:
+            self.fit_points = points
+            self.is_fitted = True
+
+        def interpolate(self, _x_mm, _y_mm):
+            return 0.0
+
+    monkeypatch.setattr("squid.backend.managers.focus_map.FocusMap", _FakeFocusMap)
+
+    af = _FakeAutoFocusController()
+    executor = AutofocusExecutor(autofocus_controller=af)
+
+    center = executor.generate_focus_map_for_acquisition(
+        {"x": (0.0, 6.0), "y": (0.0, 6.0)},
+        dx_mm=3.0,
+        dy_mm=3.0,
+    )
+
+    assert center == (3.0, 3.0)
+    assert af._sample_focus_map_calls == 1
+    assert len(af.sampled_coords) >= 4
+    x1, y1 = af.sampled_coords[0]
+    x2, y2 = af.sampled_coords[1]
+    x3, y3 = af.sampled_coords[2]
+    detT = (y2 - y3) * (x1 - x3) + (x3 - x2) * (y1 - y3)
+    assert detT != 0
+    assert af.focus_map_surface is not None
+    assert af.use_focus_map is True
 
 
 def test_reflection_af_requires_laser_controller() -> None:
@@ -205,9 +288,36 @@ def test_reflection_af_requires_laser_controller() -> None:
             scan_coordinates=_FakeScanCoordinates(),
             laser_autofocus_controller=None,
         )
-        controller.set_reflection_af_flag(True)
+        controller.set_autofocus_mode(AutofocusMode.LASER_REFLECTION)
 
         assert controller.validate_acquisition_settings() is False
+    finally:
+        bus.stop()
+
+
+def test_focus_lock_allows_locked_run_without_laser_reference() -> None:
+    bus = EventBus()
+    bus.start()
+    try:
+        scan_coordinates = _FakeScanCoordinates()
+        scan_coordinates.region_fov_coordinates = {"region_1": [(0.0, 0.0, 0.0)]}
+        controller = MultiPointController(
+            live_controller=_FakeLiveController(),
+            autofocus_controller=_FakeAutoFocusController(),
+            objective_store=_FakeObjectiveStore(),
+            channel_configuration_manager=_FakeChannelConfigurationManager(),
+            camera_service=_FakeCameraService(),
+            stage_service=_FakeStageService(),
+            peripheral_service=_FakePeripheralService(),
+            event_bus=bus,
+            scan_coordinates=scan_coordinates,
+            laser_autofocus_controller=_FakeLaserAFController(has_reference=False),
+            focus_lock_controller=_FakeFocusLockController(status="locked"),
+            piezo_service=type("_Piezo", (), {"is_available": True})(),
+        )
+        controller.set_autofocus_mode(AutofocusMode.FOCUS_LOCK)
+
+        assert controller.validate_acquisition_settings() is True
     finally:
         bus.stop()
 
@@ -222,11 +332,17 @@ def test_acquire_current_fov_focus_map_does_not_mutate_global_scan_coordinates(
             self.objectiveStore = objectiveStore
             self.stage = stage
             self.camera = camera
+            self.region_fov_coordinates: dict[str, list[tuple[float, ...]]] = {}
             self.update_calls: list[tuple[str, int, float]] = []
             type(self).last_instance = self
 
-        def add_single_fov_region(self, *_args, **_kwargs) -> None:
-            return None
+        def add_single_fov_region(
+            self, region_id, center_x, center_y, center_z
+        ) -> None:
+            # Mirror ScanCoordinates.add_single_fov_region(): register one FOV so
+            # validate_acquisition_settings() sees a non-empty region and the
+            # acquire-current-fov path proceeds.
+            self.region_fov_coordinates[region_id] = [(center_x, center_y, center_z)]
 
         def update_fov_z_level(self, region_id: str, index: int, z_mm: float) -> None:
             self.update_calls.append((region_id, index, z_mm))

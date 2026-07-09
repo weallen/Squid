@@ -1,20 +1,22 @@
 # Flexible multi-point acquisition widget
 import math
 import time
-from typing import Optional, List
+from typing import TYPE_CHECKING, List, Optional
 
 import numpy as np
 import pandas as pd
 
 from squid.core.events import (
-    EventBus,
+    AutofocusMode,
     StagePositionChanged,
-    MoveStageCommand,
+    MoveStageToCommand,
     ObjectiveChanged,
     SetLaserAFReferenceCommand,
     SetAcquisitionParametersCommand,
     SetAcquisitionPathCommand,
     SetAcquisitionChannelsCommand,
+    FocusLockSettings,
+    SetFocusLockParamsCommand,
     StartNewExperimentCommand,
     StartAcquisitionCommand,
     StopAcquisitionCommand,
@@ -31,7 +33,11 @@ from squid.core.events import (
     RemoveScanCoordinateRegionCommand,
     RenameScanCoordinateRegionCommand,
     UpdateScanCoordinateRegionZCommand,
+    ChannelConfigurationsChanged,
+    FocusLockModeChanged,
+    handles,
 )
+from squid.ui.widgets.base import EventBusFrame
 
 from qtpy.QtCore import Qt, QTimer
 from qtpy.QtWidgets import (
@@ -59,27 +65,50 @@ from qtpy.QtWidgets import (
 )
 from qtpy.QtGui import QIcon, QKeySequence
 
-from _def import *
+from _def import (
+    Acquisition,
+    DEFAULT_SAVING_PATH,
+    HAS_OBJECTIVE_PIEZO,
+    MULTIPOINT_CONTRAST_AUTOFOCUS_ENABLE_BY_DEFAULT,
+    MULTIPOINT_REFLECTION_AUTOFOCUS_ENABLE_BY_DEFAULT,
+    MULTIPOINT_USE_PIEZO_FOR_ZSTACKS,
+    SOFTWARE_POS_LIMIT,
+    USE_OVERLAP_FOR_FLEXIBLE,
+    squid,
+)
+from squid.core.config.focus_lock import FocusLockConfig
+from squid.core.config.feature_flags import get_feature_flags
+from squid.core.utils import get_last_used_saving_path, save_last_used_saving_path
+from squid.ui.widgets.acquisition.yaml_drop_mixin import AcquisitionYAMLDropMixin
+from squid.backend.io.acquisition_yaml import (
+    AcquisitionYAMLData,
+    save_acquisition_preset,
+    parse_acquisition_yaml,
+)
+
+if TYPE_CHECKING:
+    from squid.ui.ui_event_bus import UIEventBus
+
+
+_FEATURE_FLAGS = get_feature_flags()
 from squid.ui.widgets.base import error_dialog, check_space_available_with_error_dialog
 
 
-class FlexibleMultiPointWidget(QFrame):
+class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, EventBusFrame):
     def __init__(
         self,
         focusMapWidget,
-        event_bus: EventBus,
+        event_bus: "UIEventBus",
         initial_channel_configs: List[str],
         z_ustep_per_mm: Optional[float] = None,
         initial_z_mm: float = 0.0,
-        *args,
-        **kwargs,
     ):
-        super().__init__(*args, **kwargs)
+        super().__init__(event_bus)
+        self.setAcceptDrops(True)  # Enable drag-and-drop for YAML loading
         self._log = squid.core.logging.get_logger(self.__class__.__name__)
         self.acquisition_start_time = None
         self.last_used_locations = None
         self.last_used_location_ids = None
-        self._event_bus = event_bus
         self._z_ustep_per_mm = z_ustep_per_mm
         # Cache current position (updated via StagePositionChanged events)
         self._cached_x_mm = 0.0
@@ -92,6 +121,15 @@ class FlexibleMultiPointWidget(QFrame):
         self.location_list = np.empty((0, 3), dtype=float)
         self.location_ids = np.empty((0,), dtype="<U20")
         self.use_overlap = USE_OVERLAP_FOR_FLEXIBLE
+        focus_lock_defaults = FocusLockConfig()
+        self._focus_lock_settings = {
+            "enabled": False,
+            "buffer_length": focus_lock_defaults.buffer_length,
+            "recovery_attempts": focus_lock_defaults.recovery_attempts,
+            "min_spot_snr": focus_lock_defaults.min_spot_snr,
+            "acquire_threshold_um": focus_lock_defaults.acquire_threshold_um,
+            "maintain_threshold_um": focus_lock_defaults.maintain_threshold_um,
+        }
 
         # Cached acquisition state from events
         self._acquisition_in_progress = False
@@ -106,17 +144,7 @@ class FlexibleMultiPointWidget(QFrame):
         self.acquisition_in_place = False
         self._is_active_tab = False
 
-        # Subscribe to EventBus for position updates and acquisition state
-        self._event_bus.subscribe(StagePositionChanged, self._on_stage_position_changed)
-        self._event_bus.subscribe(ObjectiveChanged, self._on_objective_changed)
-        self._event_bus.subscribe(AcquisitionStateChanged, self._on_acquisition_state_changed)
-        self._event_bus.subscribe(AcquisitionProgress, self._on_acquisition_progress)
-        self._event_bus.subscribe(AcquisitionRegionProgress, self._on_region_progress)
-        self._event_bus.subscribe(LoadingPositionReached, self._on_loading_position_reached)
-        self._event_bus.subscribe(ScanningPositionReached, self._on_scanning_position_reached)
-        self._event_bus.subscribe(ScanCoordinatesUpdated, self._on_scan_coordinates_updated)
-        self._event_bus.subscribe(ActiveAcquisitionTabChanged, self._on_active_tab_changed)
-
+    @handles(ActiveAcquisitionTabChanged)
     def _on_active_tab_changed(self, event: ActiveAcquisitionTabChanged) -> None:
         self._is_active_tab = event.active_tab == "flexible"
         if not self._is_active_tab:
@@ -127,17 +155,20 @@ class FlexibleMultiPointWidget(QFrame):
         except Exception:
             self._log.exception("Failed to update flexible regions on tab activation")
 
+    @handles(ScanCoordinatesUpdated)
     def _on_scan_coordinates_updated(self, event: ScanCoordinatesUpdated) -> None:
         """Handle updates to scan coordinates (regions added/removed/cleared)."""
         # Log for debugging - can be extended to update UI elements
         self._log.debug(f"ScanCoordinates updated: {event.total_regions} regions, {event.total_fovs} FOVs")
 
+    @handles(StagePositionChanged)
     def _on_stage_position_changed(self, event: StagePositionChanged) -> None:
         """Cache stage position from EventBus."""
         self._cached_x_mm = event.x_mm
         self._cached_y_mm = event.y_mm
         self._cached_z_mm = event.z_mm
 
+    @handles(ObjectiveChanged)
     def _on_objective_changed(self, _event: ObjectiveChanged) -> None:
         # Recompute FOV grid spacing for stored locations when objective changes.
         try:
@@ -145,18 +176,46 @@ class FlexibleMultiPointWidget(QFrame):
         except Exception:
             self._log.exception("Failed to update flexible multipoint FOV positions on objective change")
 
+    @handles(ChannelConfigurationsChanged)
+    def _on_channel_configs_changed(self, event: ChannelConfigurationsChanged) -> None:
+        """Update channel list when configurations change for current objective."""
+        self.list_configurations.clear()
+        self.list_configurations.addItems(event.configuration_names)
+
+    @handles(FocusLockModeChanged)
+    def _on_focus_lock_mode_changed(self, event: FocusLockModeChanged) -> None:
+        """Disable AF checkboxes when focus lock is active."""
+        focus_lock_active = event.mode == "on"
+
+        # Disable the focus lock checkbox when the external focus lock controller is active
+        self.checkbox_focus_lock.setEnabled(not focus_lock_active)
+        if focus_lock_active:
+            self.checkbox_focus_lock.setChecked(False)
+            self.checkbox_withAutofocus.setEnabled(False)
+            self.checkbox_withReflectionAutofocus.setEnabled(False)
+        else:
+            self.checkbox_withAutofocus.setEnabled(True)
+            self.checkbox_withReflectionAutofocus.setEnabled(True)
+
     def add_components(self):
         self.btn_setSavingDir = QPushButton("Browse")
         self.btn_setSavingDir.setDefault(False)
         self.btn_setSavingDir.setIcon(QIcon("assets/icon/folder.png"))
 
+        # Save/Load preset buttons
+        self.btn_save_preset = QPushButton("Save")
+        self.btn_save_preset.setToolTip("Save current acquisition settings to experiment folder")
+
+        self.btn_load_preset = QPushButton("Load")
+        self.btn_load_preset.setToolTip("Load acquisition settings from an experiment folder")
+
         self.lineEdit_savingDir = QLineEdit()
         self.lineEdit_savingDir.setReadOnly(True)
-        self.lineEdit_savingDir.setText("Choose a base saving directory")
 
-        self.lineEdit_savingDir.setText(DEFAULT_SAVING_PATH)
-        # Publish default path via event
-        self._event_bus.publish(SetAcquisitionPathCommand(base_path=DEFAULT_SAVING_PATH))
+        # Load last used saving path from cache, or fall back to default
+        last_path = get_last_used_saving_path(DEFAULT_SAVING_PATH)
+        self.lineEdit_savingDir.setText(last_path)
+        self._publish(SetAcquisitionPathCommand(base_path=last_path))
         self.base_path_is_set = True
 
         self.lineEdit_experimentID = QLineEdit()
@@ -303,22 +362,21 @@ class FlexibleMultiPointWidget(QFrame):
         self.checkbox_withAutofocus.setChecked(
             MULTIPOINT_CONTRAST_AUTOFOCUS_ENABLE_BY_DEFAULT
         )
-        # Set initial autofocus flag via event
-        self._event_bus.publish(SetAcquisitionParametersCommand(
-            use_autofocus=MULTIPOINT_CONTRAST_AUTOFOCUS_ENABLE_BY_DEFAULT
-        ))
 
         self.checkbox_withReflectionAutofocus = QCheckBox("Reflection AF")
         self.checkbox_withReflectionAutofocus.setChecked(
             MULTIPOINT_REFLECTION_AUTOFOCUS_ENABLE_BY_DEFAULT
         )
-        # Set initial reflection AF flag via event
-        self._event_bus.publish(SetAcquisitionParametersCommand(
-            use_reflection_af=MULTIPOINT_REFLECTION_AUTOFOCUS_ENABLE_BY_DEFAULT
+        autofocus_mode = AutofocusMode.NONE
+        if MULTIPOINT_REFLECTION_AUTOFOCUS_ENABLE_BY_DEFAULT:
+            autofocus_mode = AutofocusMode.LASER_REFLECTION
+            self.checkbox_withAutofocus.setChecked(False)
+        elif MULTIPOINT_CONTRAST_AUTOFOCUS_ENABLE_BY_DEFAULT:
+            autofocus_mode = AutofocusMode.CONTRAST
+        # Set initial autofocus mode via event
+        self._publish(SetAcquisitionParametersCommand(
+            autofocus_mode=autofocus_mode
         ))
-
-        self.checkbox_genAFMap = QCheckBox("Generate Focus Map")
-        self.checkbox_genAFMap.setChecked(False)
 
         self.checkbox_useFocusMap = QCheckBox("Use Focus Map")
         self.checkbox_useFocusMap.setChecked(False)
@@ -326,11 +384,23 @@ class FlexibleMultiPointWidget(QFrame):
         self.checkbox_usePiezo = QCheckBox("Piezo Z-Stack")
         self.checkbox_usePiezo.setChecked(MULTIPOINT_USE_PIEZO_FOR_ZSTACKS)
 
-        self.checkbox_stitchOutput = QCheckBox("Stitch Scans")
-        self.checkbox_stitchOutput.setChecked(False)
-
         self.checkbox_skipSaving = QCheckBox("Skip Saving")
         self.checkbox_skipSaving.setChecked(False)
+
+        # AF interval spinbox
+        self.spinbox_af_interval = QSpinBox()
+        self.spinbox_af_interval.setRange(1, 1000)
+        self.spinbox_af_interval.setValue(3)
+        self.spinbox_af_interval.setSuffix(" FOVs")
+        self.spinbox_af_interval.setToolTip("Run autofocus every N FOVs")
+
+        # Focus Lock checkbox
+        self.checkbox_focus_lock = QCheckBox("Focus Lock")
+        self.checkbox_focus_lock.setChecked(False)
+        self.checkbox_focus_lock.setToolTip(
+            "Enable continuous focus lock during acquisition.\n"
+            "Uses laser autofocus to maintain focus between FOVs."
+        )
 
         self.checkbox_set_z_range = QCheckBox("Set Z-range")
         self.checkbox_set_z_range.toggled.connect(self.toggle_z_range_controls)
@@ -370,11 +440,6 @@ class FlexibleMultiPointWidget(QFrame):
         self.set_maxZ_button = QPushButton("Set")
         self.set_maxZ_button.clicked.connect(self.set_z_max)
 
-        self.combobox_z_stack = QComboBox()
-        self.combobox_z_stack.addItems(
-            ["From Bottom (Z-min)", "From Center", "From Top (Z-max)"]
-        )
-
         self.btn_startAcquisition = QPushButton("Start\n Acquisition ")
         self.btn_startAcquisition.setStyleSheet("background-color: #C2C2FF")
         self.btn_startAcquisition.setCheckable(True)
@@ -400,6 +465,8 @@ class FlexibleMultiPointWidget(QFrame):
         self.grid_line0.addWidget(QLabel("Saving Path"))
         self.grid_line0.addWidget(self.lineEdit_savingDir)
         self.grid_line0.addWidget(self.btn_setSavingDir)
+        self.grid_line0.addWidget(self.btn_save_preset)
+        self.grid_line0.addWidget(self.btn_load_preset)
         self.grid_line0.addWidget(QLabel("ID"))
         self.grid_line0.addWidget(self.lineEdit_experimentID)
 
@@ -515,17 +582,25 @@ class FlexibleMultiPointWidget(QFrame):
 
         grid_af = QVBoxLayout()
         grid_af.addWidget(self.checkbox_withAutofocus)
-        if SUPPORT_LASER_AUTOFOCUS:
+        if _FEATURE_FLAGS.is_enabled("SUPPORT_LASER_AUTOFOCUS"):
             grid_af.addWidget(self.checkbox_withReflectionAutofocus)
-        # grid_af.addWidget(self.checkbox_genAFMap)  # we are not using auto-focus map for now
+            grid_af.addWidget(self.checkbox_focus_lock)
+        af_interval_layout = QHBoxLayout()
+        af_interval_layout.addWidget(QLabel("AF every"))
+        af_interval_layout.addWidget(self.spinbox_af_interval)
+        af_interval_layout.addStretch()
+        grid_af.addLayout(af_interval_layout)
         grid_af.addWidget(self.checkbox_useFocusMap)
         if HAS_OBJECTIVE_PIEZO:
             grid_af.addWidget(self.checkbox_usePiezo)
         grid_af.addWidget(self.checkbox_skipSaving)
         grid_af.addWidget(self.checkbox_set_z_range)
 
+        config_col = QVBoxLayout()
+        config_col.addWidget(self.list_configurations)
+
         grid_config = QHBoxLayout()
-        grid_config.addWidget(self.list_configurations)
+        grid_config.addLayout(config_col)
         grid_config.addSpacerItem(edge_spacer)
 
         button_layout = QVBoxLayout()
@@ -582,28 +657,27 @@ class FlexibleMultiPointWidget(QFrame):
             self.entry_deltaY.valueChanged.connect(self.update_fov_positions)
         self.entry_NX.valueChanged.connect(self.update_fov_positions)
         self.entry_NY.valueChanged.connect(self.update_fov_positions)
-        # self.btn_add.clicked.connect(self.update_fov_positions) #TODO: this is handled in the add_location method - to be removed
-        # self.btn_remove.clicked.connect(self.update_fov_positions) #TODO: this is handled in the remove_location method - to be removed
         self.entry_deltaZ.valueChanged.connect(self.set_deltaZ)
         self.entry_dt.valueChanged.connect(self._on_dt_changed)
         self.entry_NX.valueChanged.connect(self._on_nx_changed)
         self.entry_NY.valueChanged.connect(self._on_ny_changed)
         self.entry_NZ.valueChanged.connect(self._on_nz_changed)
         self.entry_Nt.valueChanged.connect(self._on_nt_changed)
-        self.checkbox_genAFMap.toggled.connect(self._on_gen_af_map_toggled)
         self.checkbox_useFocusMap.toggled.connect(self.focusMapWidget.setEnabled)
         self.checkbox_withAutofocus.toggled.connect(self._on_autofocus_toggled)
         self.checkbox_withReflectionAutofocus.toggled.connect(self._on_reflection_af_toggled)
         self.checkbox_usePiezo.toggled.connect(self._on_use_piezo_toggled)
         self.checkbox_skipSaving.toggled.connect(self._on_skip_saving_toggled)
+        self.checkbox_focus_lock.toggled.connect(self._on_focus_lock_toggled)
         self.btn_setSavingDir.clicked.connect(self.set_saving_dir)
+        self.btn_save_preset.clicked.connect(self.save_acquisition_preset)
+        self.btn_load_preset.clicked.connect(self.load_acquisition_preset)
         self.btn_startAcquisition.clicked.connect(self.toggle_acquisition)
         # Note: acquisition_finished, signal_acquisition_progress, signal_region_progress
         # are now handled via EventBus subscriptions (see _on_acquisition_state_changed etc.)
         self.list_configurations.itemSelectionChanged.connect(
             self.emit_selected_channels
         )
-        # self.combobox_z_stack.currentIndexChanged.connect(self.signal_z_stacking.emit)
 
         self.eta_timer.timeout.connect(self.update_eta_display)
 
@@ -627,7 +701,7 @@ class FlexibleMultiPointWidget(QFrame):
 
         self.toggle_z_range_controls(False)
         # Set initial piezo flag via event
-        self._event_bus.publish(SetAcquisitionParametersCommand(
+        self._publish(SetAcquisitionParametersCommand(
             use_piezo=self.checkbox_usePiezo.isChecked()
         ))
 
@@ -727,13 +801,13 @@ class FlexibleMultiPointWidget(QFrame):
         if self.checkbox_withReflectionAutofocus.isChecked():
             # Publish command - the result will come back via LaserAFReferenceSet event
             # For now we just publish and let the controller handle errors
-            self._event_bus.publish(SetLaserAFReferenceCommand())
+            self._publish(SetLaserAFReferenceCommand())
 
     def update_z(self):
         z_mm = self._cached_z_mm
         index = self.dropdown_location_list.currentIndex()
         self.location_list[index, 2] = z_mm
-        self._event_bus.publish(
+        self._publish(
             UpdateScanCoordinateRegionZCommand(region_id=str(self.location_ids[index]), z_mm=z_mm)
         )
         location_str = f"x:{round(self.location_list[index, 0], 3)} mm  y:{round(self.location_list[index, 1], 3)} mm  z:{round(z_mm * 1000.0, 3)} μm"
@@ -838,12 +912,12 @@ class FlexibleMultiPointWidget(QFrame):
         if not self.isVisible():
             return
 
-        self._event_bus.publish(ClearScanCoordinatesCommand())
+        self._publish(ClearScanCoordinatesCommand())
 
         for i, (x, y, z) in enumerate(self.location_list):
             region_id = self.location_ids[i]
             if self.use_overlap:
-                self._event_bus.publish(
+                self._publish(
                     AddFlexibleRegionCommand(
                         region_id=str(region_id),
                         center_x_mm=float(x),
@@ -855,7 +929,7 @@ class FlexibleMultiPointWidget(QFrame):
                     )
                 )
             else:
-                self._event_bus.publish(
+                self._publish(
                     AddFlexibleRegionWithStepSizeCommand(
                         region_id=str(region_id),
                         center_x_mm=float(x),
@@ -879,20 +953,22 @@ class FlexibleMultiPointWidget(QFrame):
             # No Z config available, use value as-is
             deltaZ = value
         self.entry_deltaZ.setValue(deltaZ)
-        self._event_bus.publish(SetAcquisitionParametersCommand(delta_z_um=deltaZ))
+        self._publish(SetAcquisitionParametersCommand(delta_z_um=deltaZ))
 
     def set_saving_dir(self):
         dialog = QFileDialog()
         save_dir_base = dialog.getExistingDirectory(None, "Select Folder")
-        self._event_bus.publish(SetAcquisitionPathCommand(base_path=save_dir_base))
-        self.lineEdit_savingDir.setText(save_dir_base)
-        self.base_path_is_set = True
+        if save_dir_base:  # Only update if user didn't cancel
+            self._publish(SetAcquisitionPathCommand(base_path=save_dir_base))
+            self.lineEdit_savingDir.setText(save_dir_base)
+            self.base_path_is_set = True
+            save_last_used_saving_path(save_dir_base)
 
     def emit_selected_channels(self):
         selected_channels = [
             item.text() for item in self.list_configurations.selectedItems()
         ]
-        self._event_bus.publish(
+        self._publish(
             SetAcquisitionChannelsCommand(channel_names=list(selected_channels))
         )
 
@@ -938,30 +1014,35 @@ class FlexibleMultiPointWidget(QFrame):
                 focus_map = self.focusMapWidget.focusMap
 
             # Publish acquisition parameters via events
-            self._event_bus.publish(SetAcquisitionParametersCommand(
+            overlap_pct = self.entry_overlap.value() if self.use_overlap else 0.0
+            self._publish(SetAcquisitionParametersCommand(
                 delta_z_um=self.entry_deltaZ.value(),
                 n_z=self.entry_NZ.value(),
                 delta_t_s=self.entry_dt.value(),
                 n_t=self.entry_Nt.value(),
                 use_piezo=self.checkbox_usePiezo.isChecked(),
-                use_autofocus=self.checkbox_withAutofocus.isChecked(),
-                use_reflection_af=self.checkbox_withReflectionAutofocus.isChecked(),
-                use_fluidics=False,
+                autofocus_mode=self._current_autofocus_mode(),
+                autofocus_interval_fovs=self.spinbox_af_interval.value(),
+                focus_lock_settings=self._current_focus_lock_settings(),
                 skip_saving=self.checkbox_skipSaving.isChecked(),
                 z_range=z_range,
                 focus_map=focus_map,
+                # Widget context for YAML saving
+                widget_type="flexible",
+                overlap_percent=overlap_pct,
             ))
-            self._event_bus.publish(SetAcquisitionPathCommand(
+            self._publish(SetAcquisitionPathCommand(
                 base_path=self.lineEdit_savingDir.text()
             ))
-            self._event_bus.publish(SetAcquisitionChannelsCommand(
+            self._publish(SetAcquisitionChannelsCommand(
                 channel_names=[item.text() for item in self.list_configurations.selectedItems()]
             ))
-            self._event_bus.publish(StartNewExperimentCommand(
+            self._publish_focus_lock_params()
+            self._publish(StartNewExperimentCommand(
                 experiment_id=self.lineEdit_experimentID.text()
             ))
             requested_id = self.lineEdit_experimentID.text().strip()
-            self._active_experiment_id = requested_id or None
+            self._active_experiment_id = self._normalize_experiment_id(requested_id)
 
             # TODO: check_space_available_with_error_dialog needs to be refactored
             # to not require multipointController reference
@@ -975,10 +1056,10 @@ class FlexibleMultiPointWidget(QFrame):
             self.setEnabled_all(False)
 
             # Start coordinate-based acquisition via event
-            self._event_bus.publish(StartAcquisitionCommand(xy_mode="Current Position"))
+            self._publish(StartAcquisitionCommand(xy_mode="Current Position"))
         else:
             # This must eventually propagate through and call out acquisition_finished.
-            self._event_bus.publish(StopAcquisitionCommand())
+            self._publish(StopAcquisitionCommand())
 
     def load_last_used_locations(self):
         if self.last_used_locations is None or len(self.last_used_locations) == 0:
@@ -1064,7 +1145,7 @@ class FlexibleMultiPointWidget(QFrame):
 
             # Store actual values in region coordinates
             if self.use_overlap:
-                self._event_bus.publish(
+                self._publish(
                     AddFlexibleRegionCommand(
                         region_id=str(region_id),
                         center_x_mm=float(x),
@@ -1076,7 +1157,7 @@ class FlexibleMultiPointWidget(QFrame):
                     )
                 )
             else:
-                self._event_bus.publish(
+                self._publish(
                     AddFlexibleRegionWithStepSizeCommand(
                         region_id=str(region_id),
                         center_x_mm=float(x),
@@ -1119,7 +1200,7 @@ class FlexibleMultiPointWidget(QFrame):
             self.dropdown_location_list.removeItem(index)
             self.table_location_list.removeRow(index)
 
-            self._event_bus.publish(RemoveScanCoordinateRegionCommand(region_id=str(region_id)))
+            self._publish(RemoveScanCoordinateRegionCommand(region_id=str(region_id)))
 
             # Note: region reindexing must be done via RenameScanCoordinateRegionCommand.
 
@@ -1159,7 +1240,7 @@ class FlexibleMultiPointWidget(QFrame):
     def clear(self):
         self.location_list = np.empty((0, 3), dtype=float)
         self.location_ids = np.empty((0,), dtype="<U20")
-        self._event_bus.publish(ClearScanCoordinatesCommand())
+        self._publish(ClearScanCoordinatesCommand())
         self.dropdown_location_list.clear()
         self.table_location_list.setRowCount(0)
 
@@ -1184,7 +1265,7 @@ class FlexibleMultiPointWidget(QFrame):
 
     def _move_stage_to(self, x: float, y: float, z: float) -> None:
         """Move stage to position via EventBus."""
-        self._event_bus.publish(MoveStageCommand(x_mm=x, y_mm=y, z_mm=z))
+        self._publish(MoveStageToCommand(x_mm=x, y_mm=y, z_mm=z))
 
     def cell_was_clicked(self, row, column):
         self.dropdown_location_list.setCurrentIndex(row)
@@ -1202,8 +1283,8 @@ class FlexibleMultiPointWidget(QFrame):
 
             # Update region coordinates and FOVs for new position
             if self.use_overlap:
-                self._event_bus.publish(RemoveScanCoordinateRegionCommand(region_id=str(region_id)))
-                self._event_bus.publish(
+                self._publish(RemoveScanCoordinateRegionCommand(region_id=str(region_id)))
+                self._publish(
                     AddFlexibleRegionCommand(
                         region_id=str(region_id),
                         center_x_mm=float(x),
@@ -1215,8 +1296,8 @@ class FlexibleMultiPointWidget(QFrame):
                     )
                 )
             else:
-                self._event_bus.publish(RemoveScanCoordinateRegionCommand(region_id=str(region_id)))
-                self._event_bus.publish(
+                self._publish(RemoveScanCoordinateRegionCommand(region_id=str(region_id)))
+                self._publish(
                     AddFlexibleRegionWithStepSizeCommand(
                         region_id=str(region_id),
                         center_x_mm=float(x),
@@ -1232,11 +1313,11 @@ class FlexibleMultiPointWidget(QFrame):
         elif column == 2:  # Z coordinate changed
             z = float(val_edit) / 1000
             self.location_list[row, 2] = z
-            self._event_bus.publish(UpdateScanCoordinateRegionZCommand(region_id=str(region_id), z_mm=float(z)))
+            self._publish(UpdateScanCoordinateRegionZCommand(region_id=str(region_id), z_mm=float(z)))
         else:  # ID changed
             new_id = val_edit
             self.location_ids[row] = new_id
-            self._event_bus.publish(
+            self._publish(
                 RenameScanCoordinateRegionCommand(old_region_id=str(region_id), new_region_id=str(new_id))
             )
 
@@ -1354,7 +1435,7 @@ class FlexibleMultiPointWidget(QFrame):
                         QTableWidgetItem(region_id),
                     )
                     if self.use_overlap:
-                        self._event_bus.publish(
+                        self._publish(
                             AddFlexibleRegionCommand(
                                 region_id=str(region_id),
                                 center_x_mm=float(x),
@@ -1366,7 +1447,7 @@ class FlexibleMultiPointWidget(QFrame):
                             )
                         )
                     else:
-                        self._event_bus.publish(
+                        self._publish(
                             AddFlexibleRegionWithStepSizeCommand(
                                 region_id=str(region_id),
                                 center_x_mm=float(x),
@@ -1392,28 +1473,51 @@ class FlexibleMultiPointWidget(QFrame):
             return
 
         # Set the selected channels and acquisition parameters via events
-        self._event_bus.publish(SetAcquisitionChannelsCommand(
+        self._publish(SetAcquisitionChannelsCommand(
             channel_names=[item.text() for item in self.list_configurations.selectedItems()]
         ))
 
         z = self._cached_z_mm
-        self._event_bus.publish(SetAcquisitionParametersCommand(
+        self._publish(SetAcquisitionParametersCommand(
             delta_z_um=0,
             n_z=1,
             delta_t_s=0,
             n_t=1,
             use_piezo=False,
-            use_autofocus=False,
-            use_reflection_af=False,
-            use_fluidics=False,
+            autofocus_mode=AutofocusMode.NONE,
+            autofocus_interval_fovs=1,
             z_range=(z, z),
         ))
 
         # Start the acquisition process for the single FOV
         experiment_id = "snapped images" + self.lineEdit_experimentID.text()
-        self._active_experiment_id = experiment_id.strip() or None
-        self._event_bus.publish(StartNewExperimentCommand(experiment_id=experiment_id))
-        self._event_bus.publish(StartAcquisitionCommand(acquire_current_fov=True, xy_mode="Current Position"))
+        self._active_experiment_id = self._normalize_experiment_id(experiment_id)
+        self._publish(StartNewExperimentCommand(experiment_id=experiment_id))
+        self._publish(StartAcquisitionCommand(acquire_current_fov=True, xy_mode="Current Position"))
+
+    @staticmethod
+    def _normalize_experiment_id(experiment_id: Optional[str]) -> Optional[str]:
+        if experiment_id is None:
+            return None
+        normalized = experiment_id.strip()
+        return normalized or None
+
+    @classmethod
+    def _experiment_id_matches(
+        cls,
+        active_experiment_id: Optional[str],
+        event_experiment_id: Optional[str],
+    ) -> bool:
+        active_id = cls._normalize_experiment_id(active_experiment_id)
+        event_id = cls._normalize_experiment_id(event_experiment_id)
+        if active_id is None or event_id is None:
+            return False
+        if active_id == event_id:
+            return True
+        return (
+            event_id.startswith(f"{active_id}_")
+            or active_id.startswith(f"{event_id}_")
+        )
 
     def acquisition_is_finished(self):
         self._log.debug(
@@ -1452,11 +1556,9 @@ class FlexibleMultiPointWidget(QFrame):
         else:
             self.entry_overlap.setEnabled(enabled)
         self.list_configurations.setEnabled(enabled)
-        self.checkbox_genAFMap.setEnabled(enabled)
         self.checkbox_useFocusMap.setEnabled(enabled)
         self.checkbox_withAutofocus.setEnabled(enabled)
         self.checkbox_withReflectionAutofocus.setEnabled(enabled)
-        self.checkbox_stitchOutput.setEnabled(enabled)
         self.checkbox_skipSaving.setEnabled(enabled)
         self.checkbox_set_z_range.setEnabled(enabled)
 
@@ -1469,13 +1571,20 @@ class FlexibleMultiPointWidget(QFrame):
     def enable_the_start_aquisition_button(self):
         self.btn_startAcquisition.setEnabled(True)
 
+
     # =========================================================================
     # EventBus Handlers
     # =========================================================================
 
+    @handles(AcquisitionStateChanged)
     def _on_acquisition_state_changed(self, event: AcquisitionStateChanged) -> None:
         """Handle acquisition state changes from EventBus."""
-        if self._active_experiment_id and event.experiment_id != self._active_experiment_id:
+        if (
+            self._active_experiment_id
+            and not self._experiment_id_matches(
+                self._active_experiment_id, event.experiment_id
+            )
+        ):
             return
         self._acquisition_in_progress = event.in_progress
         self._acquisition_is_aborting = event.is_aborting
@@ -1487,9 +1596,15 @@ class FlexibleMultiPointWidget(QFrame):
             # Acquisition finished
             self.acquisition_is_finished()
 
+    @handles(AcquisitionProgress)
     def _on_acquisition_progress(self, event: AcquisitionProgress) -> None:
         """Handle acquisition progress updates from EventBus."""
-        if self._active_experiment_id and event.experiment_id != self._active_experiment_id:
+        if (
+            self._active_experiment_id
+            and not self._experiment_id_matches(
+                self._active_experiment_id, event.experiment_id
+            )
+        ):
             return
         if not self.is_current_acquisition_widget:
             return
@@ -1520,16 +1635,24 @@ class FlexibleMultiPointWidget(QFrame):
             eta_str = f"{minutes:02d}:{seconds:02d}"
         self.eta_label.setText(eta_str)
 
+    @handles(AcquisitionRegionProgress)
     def _on_region_progress(self, event: AcquisitionRegionProgress) -> None:
         """Handle region progress updates from EventBus."""
-        if self._active_experiment_id and event.experiment_id != self._active_experiment_id:
+        if (
+            self._active_experiment_id
+            and not self._experiment_id_matches(
+                self._active_experiment_id, event.experiment_id
+            )
+        ):
             return
         self.update_region_progress(event.current_region, event.total_regions)
 
+    @handles(LoadingPositionReached)
     def _on_loading_position_reached(self, event: LoadingPositionReached) -> None:
         """Handle loading position reached - disable acquisition button."""
         self.disable_the_start_aquisition_button()
 
+    @handles(ScanningPositionReached)
     def _on_scanning_position_reached(self, event: ScanningPositionReached) -> None:
         """Handle scanning position reached - enable acquisition button."""
         self.enable_the_start_aquisition_button()
@@ -1538,42 +1661,400 @@ class FlexibleMultiPointWidget(QFrame):
     # UI Event Handlers (publish commands)
     # =========================================================================
 
+    def _current_autofocus_mode(self) -> AutofocusMode:
+        if self.checkbox_focus_lock.isChecked():
+            return AutofocusMode.FOCUS_LOCK
+        if self.checkbox_withReflectionAutofocus.isChecked():
+            return AutofocusMode.LASER_REFLECTION
+        if self.checkbox_withAutofocus.isChecked():
+            return AutofocusMode.CONTRAST
+        return AutofocusMode.NONE
+
+    def _current_focus_lock_settings(self) -> FocusLockSettings:
+        settings = self.get_focus_lock_settings()
+        return FocusLockSettings(
+            buffer_length=int(settings["buffer_length"]),
+            recovery_attempts=int(settings["recovery_attempts"]),
+            min_spot_snr=float(settings["min_spot_snr"]),
+            acquire_threshold_um=float(settings["acquire_threshold_um"]),
+            maintain_threshold_um=float(settings["maintain_threshold_um"]),
+            auto_search_enabled=bool(settings.get("enabled", False)),
+        )
+
     def _on_dt_changed(self, value: float) -> None:
         """Handle dt spinbox change - publish event."""
-        self._event_bus.publish(SetAcquisitionParametersCommand(delta_t_s=value))
+        self._publish(SetAcquisitionParametersCommand(delta_t_s=value))
 
     def _on_nx_changed(self, value: int) -> None:
         """Handle NX spinbox change - publish event."""
-        self._event_bus.publish(SetAcquisitionParametersCommand(n_x=value))
+        self._publish(SetAcquisitionParametersCommand(n_x=value))
 
     def _on_ny_changed(self, value: int) -> None:
         """Handle NY spinbox change - publish event."""
-        self._event_bus.publish(SetAcquisitionParametersCommand(n_y=value))
+        self._publish(SetAcquisitionParametersCommand(n_y=value))
 
     def _on_nz_changed(self, value: int) -> None:
         """Handle NZ spinbox change - publish event."""
-        self._event_bus.publish(SetAcquisitionParametersCommand(n_z=value))
+        self._publish(SetAcquisitionParametersCommand(n_z=value))
 
     def _on_nt_changed(self, value: int) -> None:
         """Handle Nt spinbox change - publish event."""
-        self._event_bus.publish(SetAcquisitionParametersCommand(n_t=value))
-
-    def _on_gen_af_map_toggled(self, checked: bool) -> None:
-        """Handle generate AF map checkbox toggle - publish event."""
-        self._event_bus.publish(SetAcquisitionParametersCommand(gen_focus_map=checked))
+        self._publish(SetAcquisitionParametersCommand(n_t=value))
 
     def _on_autofocus_toggled(self, checked: bool) -> None:
         """Handle autofocus checkbox toggle - publish event."""
-        self._event_bus.publish(SetAcquisitionParametersCommand(use_autofocus=checked))
+        if checked:
+            self.checkbox_withReflectionAutofocus.blockSignals(True)
+            self.checkbox_withReflectionAutofocus.setChecked(False)
+            self.checkbox_withReflectionAutofocus.blockSignals(False)
+            self.checkbox_focus_lock.blockSignals(True)
+            self.checkbox_focus_lock.setChecked(False)
+            self.checkbox_focus_lock.blockSignals(False)
+        self._publish(
+            SetAcquisitionParametersCommand(
+                autofocus_mode=self._current_autofocus_mode(),
+                autofocus_interval_fovs=self.spinbox_af_interval.value(),
+                focus_lock_settings=self._current_focus_lock_settings(),
+            )
+        )
 
     def _on_reflection_af_toggled(self, checked: bool) -> None:
         """Handle reflection AF checkbox toggle - publish event."""
-        self._event_bus.publish(SetAcquisitionParametersCommand(use_reflection_af=checked))
+        if checked:
+            self.checkbox_withAutofocus.blockSignals(True)
+            self.checkbox_withAutofocus.setChecked(False)
+            self.checkbox_withAutofocus.blockSignals(False)
+            self.checkbox_focus_lock.blockSignals(True)
+            self.checkbox_focus_lock.setChecked(False)
+            self.checkbox_focus_lock.blockSignals(False)
+        self._publish(
+            SetAcquisitionParametersCommand(
+                autofocus_mode=self._current_autofocus_mode(),
+                autofocus_interval_fovs=self.spinbox_af_interval.value(),
+                focus_lock_settings=self._current_focus_lock_settings(),
+            )
+        )
 
     def _on_use_piezo_toggled(self, checked: bool) -> None:
         """Handle use piezo checkbox toggle - publish event."""
-        self._event_bus.publish(SetAcquisitionParametersCommand(use_piezo=checked))
+        self._publish(SetAcquisitionParametersCommand(use_piezo=checked))
 
     def _on_skip_saving_toggled(self, checked: bool) -> None:
         """Handle skip saving checkbox toggle - publish event."""
-        self._event_bus.publish(SetAcquisitionParametersCommand(skip_saving=checked))
+        self._publish(SetAcquisitionParametersCommand(skip_saving=checked))
+
+    def _on_focus_lock_toggled(self, checked: bool) -> None:
+        """Handle focus lock checkbox toggle."""
+        self._focus_lock_settings["enabled"] = checked
+        # When focus lock is enabled, disable the single-shot AF checkboxes
+        if checked:
+            self.checkbox_withAutofocus.setChecked(False)
+            self.checkbox_withAutofocus.setEnabled(False)
+            self.checkbox_withReflectionAutofocus.setChecked(False)
+            self.checkbox_withReflectionAutofocus.setEnabled(False)
+        else:
+            self.checkbox_withAutofocus.setEnabled(True)
+            self.checkbox_withReflectionAutofocus.setEnabled(True)
+        self._publish(
+            SetAcquisitionParametersCommand(
+                autofocus_mode=self._current_autofocus_mode(),
+                autofocus_interval_fovs=self.spinbox_af_interval.value(),
+                focus_lock_settings=self._current_focus_lock_settings(),
+            )
+        )
+        self._publish_focus_lock_params()
+
+    def get_focus_lock_settings(self) -> dict:
+        """Get current focus lock settings for saving."""
+        settings = dict(self._focus_lock_settings)
+        settings["enabled"] = self.checkbox_focus_lock.isChecked()
+        return settings
+
+    def set_focus_lock_settings(self, settings: dict) -> None:
+        """Restore focus lock settings from saved data."""
+        self._focus_lock_settings.update(
+            {
+                "enabled": settings.get("enabled", False),
+                "buffer_length": settings.get(
+                    "buffer_length", self._focus_lock_settings["buffer_length"]
+                ),
+                "recovery_attempts": settings.get(
+                    "recovery_attempts", self._focus_lock_settings["recovery_attempts"]
+                ),
+                "min_spot_snr": settings.get(
+                    "min_spot_snr", self._focus_lock_settings["min_spot_snr"]
+                ),
+                "acquire_threshold_um": settings.get(
+                    "acquire_threshold_um", self._focus_lock_settings["acquire_threshold_um"]
+                ),
+                "maintain_threshold_um": settings.get(
+                    "maintain_threshold_um", self._focus_lock_settings["maintain_threshold_um"]
+                ),
+            }
+        )
+        self.checkbox_focus_lock.setChecked(bool(self._focus_lock_settings["enabled"]))
+        self._publish_focus_lock_params()
+
+    def _publish_focus_lock_params(self) -> None:
+        settings = self.get_focus_lock_settings()
+        self._publish(
+            SetFocusLockParamsCommand(
+                buffer_length=int(settings["buffer_length"]),
+                recovery_attempts=int(settings["recovery_attempts"]),
+                min_spot_snr=float(settings["min_spot_snr"]),
+                acquire_threshold_um=float(settings["acquire_threshold_um"]),
+                maintain_threshold_um=float(settings["maintain_threshold_um"]),
+            )
+        )
+
+    # =========================================================================
+    # Preset Save/Load
+    # =========================================================================
+
+    def save_acquisition_preset(self) -> None:
+        """Save current acquisition settings to the experiment folder."""
+        base_path = self.lineEdit_savingDir.text()
+        experiment_id = self.lineEdit_experimentID.text() or "Preset"
+
+        if not base_path:
+            QMessageBox.warning(
+                self,
+                "No Saving Path",
+                "Please set a saving path before saving the preset.",
+            )
+            return
+
+        experiment_path = os.path.join(base_path, experiment_id)
+
+        # Collect selected channels
+        selected_channels = [
+            self.list_configurations.item(i).text()
+            for i in range(self.list_configurations.count())
+            if self.list_configurations.item(i).isSelected()
+        ]
+
+        try:
+            save_acquisition_preset(
+                experiment_path=experiment_path,
+                experiment_id=experiment_id,
+                widget_type="flexible",
+                z_stack_settings={
+                    "nz": self.entry_NZ.value(),
+                    "delta_z_um": self.entry_deltaZ.value(),
+                    # z-stack direction has no visible control in this widget; preserve
+                    # the historical default that the (removed) combobox always produced
+                    "config": "From Bottom (Z-min)",
+                    "use_piezo": self.checkbox_usePiezo.isChecked(),
+                },
+                time_series_settings={
+                    "nt": self.entry_Nt.value(),
+                    "delta_t_s": self.entry_dt.value(),
+                },
+                channel_names=selected_channels,
+                autofocus_settings={
+                    "mode": self._current_autofocus_mode().value,
+                    "interval_fovs": self.spinbox_af_interval.value(),
+                },
+                focus_lock_settings=self.get_focus_lock_settings(),
+                flexible_scan_settings={
+                    "nx": self.entry_NX.value(),
+                    "ny": self.entry_NY.value(),
+                    "delta_x_mm": self.entry_deltaX.value() if hasattr(self, "entry_deltaX") else 0.0,
+                    "delta_y_mm": self.entry_deltaY.value() if hasattr(self, "entry_deltaY") else 0.0,
+                    "overlap_percent": self.entry_overlap.value() if self.use_overlap else 10.0,
+                    "positions": [
+                        {"name": name, "center_mm": list(coord)}
+                        for name, coord in zip(self.location_ids, self.location_list)
+                    ] if len(self.location_list) > 0 else [],
+                },
+            )
+            self._log.info(f"Saved acquisition preset to: {experiment_path}")
+            QMessageBox.information(
+                self,
+                "Preset Saved",
+                f"Acquisition preset saved to:\n{experiment_path}/acquisition.yaml",
+            )
+        except Exception as e:
+            self._log.exception("Failed to save acquisition preset")
+            QMessageBox.critical(
+                self,
+                "Save Failed",
+                f"Failed to save acquisition preset:\n{str(e)}",
+            )
+
+    def load_acquisition_preset(self) -> None:
+        """Load acquisition settings from an experiment folder."""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Load Acquisition Preset",
+            self.lineEdit_savingDir.text() or DEFAULT_SAVING_PATH,
+            "YAML files (acquisition.yaml);;All files (*)",
+        )
+
+        if not file_path:
+            return
+
+        try:
+            # Parse the YAML file
+            yaml_data = parse_acquisition_yaml(file_path)
+
+            # Check widget type compatibility
+            if yaml_data.widget_type != "flexible":
+                QMessageBox.warning(
+                    self,
+                    "Widget Type Mismatch",
+                    f"This preset was created for '{yaml_data.widget_type}' mode.\n"
+                    "Some settings may not be applicable.",
+                )
+
+            # Apply the settings via the existing YAML handling method
+            self._apply_yaml_settings(yaml_data)
+
+            self._log.info(f"Loaded acquisition preset from: {file_path}")
+            QMessageBox.information(
+                self,
+                "Preset Loaded",
+                f"Acquisition preset loaded from:\n{file_path}",
+            )
+        except Exception as e:
+            self._log.exception("Failed to load acquisition preset")
+            QMessageBox.critical(
+                self,
+                "Load Failed",
+                f"Failed to load acquisition preset:\n{str(e)}",
+            )
+
+    # =========================================================================
+    # YAML Drag-and-Drop Support (AcquisitionYAMLDropMixin implementation)
+    # =========================================================================
+
+    def _get_expected_widget_type(self) -> str:
+        """Return expected widget type for YAML validation."""
+        return "flexible"
+
+    def _apply_yaml_settings(self, yaml_data: AcquisitionYAMLData) -> None:
+        """Apply YAML settings to widget controls.
+
+        Called after successful YAML parsing and hardware validation.
+        Blocks signals during update to prevent cascading events.
+        """
+        # Block signals during bulk update
+        widgets_to_block = [
+            self.entry_NZ,
+            self.entry_deltaZ,
+            self.entry_Nt,
+            self.entry_dt,
+            self.entry_NX,
+            self.entry_NY,
+            self.entry_deltaX,
+            self.entry_deltaY,
+            self.checkbox_withAutofocus,
+            self.checkbox_withReflectionAutofocus,
+            self.list_configurations,
+        ]
+        if self.use_overlap:
+            widgets_to_block.append(self.entry_overlap)
+
+        for widget in widgets_to_block:
+            widget.blockSignals(True)
+
+        try:
+            # Z-stack settings
+            self.entry_NZ.setValue(yaml_data.nz)
+            self.entry_deltaZ.setValue(yaml_data.delta_z_um)
+
+            # Time series
+            self.entry_Nt.setValue(yaml_data.nt)
+            self.entry_dt.setValue(yaml_data.delta_t_s)
+
+            # Grid settings
+            self.entry_NX.setValue(yaml_data.nx)
+            self.entry_NY.setValue(yaml_data.ny)
+            self.entry_deltaX.setValue(yaml_data.delta_x_mm)
+            self.entry_deltaY.setValue(yaml_data.delta_y_mm)
+
+            # Overlap
+            if self.use_overlap and hasattr(self, "entry_overlap"):
+                self.entry_overlap.setValue(yaml_data.overlap_percent)
+
+            # Autofocus
+            autofocus_mode = AutofocusMode(yaml_data.autofocus_mode)
+            self.checkbox_withAutofocus.setChecked(autofocus_mode == AutofocusMode.CONTRAST)
+            self.checkbox_withReflectionAutofocus.setChecked(
+                autofocus_mode == AutofocusMode.LASER_REFLECTION
+            )
+
+            # Focus lock settings
+            self.set_focus_lock_settings({
+                "enabled": autofocus_mode == AutofocusMode.FOCUS_LOCK or yaml_data.focus_lock_enabled,
+                "buffer_length": yaml_data.focus_lock_buffer_length,
+                "recovery_attempts": yaml_data.focus_lock_recovery_attempts,
+                "min_spot_snr": yaml_data.focus_lock_min_spot_snr,
+                "acquire_threshold_um": yaml_data.focus_lock_acquire_threshold_um,
+                "maintain_threshold_um": yaml_data.focus_lock_maintain_threshold_um,
+            })
+
+            # Channels - select matching channels in list
+            self.list_configurations.clearSelection()
+            for i in range(self.list_configurations.count()):
+                item = self.list_configurations.item(i)
+                if item and item.text() in yaml_data.channel_names:
+                    item.setSelected(True)
+
+            # Load positions if present
+            if yaml_data.flexible_positions:
+                self._load_positions_from_yaml(yaml_data.flexible_positions)
+
+        finally:
+            # Unblock signals
+            for widget in widgets_to_block:
+                widget.blockSignals(False)
+
+        self._log.info(
+            f"Applied YAML settings: NZ={yaml_data.nz}, Nt={yaml_data.nt}, "
+            f"channels={yaml_data.channel_names}"
+        )
+
+    def _load_positions_from_yaml(self, positions: list) -> None:
+        """Load position list from YAML data.
+
+        Args:
+            positions: List of dicts with 'name' and 'center_mm' keys
+        """
+        # Clear existing locations
+        self.location_list = np.empty((0, 3), dtype=float)
+        self.location_ids = np.empty((0,), dtype="<U20")
+
+        # Clear the scan coordinates
+        self._publish(ClearScanCoordinatesCommand())
+
+        for pos in positions:
+            name = pos.get("name", f"P{len(self.location_ids) + 1}")
+            center = pos.get("center_mm", [0, 0, 0])
+            if len(center) >= 3:
+                x, y, z = center[0], center[1], center[2]
+            elif len(center) == 2:
+                x, y = center[0], center[1]
+                z = self._cached_z_mm
+            else:
+                continue
+
+            # Add to local tracking
+            self.location_list = np.vstack([self.location_list, [x, y, z]])
+            self.location_ids = np.append(self.location_ids, name)
+
+            # Add to scan coordinates via event
+            self._publish(
+                AddFlexibleRegionCommand(
+                    region_id=name,
+                    center_x_mm=x,
+                    center_y_mm=y,
+                    center_z_mm=z,
+                    n_x=self.entry_NX.value(),
+                    n_y=self.entry_NY.value(),
+                    overlap_percent=self.entry_overlap.value() if self.use_overlap else 0.0,
+                )
+            )
+
+        # Update UI
+        self._update_location_display()

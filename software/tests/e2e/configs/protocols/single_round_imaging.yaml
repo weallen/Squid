@@ -1,0 +1,14 @@
+name: "Single Round Imaging"
+version: "3.0"
+description: "Quick brightfield preview using a preloaded 4-FOV grid."
+output_directory: ../outputs
+
+resources:
+  fluidics_config_file: ../fluidics/simulation_fluidics.json
+  fov_file: ../fov_positions/test_4fov_grid.csv
+
+rounds:
+  - name: "Brightfield Preview"
+    steps:
+      - step_type: imaging
+        protocol: resource_files/protocols/bf_quick.yaml

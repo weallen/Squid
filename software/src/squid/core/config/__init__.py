@@ -43,7 +43,6 @@ class SquidFilterWheelConfig(pydantic.BaseModel):
     max_index: int
     min_index: int
     offset: float
-    homing_enabled: bool
     motor_slot_index: int
     transitions_per_revolution: int
 
@@ -101,7 +100,6 @@ def _load_filter_wheel_config() -> Optional[FilterWheelConfig]:
             max_index=_def.SQUID_FILTERWHEEL_MAX_INDEX,
             min_index=_def.SQUID_FILTERWHEEL_MIN_INDEX,
             offset=_def.SQUID_FILTERWHEEL_OFFSET,
-            homing_enabled=_def.SQUID_FILTERWHEEL_HOMING_ENABLED,
             motor_slot_index=_def.SQUID_FILTERWHEEL_MOTORSLOTINDEX,
             transitions_per_revolution=_def.SQUID_FILTERWHEEL_TRANSITIONS_PER_REVOLUTION,
         )
@@ -344,6 +342,8 @@ class TucsenCameraModel(enum.Enum):
     DHYANA_400BSI_V3 = "DHYANA-400BSI-V3"
     ARIES_6506 = "ARIES-6506"
     ARIES_6510 = "ARIES-6510"
+    LIBRA_25 = "LIBRA-25"
+    LIBRA_22 = "LIBRA-22"
 
     @staticmethod
     def from_string(cam_string: str) -> Optional["TucsenCameraModel"]:
@@ -395,6 +395,20 @@ class AndorCameraModel(enum.Enum):
         """
         try:
             return AndorCameraModel[cam_string.upper()]
+        except KeyError:
+            return None
+
+
+class FLIRCameraModel(enum.Enum):
+    BFS_U3_63S4M_C = "BFS-U3-63S4M-C"
+
+    @staticmethod
+    def from_string(cam_string: str) -> Optional["FLIRCameraModel"]:
+        """
+        Attempts to convert the given string to a FLIR camera model.  This ignores all letter cases.
+        """
+        try:
+            return FLIRCameraModel[cam_string.upper()]
         except KeyError:
             return None
 
@@ -477,6 +491,7 @@ class CameraConfig(pydantic.BaseModel):
             HamamatsuCameraModel,
             PhotometricsCameraModel,
             AndorCameraModel,
+            FLIRCameraModel,
         ]
     ] = None
 
@@ -527,6 +542,12 @@ class CameraConfig(pydantic.BaseModel):
     # Whether this camera is a focus camera (e.g., laser autofocus camera).
     # Used by simulated cameras to generate appropriate test images.
     is_focus_camera: bool = False
+
+    # Simulated-camera-only overrides.
+    # If unset, simulated cameras use their built-in defaults.
+    simulated_pixel_size_um: Optional[float] = None
+    simulated_sensor_width_px: Optional[int] = None
+    simulated_sensor_height_px: Optional[int] = None
 
 
 def _old_camera_variant_to_enum(old_string) -> CameraVariant:
@@ -613,6 +634,9 @@ _camera_config = CameraConfig(
         g=_def.CAMERA_CONFIG.AWB_RATIOS_G,
         b=_def.CAMERA_CONFIG.AWB_RATIOS_B,
     ),
+    simulated_pixel_size_um=getattr(_def.CAMERA_CONFIG, "SIMULATED_PIXEL_SIZE_UM", None),
+    simulated_sensor_width_px=getattr(_def.CAMERA_CONFIG, "SIMULATED_SENSOR_WIDTH_PX", None),
+    simulated_sensor_height_px=getattr(_def.CAMERA_CONFIG, "SIMULATED_SENSOR_HEIGHT_PX", None),
 )
 
 

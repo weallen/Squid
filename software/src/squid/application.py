@@ -14,21 +14,30 @@ Usage:
 """
 from __future__ import annotations
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional, TYPE_CHECKING
 
 import squid.core.logging
+from squid.core.config.feature_flags import get_feature_flags
 
 from squid.backend.microscope import Microscope
 from squid.backend.controllers.live_controller import LiveController
 from squid.backend.io.stream_handler import StreamHandler
 from squid.backend.controllers.multipoint import MultiPointController
-from squid.backend.managers import ChannelConfigurationManager
+from squid.backend.managers import ChannelConfigService
 from squid.backend.managers import ObjectiveStore
 from squid.backend.managers.scan_coordinates import ScanCoordinates
 from squid.backend.managers.navigation_state_service import NavigationViewerStateService
 from squid.backend.services import ServiceRegistry
 from squid.backend.controllers import MicroscopeModeController, PeripheralsController, ImageClickController
-from squid.core.events import event_bus
+from squid.core.events import (
+    auto_subscribe,
+    auto_unsubscribe,
+    handles,
+    event_bus,
+    ObjectiveChanged,
+    LoadFluidicsProtocolsCommand,
+)
 from squid.core.mode_gate import GlobalModeGate
 from squid.backend.controllers.autofocus import AutoFocusController, LaserAutofocusController
 
@@ -38,6 +47,9 @@ if TYPE_CHECKING:
     from squid.backend.controllers.tracking_controller import TrackingControllerCore
     from squid.backend.controllers.autofocus.continuous_focus_lock import ContinuousFocusLockController
     from squid.backend.controllers.autofocus.focus_lock_simulator import FocusLockSimulator
+    from squid.backend.controllers.orchestrator import OrchestratorController
+    from squid.backend.controllers.workflow_runner import WorkflowRunnerController
+    from squid.core.abc import AbstractFluidicsController
 
 
 @dataclass
@@ -59,11 +71,13 @@ class Controllers:
     laser_autofocus: Optional["LaserAutofocusController"] = None
     continuous_focus_lock: "ContinuousFocusLockController | FocusLockSimulator | None" = None
     live_focus: Optional["LiveController"] = None
-    channel_config_manager: Optional["ChannelConfigurationManager"] = None
+    channel_config_service: Optional["ChannelConfigService"] = None
     objective_store: Optional["ObjectiveStore"] = None
     scan_coordinates: Optional["ScanCoordinates"] = None
     image_click: Optional["ImageClickController"] = None
     tracking: Optional["TrackingControllerCore"] = None
+    orchestrator: Optional["OrchestratorController"] = None
+    workflow_runner: Optional["WorkflowRunnerController"] = None
 
 
 class ApplicationContext:
@@ -86,16 +100,19 @@ class ApplicationContext:
     """
 
     def __init__(
-        self, simulation: bool = False
+        self, simulation: bool = False, skip_init: bool = False
     ):
         """
         Initialize the application context.
 
         Args:
             simulation: If True, use simulated hardware
+            skip_init: If True, skip hardware initialization (MCU reset, homing, limits).
+                      Used when restarting after settings change.
         """
         self._log = squid.core.logging.get_logger(self.__class__.__name__)
         self._simulation = simulation
+        self._skip_init = skip_init
         self._microscope: Optional["Microscope"] = None
         self._controllers: Optional[Controllers] = None
         self._services: Optional["ServiceRegistry"] = None
@@ -109,9 +126,10 @@ class ApplicationContext:
         self._navigation_state_service: Optional[NavigationViewerStateService] = None
         self._camera_frame_callback_id: Optional[str] = None
         self._camera_focus_frame_callback_id: Optional[str] = None
+        self._subscriptions: list[tuple[type, object]] = []
 
         self._log.info(
-            f"Creating ApplicationContext (simulation={simulation})"
+            f"Creating ApplicationContext (simulation={simulation}, skip_init={skip_init})"
         )
 
         # Ensure the core EventBus dispatch thread is running early
@@ -128,9 +146,7 @@ class ApplicationContext:
         self._build_controllers()
         self._initialize_hardware()
         # Subscribe to objective changes to refresh channel configs
-        from squid.core.events import ObjectiveChanged
-
-        event_bus.subscribe(ObjectiveChanged, self._on_objective_changed)
+        self._subscriptions = auto_subscribe(self, event_bus)
 
     def _initialize_hardware(self) -> None:
         """Backend-owned one-time hardware initialization.
@@ -144,6 +160,14 @@ class ApplicationContext:
             import _def as _config
         except Exception:
             _config = None
+
+        # Skip full initialization if --skip-init flag is set
+        # (Used when restarting after settings change - hardware already configured)
+        if self._skip_init:
+            self._log.info("Skipping hardware initialization (--skip-init flag)")
+            # Still need to wire up camera callbacks for live streaming
+            self._setup_camera_callbacks_only(_config)
+            return
 
         # Stage limits + home
         stage_service = self._services.get("stage")
@@ -215,6 +239,12 @@ class ApplicationContext:
 
                     if getattr(_config, "DEFAULT_TRIGGER_MODE") == TriggerMode.HARDWARE:
                         camera_service.set_acquisition_mode(CameraAcquisitionMode.HARDWARE_TRIGGER)
+                        # Set microcontroller trigger mode to match (ports upstream 2408902a)
+                        mc = self._microscope.low_level_drivers.microcontroller if self._microscope else None
+                        if mc is not None:
+                            from _def import HARDWARE_TRIGGER_MODE
+
+                            mc.set_trigger_mode(HARDWARE_TRIGGER_MODE)
                     else:
                         camera_service.set_acquisition_mode(CameraAcquisitionMode.SOFTWARE_TRIGGER)
                 self._camera_frame_callback_id = camera_service.add_frame_callback(
@@ -251,12 +281,65 @@ class ApplicationContext:
             except Exception:
                 self._log.debug("Objective changer home not supported", exc_info=True)
 
+    def _setup_camera_callbacks_only(self, _config) -> None:
+        """Minimal camera setup when skipping full initialization.
+
+        Wires up camera callbacks so live streaming works, without doing
+        stage homing, limits configuration, or position restoration.
+        """
+        assert self._controllers is not None
+        assert self._services is not None
+
+        # Camera callback wiring (live display path)
+        camera_service = self._services.get("camera")
+        if camera_service is not None and self._camera_frame_callback_id is None:
+            try:
+                if _config is not None and getattr(_config, "DEFAULT_TRIGGER_MODE", None) is not None:
+                    from squid.core.abc import CameraAcquisitionMode
+                    from _def import TriggerMode
+
+                    if getattr(_config, "DEFAULT_TRIGGER_MODE") == TriggerMode.HARDWARE:
+                        camera_service.set_acquisition_mode(CameraAcquisitionMode.HARDWARE_TRIGGER)
+                        # Set microcontroller trigger mode to match (ports upstream 2408902a)
+                        mc = self._microscope.low_level_drivers.microcontroller if self._microscope else None
+                        if mc is not None:
+                            from _def import HARDWARE_TRIGGER_MODE
+
+                            mc.set_trigger_mode(HARDWARE_TRIGGER_MODE)
+                    else:
+                        camera_service.set_acquisition_mode(CameraAcquisitionMode.SOFTWARE_TRIGGER)
+                self._camera_frame_callback_id = camera_service.add_frame_callback(
+                    self._controllers.stream_handler.on_new_frame
+                )
+                camera_service.enable_callbacks(enabled=True)
+            except Exception:
+                self._log.exception("Failed to initialize camera callbacks (skip-init mode)")
+
+        # Focus camera callback wiring (laser autofocus)
+        focus_camera_service = self._services.get("camera_focus")
+        if (
+            focus_camera_service is not None
+            and self._controllers.stream_handler_focus is not None
+            and self._camera_focus_frame_callback_id is None
+        ):
+            try:
+                from squid.core.abc import CameraAcquisitionMode
+
+                focus_camera_service.set_acquisition_mode(CameraAcquisitionMode.SOFTWARE_TRIGGER)
+                self._camera_focus_frame_callback_id = focus_camera_service.add_frame_callback(
+                    self._controllers.stream_handler_focus.on_new_frame
+                )
+                focus_camera_service.enable_callbacks(enabled=True)
+                focus_camera_service.start_streaming()
+            except Exception:
+                self._log.exception("Failed to initialize focus camera callbacks (skip-init mode)")
+
     def _build_microscope(self) -> None:
         """Build the microscope from configuration."""
-        from squid.backend.microscope import Microscope
+        from squid.backend import microscope_factory
 
         self._log.info("Building microscope...")
-        self._microscope = Microscope.build_from_global_config(
+        self._microscope = microscope_factory.build_microscope(
             simulated=self._simulation,
             skip_controller_creation=True,
         )
@@ -308,6 +391,10 @@ class ApplicationContext:
             camera="main",
         )
 
+        # Give LiveController access to channel configs for event-driven mode switching
+        channel_configs = self._get_channel_configs_for_current_objective()
+        live_controller.set_channel_configs(channel_configs)
+
         # Create StreamHandler with backend hooks preserved across Qt wiring.
         stream_handler = StreamHandler(
             handler_functions=StreamHandlerFunctions(
@@ -333,6 +420,7 @@ class ApplicationContext:
                 camera_service=focus_camera_service,
                 event_bus=event_bus,
                 control_illumination=False,
+                peripheral_service=self._services.get("peripheral"),
                 for_displacement_measurement=True,
                 mode_gate=self.mode_gate,
                 camera="focus",
@@ -361,7 +449,7 @@ class ApplicationContext:
             live_focus=live_controller_focus if self._microscope.addons.camera_focus else None,
             microscope_mode=microscope_mode_controller,
             peripherals=peripherals_controller,
-            channel_config_manager=self._microscope.channel_configuration_manager,
+            channel_config_service=self._microscope.channel_config_service,
             objective_store=self._microscope.objective_store,
         )
         self._controllers.autofocus = self._build_autofocus_controller()
@@ -379,6 +467,15 @@ class ApplicationContext:
         # Phase 8: ImageClickController for click-to-move
         self._controllers.image_click = self._build_image_click_controller()
         self._controllers.tracking = self._build_tracking_controller()
+        # Experiment orchestrator for multi-round protocols (FISH, etc.)
+        self._controllers.orchestrator = self._build_orchestrator_controller(
+            multipoint=self._controllers.multipoint,
+            scan_coordinates=self._controllers.scan_coordinates,
+        )
+        # Workflow runner for script+acquisition automation
+        self._controllers.workflow_runner = self._build_workflow_runner_controller(
+            multipoint=self._controllers.multipoint,
+        )
 
         # Backend navigation state publisher (UI can subscribe via UIEventBus).
         try:
@@ -394,14 +491,9 @@ class ApplicationContext:
 
     def _build_tracking_controller(self) -> Optional["TrackingControllerCore"]:
         """Create TrackingControllerCore (backend-only, services-only)."""
-        try:
-            import _def as _config  # Local import to avoid circularity at module import time
-        except Exception:
-            _config = None
-
-        if self._microscope is None or self._services is None or _config is None:
+        if self._microscope is None or self._services is None:
             return None
-        if not getattr(_config, "ENABLE_TRACKING", False):
+        if not get_feature_flags().is_enabled("ENABLE_TRACKING"):
             return None
 
         from squid.backend.controllers.tracking_controller import TrackingControllerCore
@@ -417,9 +509,110 @@ class ApplicationContext:
             stage_service=stage_service,
             live_controller=self._microscope.live_controller,
             peripheral_service=self._services.get("peripheral"),
-            channel_config_manager=self._microscope.channel_configuration_manager,
+            channel_config_manager=self._microscope.channel_config_service,
             objective_store=self._microscope.objective_store,
             mode_gate=self.mode_gate,
+        )
+
+    def _build_orchestrator_controller(
+        self,
+        multipoint: Optional[MultiPointController],
+        scan_coordinates: Optional[ScanCoordinates],
+    ) -> Optional["OrchestratorController"]:
+        """Create OrchestratorController for multi-round experiment automation."""
+        if self._microscope is None or self._services is None:
+            return None
+        if multipoint is None:
+            self._log.info("OrchestratorController requires MultiPointController - skipping")
+            return None
+
+        from squid.backend.controllers.orchestrator import (
+            OrchestratorController,
+            ImagingExecutor,
+        )
+        from squid.backend.controllers.fluidics_controller import FluidicsController
+        from squid.backend.controllers.multipoint.experiment_manager import ExperimentManager
+        from squid.backend.controllers.multipoint.acquisition_planner import AcquisitionPlanner
+
+        camera_service = self._services.get("camera")
+        if camera_service is None:
+            self._log.warning("No camera service available for OrchestratorController")
+            return None
+
+        # Create shared utilities
+        experiment_manager = ExperimentManager(
+            objective_store=self._microscope.objective_store,
+            channel_config_manager=self._microscope.channel_config_service,
+            camera_service=camera_service,
+        )
+        acquisition_planner = AcquisitionPlanner(
+            objective_store=self._microscope.objective_store,
+            channel_config_manager=self._microscope.channel_config_service,
+            camera_service=camera_service,
+        )
+
+        # Create executors
+        imaging_executor = ImagingExecutor(
+            event_bus=event_bus,
+            multipoint_controller=multipoint,
+        )
+
+        # Create fluidics controller
+        # Pass both direct service reference and registry for late-binding support
+        # (service may be initialized later via FluidicsWidget)
+        fluidics_service = self._services.get("fluidics")
+        fluidics_controller = FluidicsController(
+            event_bus=event_bus,
+            fluidics_service=fluidics_service,
+            service_registry=self._services,
+        )
+        # Optionally load named fluidics protocols from config.
+        try:
+            import _def as _config
+        except Exception:
+            _config = None
+        protocols_path = None
+        if _config is not None:
+            protocols_path = getattr(_config, "FLUIDICS_PROTOCOLS_PATH", None)
+        if protocols_path:
+            path = Path(protocols_path)
+            if not path.is_absolute():
+                base_dir = getattr(_config, "PROJECT_ROOT", None)
+                if base_dir is not None:
+                    path = (base_dir / path).resolve()
+                else:
+                    path = path.resolve()
+            try:
+                event_bus.publish(LoadFluidicsProtocolsCommand(path=str(path)))
+            except Exception:
+                self._log.exception(
+                    f"Failed to load fluidics protocols from {path}"
+                )
+
+        return OrchestratorController(
+            event_bus=event_bus,
+            multipoint_controller=multipoint,
+            experiment_manager=experiment_manager,
+            acquisition_planner=acquisition_planner,
+            imaging_executor=imaging_executor,
+            fluidics_controller=fluidics_controller,
+            scan_coordinates=scan_coordinates,
+        )
+
+    def _build_workflow_runner_controller(
+        self,
+        multipoint: Optional[MultiPointController],
+    ) -> Optional["WorkflowRunnerController"]:
+        """Create WorkflowRunnerController for script+acquisition automation."""
+        if multipoint is None:
+            self._log.info("WorkflowRunnerController requires MultiPointController - skipping")
+            return None
+
+        from squid.backend.controllers.workflow_runner import WorkflowRunnerController
+
+        return WorkflowRunnerController(
+            event_bus=event_bus,
+            multipoint_controller=multipoint,
         )
 
     def _create_microscope_mode_controller(self) -> MicroscopeModeController:
@@ -450,11 +643,14 @@ class ApplicationContext:
         self, controller: Optional[MicroscopeModeController]
     ) -> None:
         """Update channel configs on the controller from the current objective."""
-        if controller is None:
-            return
         channel_configs = self._get_channel_configs_for_current_objective()
-        if channel_configs:
+        if controller is not None and channel_configs:
             controller.update_channel_configs(channel_configs)
+        # Also update LiveController's channel configs
+        if self._microscope is not None and hasattr(self._microscope, "live_controller"):
+            live_ctrl = self._microscope.live_controller
+            if live_ctrl is not None and channel_configs:
+                live_ctrl.set_channel_configs(channel_configs)
 
     def _create_peripherals_controller(self) -> PeripheralsController:
         """Create PeripheralsController with dependencies."""
@@ -510,14 +706,9 @@ class ApplicationContext:
 
     def _build_laser_autofocus_controller(self) -> Optional[LaserAutofocusController]:
         """Create LaserAutofocusController core without Qt dependencies."""
-        try:
-            import _def as _config  # Local import to avoid circularity at module import time
-        except Exception:
-            _config = None
-
-        if self._microscope is None or _config is None:
+        if self._microscope is None:
             return None
-        if not getattr(_config, "SUPPORT_LASER_AUTOFOCUS", False):
+        if not get_feature_flags().is_enabled("SUPPORT_LASER_AUTOFOCUS"):
             return None
         if self._services is None:
             return None
@@ -598,7 +789,7 @@ class ApplicationContext:
             self._microscope.live_controller,
             autofocus,
             self._microscope.objective_store,
-            self._microscope.channel_configuration_manager,
+            self._microscope.channel_config_service,
             scan_coordinates=scan_coordinates,
             laser_autofocus_controller=laser_autofocus,
             focus_lock_controller=focus_lock_controller,
@@ -618,7 +809,7 @@ class ApplicationContext:
     def _get_channel_configs_for_current_objective(self) -> dict:
         """Return channel config mapping for the current objective."""
         assert self._microscope is not None
-        manager = self._microscope.channel_configuration_manager
+        manager = self._microscope.channel_config_service
         objective_store = self._microscope.objective_store
         if manager is None or objective_store is None:
             return {}
@@ -663,10 +854,123 @@ class ApplicationContext:
         )
 
     # Event handlers
-    def _on_objective_changed(self, event) -> None:
+    @handles(ObjectiveChanged)
+    def _on_objective_changed(self, event: ObjectiveChanged) -> None:
         """Refresh channel configs when objective changes."""
         if self._controllers and self._controllers.microscope_mode:
             self._refresh_channel_configs(self._controllers.microscope_mode)
+
+    def _build_fluidics_driver(self) -> Optional["AbstractFluidicsController"]:
+        """Build fluidics driver based on configuration.
+
+        Returns:
+            AbstractFluidicsController if configured and available, None if fluidics is
+            disabled (RUN_FLUIDICS=False) or, in SIMULATION mode only, if the config is
+            missing.
+
+        Creates SimulatedFluidicsController in simulation mode and MERFISHFluidicsDriver
+        for real hardware. In HARDWARE mode this raises RuntimeError rather than silently
+        falling back to the simulator, so a run can never execute with fluidics quietly
+        disabled (pumps/valves idle while the GUI looks live).
+        """
+        import sys
+        from pathlib import Path
+
+        try:
+            import _def as _config
+        except Exception:
+            _config = None
+
+        # Check if fluidics should be enabled
+        run_fluidics = _config is not None and getattr(_config, "RUN_FLUIDICS", False)
+        if not run_fluidics:
+            self._log.debug("Fluidics disabled (RUN_FLUIDICS=False or no _def)")
+            return None
+
+        # Resolve paths relative to software/ directory
+        # application.py is at software/src/squid/application.py
+        software_dir = Path(__file__).parent.parent.parent
+
+        # Get config file path. A relative FLUIDICS_CONFIG_PATH (the shipped default is
+        # "./merfish_config/MERFISH_config.json") must resolve against software/ -- NOT the
+        # process CWD -- because the launchers (launch.bat / launch_hardware.bat) cd into
+        # software/src before starting, where a CWD-relative path silently misses and fluidics
+        # would be disabled with only a log warning.
+        fluidics_config_path = getattr(_config, "FLUIDICS_CONFIG_PATH", None)
+        if fluidics_config_path:
+            config_path = Path(fluidics_config_path)
+            if not config_path.is_absolute():
+                config_path = (software_dir / config_path).resolve()
+        else:
+            # Default to configurations/fluidics_simulation.json
+            config_path = software_dir / "configurations" / "fluidics_simulation.json"
+
+        if not config_path.exists():
+            if not self._simulation:
+                raise RuntimeError(
+                    f"Fluidics config not found: {config_path}. RUN_FLUIDICS is enabled for a "
+                    "HARDWARE run but the fluidics config is missing, so real fluidics cannot "
+                    "start. Refusing to launch with fluidics SILENTLY DISABLED. Fix "
+                    "FLUIDICS_CONFIG_PATH in the active configuration (or make it absolute), or "
+                    "set RUN_FLUIDICS=False to run without fluidics."
+                )
+            self._log.warning(f"Fluidics config not found: {config_path}")
+            return None
+
+        # In simulation mode, use SimulatedFluidicsController
+        if self._simulation:
+            self._log.info("Using SimulatedFluidicsController for simulation mode")
+            from squid.backend.drivers.fluidics import SimulatedFluidicsController
+
+            driver = SimulatedFluidicsController(
+                config_path=str(config_path),
+                simulate_timing=False,
+            )
+            if driver.initialize():
+                return driver
+            else:
+                self._log.error("Failed to initialize SimulatedFluidicsController")
+                return None
+
+        # Real hardware mode - use MERFISHFluidicsDriver. Do NOT silently fall back to the
+        # simulator on failure: a hardware run that believes fluidics is live but is actually
+        # simulated would execute every reagent / pump / valve step as a no-op while the GUI
+        # looks normal -- the worst possible failure for an unattended MERFISH run. Fail LOUD.
+        fluidics_v2_path = software_dir / "fluidics_v2" / "software"
+        if fluidics_v2_path.exists() and str(fluidics_v2_path) not in sys.path:
+            sys.path.insert(0, str(fluidics_v2_path))
+
+        try:
+            from squid.backend.drivers.fluidics import MERFISHFluidicsDriver
+        except ImportError as e:
+            raise RuntimeError(
+                f"Real fluidics driver unavailable (fluidics_v2 not importable: {e}). "
+                "RUN_FLUIDICS is enabled for a HARDWARE run; refusing to silently fall back to "
+                "the simulator (pumps/valves would sit idle while the GUI looks live). Ensure "
+                "software/fluidics_v2/software/fluidics is present -- ship a directory copy, NOT "
+                "a git clone -- or set RUN_FLUIDICS=False."
+            ) from e
+
+        try:
+            driver = MERFISHFluidicsDriver(
+                config_path=str(config_path),
+                simulation=False,
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to construct MERFISHFluidicsDriver for a HARDWARE run: {e}. Refusing to "
+                "launch with fluidics silently disabled; check the fluidics config and hardware "
+                "connections, or set RUN_FLUIDICS=False."
+            ) from e
+
+        if not driver.initialize():
+            raise RuntimeError(
+                "MERFISHFluidicsDriver.initialize() failed for a HARDWARE run. Check pump/valve "
+                "serial connections and the fluidics config; refusing to launch with fluidics "
+                "silently disabled."
+            )
+        self._log.info("MERFISHFluidicsDriver initialized successfully")
+        return driver
 
     def _build_services(self) -> None:
         """Build service layer."""
@@ -746,11 +1050,11 @@ class ApplicationContext:
         )
 
         # Fluidics service (for MERFISH and other fluidics-based protocols)
-        fluidics = getattr(self._microscope.addons, "fluidics", None)
-        if fluidics:
+        fluidics_driver = self._build_fluidics_driver()
+        if fluidics_driver is not None:
             self._services.register(
                 "fluidics",
-                FluidicsService(fluidics, event_bus),
+                FluidicsService(fluidics_driver, event_bus, mode_gate=self.mode_gate),
             )
 
         objective_changer = getattr(self._microscope.addons, "objective_changer", None)
@@ -928,6 +1232,9 @@ class ApplicationContext:
         self._controllers = None
 
         # Stop the global EventBus dispatch thread
+        if self._subscriptions:
+            auto_unsubscribe(self._subscriptions, event_bus)
+            self._subscriptions.clear()
         event_bus.stop()
         # Clear subscribers to avoid leaking old controller/service handlers across tests/runs.
         event_bus.clear()
@@ -949,6 +1256,16 @@ class ApplicationContext:
             import _def as _def  # Local import to avoid circulars at import time
         except Exception:
             _def = None  # type: ignore[assignment]
+
+        # Laser safety FIRST: force every laser off before the (slow) Z-retract and
+        # the rest of teardown, so the beam is extinguished the instant shutdown
+        # begins. The Teensy latches its last state and is not reset on serial
+        # close, so without this an active laser is left emitting after the app
+        # exits. Best-effort — turn_off_all_lasers never raises.
+        try:
+            self._microscope.low_level_drivers.microcontroller.turn_off_all_lasers()
+        except Exception:
+            self._log.exception("Failed to force all lasers off during shutdown")
 
         stage_service = self._services.get("stage")
         if stage_service is not None:
@@ -1018,10 +1335,5 @@ class ApplicationContext:
             except Exception:
                 self._log.exception("Failed to shut down CellX during shutdown")
 
-        if _def is not None and getattr(_def, "RUN_FLUIDICS", False):
-            try:
-                fluidics = getattr(self._microscope.addons, "fluidics", None)
-                if fluidics is not None:
-                    fluidics.close()
-            except Exception:
-                self._log.exception("Failed to shut down fluidics during shutdown")
+        # Note: FluidicsService.shutdown() handles driver.close() automatically
+        # when the service registry shuts down services.

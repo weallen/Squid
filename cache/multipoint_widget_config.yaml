@@ -1,13 +1,12 @@
 xy_enabled: true
-xy_mode: Select Wells
-z_enabled: false
+xy_mode: Current Position
+z_enabled: true
 z_mode: From Bottom
 time_enabled: false
 fov_overlap: 10.0
 dt: 0.0
 nt: 1
 dz: 1.5
-nz: 1
+nz: 5
 selected_channels: []
-contrast_af: false
-laser_af: false
+autofocus_mode: none

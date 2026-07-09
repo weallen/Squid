@@ -5,7 +5,6 @@ import squid.core.logging
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Type, TYPE_CHECKING
 from configparser import ConfigParser
-from qtpy.QtCore import Signal
 from qtpy.QtWidgets import (
     QCheckBox,
     QDialog,
@@ -37,171 +36,7 @@ if TYPE_CHECKING:
     from squid.ui.ui_event_bus import UIEventBus
 
 
-class ConfigEditor(QDialog):
-    config: ConfigParser
-    scroll_area: QScrollArea
-    scroll_area_widget: QWidget
-    scroll_area_layout: QVBoxLayout
-    save_config_button: QPushButton
-    save_to_file_button: QPushButton
-    load_config_button: QPushButton
-    config_value_widgets: Dict[str, Dict[str, Any]]
-    groups: Dict[str, CollapsibleGroupBox]
-
-    def __init__(self, config: ConfigParser) -> None:
-        super().__init__()
-        self._log = squid.core.logging.get_logger(self.__class__.__name__)
-        self.config = config
-
-        self.scroll_area = QScrollArea()
-        self.scroll_area.setWidgetResizable(True)
-        self.scroll_area_widget = QWidget()
-        self.scroll_area_layout = QVBoxLayout()
-        self.scroll_area_widget.setLayout(self.scroll_area_layout)
-        self.scroll_area.setWidget(self.scroll_area_widget)
-
-        self.save_config_button = QPushButton("Save Config")
-        self.save_config_button.clicked.connect(self.save_config)
-        self.save_to_file_button = QPushButton("Save to File")
-        self.save_to_file_button.clicked.connect(self.save_to_file)
-        self.load_config_button = QPushButton("Load Config from File")
-        self.load_config_button.clicked.connect(self.load_config_from_file)
-
-        layout = QVBoxLayout()
-        layout.addWidget(self.scroll_area)
-        layout.addWidget(self.save_config_button)
-        layout.addWidget(self.save_to_file_button)
-        layout.addWidget(self.load_config_button)
-
-        self.config_value_widgets = {}
-
-        self.setLayout(layout)
-        self.setWindowTitle("Configuration Editor")
-        self.init_ui()
-
-    def init_ui(self) -> None:
-        self.groups = {}
-        for section in self.config.sections():
-            group_box = CollapsibleGroupBox(section)
-            group_layout = QVBoxLayout()
-
-            section_value_widgets = {}
-
-            self.groups[section] = group_box
-
-            for option in self.config.options(section):
-                if option.startswith("_") and option.endswith("_options"):
-                    continue
-                option_value = self.config.get(section, option)
-                option_name = QLabel(option)
-                option_layout = QHBoxLayout()
-                option_layout.addWidget(option_name)
-                if f"_{option}_options" in self.config.options(section):
-                    option_value_list = self.config.get(section, f"_{option}_options")
-                    values = option_value_list.strip("[]").split(",")
-                    for i in range(len(values)):
-                        values[i] = values[i].strip()
-                    if option_value not in values:
-                        values.append(option_value)
-                    combo_box = QComboBox()
-                    combo_box.addItems(values)
-                    combo_box.setCurrentText(option_value)
-                    option_layout.addWidget(combo_box)
-                    section_value_widgets[option] = combo_box
-                else:
-                    option_input = QLineEdit(option_value)
-                    option_layout.addWidget(option_input)
-                    section_value_widgets[option] = option_input
-                group_layout.addLayout(option_layout)
-
-            self.config_value_widgets[section] = section_value_widgets
-            group_box.content.addLayout(group_layout)
-            self.scroll_area_layout.addWidget(group_box)
-
-    def save_config(self) -> None:
-        for section in self.config.sections():
-            for option in self.config.options(section):
-                if option.startswith("_") and option.endswith("_options"):
-                    continue
-                old_val = self.config.get(section, option)
-                widget = self.config_value_widgets[section][option]
-                if type(widget) is QLineEdit:
-                    self.config.set(section, option, widget.text())
-                else:
-                    self.config.set(section, option, widget.currentText())
-                if old_val != self.config.get(section, option):
-                    print(self.config.get(section, option))
-
-    def save_to_filename(self, filename: str) -> bool:
-        try:
-            with open(filename, "w") as configfile:
-                self.config.write(configfile)
-                return True
-        except IOError:
-            self._log.exception(f"Failed to write config file to '{filename}'")
-            return False
-
-    def save_to_file(self) -> None:
-        self.save_config()
-        file_path, _ = QFileDialog.getSaveFileName(
-            self, "Save Config File", "", "INI Files (*.ini);;All Files (*)"
-        )
-        if file_path:
-            if not self.save_to_filename(file_path):
-                QMessageBox.warning(
-                    self,
-                    "Warning",
-                    f"Failed to write config file to '{file_path}'.  Check permissions!",
-                )
-
-    def load_config_from_file(self) -> None:
-        file_path, _ = QFileDialog.getOpenFileName(
-            self, "Load Config File", "", "INI Files (*.ini);;All Files (*)"
-        )
-        if file_path:
-            self.config.read(file_path)
-            # Clear and re-initialize the UI
-            self.scroll_area_widget.deleteLater()
-            self.scroll_area_widget = QWidget()
-            self.scroll_area_layout = QVBoxLayout()
-            self.scroll_area_widget.setLayout(self.scroll_area_layout)
-            self.scroll_area.setWidget(self.scroll_area_widget)
-            self.init_ui()
-
-
-class ConfigEditorBackwardsCompatible(ConfigEditor):
-    original_filepath: str
-    main_window: QWidget
-    apply_exit_button: QPushButton
-
-    def __init__(
-        self, config: ConfigParser, original_filepath: str, main_window: QWidget
-    ) -> None:
-        super().__init__(config)
-        self.original_filepath = original_filepath
-        self.main_window = main_window
-
-        self.apply_exit_button = QPushButton("Apply and Exit")
-        self.apply_exit_button.clicked.connect(self.apply_and_exit)
-
-        layout = self.layout()
-        if layout is not None:
-            layout.addWidget(self.apply_exit_button)
-
-    def apply_and_exit(self) -> None:
-        self.save_config()
-        with open(self.original_filepath, "w") as configfile:
-            self.config.write(configfile)
-        try:
-            self.main_window.close()
-        except Exception:
-            pass
-        self.close()
-
-
 class ProfileWidget(QFrame):
-    signal_profile_changed: Signal = Signal()
-
     configurationManager: "ConfigurationManager"
     dropdown_profiles: QComboBox
     btn_newProfile: QPushButton
@@ -248,7 +83,6 @@ class ProfileWidget(QFrame):
         profile_name = self.dropdown_profiles.currentText()
         # Load the profile
         self.configurationManager.load_profile(profile_name)
-        self.signal_profile_changed.emit()
         if self._event_bus is not None:
             self._event_bus.publish(ProfileChanged(profile_name=profile_name))
 
@@ -268,10 +102,6 @@ class ProfileWidget(QFrame):
             except ValueError as e:
                 QMessageBox.warning(self, "Error", str(e))
 
-    def get_current_profile(self) -> str:
-        """Return the currently selected profile name."""
-        return self.dropdown_profiles.currentText()
-
 
 class PreferencesDialog(QDialog):
     """User-friendly preferences dialog with tabbed interface for common settings.
@@ -285,8 +115,6 @@ class PreferencesDialog(QDialog):
 
     Settings marked with (*) require a software restart to take effect.
     """
-
-    signal_config_changed: Signal = Signal()
 
     def __init__(
         self,
@@ -310,20 +138,26 @@ class PreferencesDialog(QDialog):
         self.tab_widget = QTabWidget()
         layout.addWidget(self.tab_widget)
 
+        # Create the action buttons BEFORE building the tabs: _create_help_tab()
+        # wires self.save_button.clicked -> self._save_help_preferences, so the
+        # button must already exist or opening the dialog raises AttributeError.
+        # (Widgets are created here; they are placed into the layout below so the
+        # button row still renders at the bottom.)
+        self.save_button = QPushButton("Save")
+        self.save_button.clicked.connect(self._save_and_close)
+        self.cancel_button = QPushButton("Cancel")
+        self.cancel_button.clicked.connect(self.reject)
+
         # Create tabs
         self._create_general_tab()
         self._create_acquisition_tab()
         self._create_camera_tab()
         self._create_views_tab()
         self._create_advanced_tab()
+        self._create_help_tab()
 
         # Buttons
         button_layout = QHBoxLayout()
-        self.save_button = QPushButton("Save")
-        self.save_button.clicked.connect(self._save_and_close)
-        self.cancel_button = QPushButton("Cancel")
-        self.cancel_button.clicked.connect(self.reject)
-
         button_layout.addStretch()
         button_layout.addWidget(self.save_button)
         button_layout.addWidget(self.cancel_button)
@@ -336,10 +170,60 @@ class PreferencesDialog(QDialog):
 
         # File Saving Format
         self.file_saving_combo = QComboBox()
-        self.file_saving_combo.addItems(["OME_TIFF", "MULTI_PAGE_TIFF", "INDIVIDUAL_IMAGES"])
+        try:
+            from _def import FileSavingOption
+            self.file_saving_combo.addItems([e.name for e in FileSavingOption])
+        except ImportError:
+            self.file_saving_combo.addItems(["OME_TIFF", "MULTI_PAGE_TIFF", "INDIVIDUAL_IMAGES", "ZARR_V3"])
         current_value = self._get_config_value("GENERAL", "file_saving_option", "OME_TIFF")
         self.file_saving_combo.setCurrentText(current_value)
         layout.addRow("File Saving Format:", self.file_saving_combo)
+
+        # Zarr Compression
+        self.zarr_compression_label = QLabel("Zarr Compression:")
+        self.zarr_compression_combo = QComboBox()
+        self.zarr_compression_combo.addItems(["none", "fast", "balanced", "best"])
+        self.zarr_compression_combo.setCurrentText(
+            self._get_config_value("GENERAL", "zarr_compression", "fast")
+        )
+        self.zarr_compression_combo.setToolTip(
+            "none: No compression (fastest write, largest files)\n"
+            "fast: LZ4/Zstd level 1 (~1000 MB/s encode, ~2:1 ratio)\n"
+            "balanced: Zstd level 3 (~500 MB/s encode, ~3:1 ratio)\n"
+            "best: Zstd level 9 (~100 MB/s encode, ~4:1 ratio)"
+        )
+        layout.addRow(self.zarr_compression_label, self.zarr_compression_combo)
+
+        # Zarr Chunk Mode
+        self.zarr_chunk_mode_label = QLabel("Zarr Chunk Mode:")
+        self.zarr_chunk_mode_combo = QComboBox()
+        self.zarr_chunk_mode_combo.addItems(["full_frame", "tiled_512", "tiled_256"])
+        self.zarr_chunk_mode_combo.setCurrentText(
+            self._get_config_value("GENERAL", "zarr_chunk_mode", "full_frame")
+        )
+        self.zarr_chunk_mode_combo.setToolTip(
+            "full_frame: Each chunk is one full image frame (best for sequential access)\n"
+            "tiled_512: 512x512 tiles (best for random spatial access)\n"
+            "tiled_256: 256x256 tiles (smaller tiles, more overhead)"
+        )
+        layout.addRow(self.zarr_chunk_mode_label, self.zarr_chunk_mode_combo)
+
+        # Zarr 6D FOV Dimension
+        self.zarr_6d_fov_checkbox = QCheckBox()
+        self.zarr_6d_fov_checkbox.setChecked(
+            self._get_config_bool("GENERAL", "zarr_use_6d_fov_dimension", False)
+        )
+        self.zarr_6d_fov_checkbox.setToolTip(
+            "When enabled, non-HCS acquisitions store all FOVs in a single 6D zarr array\n"
+            "with shape (FOV, T, C, Z, Y, X) per region. This is non-standard but more compact.\n"
+            "When disabled, each FOV gets its own 5D OME-NGFF compliant zarr store."
+        )
+        self.zarr_6d_fov_label = QLabel("Zarr 6D FOV Dimension:")
+        layout.addRow(self.zarr_6d_fov_label, self.zarr_6d_fov_checkbox)
+
+        # Connect file saving combo to update zarr options visibility
+        self.file_saving_combo.currentTextChanged.connect(self._update_zarr_options_visibility)
+        self._update_zarr_options_visibility()
 
         # Default Saving Path
         path_widget = QWidget()
@@ -529,6 +413,19 @@ class PreferencesDialog(QDialog):
 
         mosaic_group.content.addLayout(mosaic_layout)
         layout.addWidget(mosaic_group)
+
+        # NDViewer section
+        ndviewer_group = CollapsibleGroupBox("NDViewer")
+        ndviewer_layout = QFormLayout()
+
+        # Enable NDViewer
+        self.enable_ndviewer_checkbox = QCheckBox()
+        self.enable_ndviewer_checkbox.setChecked(self._get_config_bool("VIEWS", "enable_ndviewer", False))
+        self.enable_ndviewer_checkbox.setToolTip("Enable the NDViewer tab for viewing acquired datasets")
+        ndviewer_layout.addRow("Enable NDViewer *:", self.enable_ndviewer_checkbox)
+
+        ndviewer_group.content.addLayout(ndviewer_layout)
+        layout.addWidget(ndviewer_group)
 
         layout.addStretch()
         self.tab_widget.addTab(tab, "Views")
@@ -731,6 +628,170 @@ class PreferencesDialog(QDialog):
         tracking_group.content.addLayout(tracking_layout)
         layout.addWidget(tracking_group)
 
+        # Acquisition Throttling section
+        throttle_group = CollapsibleGroupBox("Acquisition Throttling")
+        throttle_layout = QFormLayout()
+
+        self.throttling_enabled_checkbox = QCheckBox()
+        self.throttling_enabled_checkbox.setChecked(
+            self._get_config_bool("GENERAL", "acquisition_throttling_enabled", True)
+        )
+        self.throttling_enabled_checkbox.setToolTip(
+            "When enabled, acquisition pauses when pending jobs or RAM usage exceeds limits.\n"
+            "Prevents RAM exhaustion when acquisition speed exceeds disk write speed."
+        )
+        throttle_layout.addRow("Enable Throttling:", self.throttling_enabled_checkbox)
+
+        self.max_pending_jobs_spinbox = QSpinBox()
+        self.max_pending_jobs_spinbox.setRange(1, 100)
+        self.max_pending_jobs_spinbox.setValue(
+            self._get_config_int("GENERAL", "acquisition_max_pending_jobs", 10)
+        )
+        self.max_pending_jobs_spinbox.setToolTip(
+            "Maximum number of jobs in flight before throttling.\n"
+            "Higher values allow more parallelism but use more RAM."
+        )
+        throttle_layout.addRow("Max Pending Jobs:", self.max_pending_jobs_spinbox)
+
+        self.max_pending_mb_spinbox = QDoubleSpinBox()
+        self.max_pending_mb_spinbox.setRange(100.0, 10000.0)
+        self.max_pending_mb_spinbox.setSingleStep(100.0)
+        self.max_pending_mb_spinbox.setValue(
+            self._get_config_float("GENERAL", "acquisition_max_pending_mb", 500.0)
+        )
+        self.max_pending_mb_spinbox.setSuffix(" MB")
+        self.max_pending_mb_spinbox.setToolTip(
+            "Maximum RAM usage (MB) for pending jobs before throttling.\n"
+            "Higher values allow faster acquisition but risk RAM exhaustion."
+        )
+        throttle_layout.addRow("Max Pending RAM:", self.max_pending_mb_spinbox)
+
+        self.throttle_timeout_spinbox = QDoubleSpinBox()
+        self.throttle_timeout_spinbox.setRange(5.0, 300.0)
+        self.throttle_timeout_spinbox.setSingleStep(5.0)
+        self.throttle_timeout_spinbox.setValue(
+            self._get_config_float("GENERAL", "acquisition_throttle_timeout_s", 30.0)
+        )
+        self.throttle_timeout_spinbox.setSuffix(" s")
+        self.throttle_timeout_spinbox.setToolTip(
+            "Maximum time to wait when throttled before reporting a warning.\n"
+            "If disk I/O cannot keep up within this time, acquisition logs a warning."
+        )
+        throttle_layout.addRow("Throttle Timeout:", self.throttle_timeout_spinbox)
+
+        throttle_group.content.addLayout(throttle_layout)
+        layout.addWidget(throttle_group)
+
+        # Use Simulated Hardware section
+        hw_sim_group = CollapsibleGroupBox("Use Simulated Hardware *")
+        hw_sim_layout = QFormLayout()
+
+        sim_tooltip = (
+            "Simulate this component (even without --simulation flag).\n"
+            "With --simulation flag, ALL components are always simulated."
+        )
+
+        self.sim_camera_checkbox = QCheckBox()
+        self.sim_camera_checkbox.setChecked(
+            self._get_config_bool("SIMULATION", "simulate_camera", False)
+        )
+        self.sim_camera_checkbox.setToolTip(sim_tooltip)
+        hw_sim_layout.addRow("Simulate Camera:", self.sim_camera_checkbox)
+
+        self.sim_mcu_checkbox = QCheckBox()
+        self.sim_mcu_checkbox.setChecked(
+            self._get_config_bool("SIMULATION", "simulate_microcontroller", False)
+        )
+        self.sim_mcu_checkbox.setToolTip(sim_tooltip)
+        hw_sim_layout.addRow("Simulate MCU/Stage:", self.sim_mcu_checkbox)
+
+        self.sim_spinning_disk_checkbox = QCheckBox()
+        self.sim_spinning_disk_checkbox.setChecked(
+            self._get_config_bool("SIMULATION", "simulate_spinning_disk", False)
+        )
+        self.sim_spinning_disk_checkbox.setToolTip(sim_tooltip)
+        hw_sim_layout.addRow("Simulate Spinning Disk:", self.sim_spinning_disk_checkbox)
+
+        self.sim_filter_wheel_checkbox = QCheckBox()
+        self.sim_filter_wheel_checkbox.setChecked(
+            self._get_config_bool("SIMULATION", "simulate_filter_wheel", False)
+        )
+        self.sim_filter_wheel_checkbox.setToolTip(sim_tooltip)
+        hw_sim_layout.addRow("Simulate Filter Wheel:", self.sim_filter_wheel_checkbox)
+
+        self.sim_objective_changer_checkbox = QCheckBox()
+        self.sim_objective_changer_checkbox.setChecked(
+            self._get_config_bool("SIMULATION", "simulate_objective_changer", False)
+        )
+        self.sim_objective_changer_checkbox.setToolTip(sim_tooltip)
+        hw_sim_layout.addRow("Simulate Objective Changer:", self.sim_objective_changer_checkbox)
+
+        self.sim_laser_af_camera_checkbox = QCheckBox()
+        self.sim_laser_af_camera_checkbox.setChecked(
+            self._get_config_bool("SIMULATION", "simulate_laser_af_camera", False)
+        )
+        self.sim_laser_af_camera_checkbox.setToolTip(sim_tooltip)
+        hw_sim_layout.addRow("Simulate Laser AF Camera:", self.sim_laser_af_camera_checkbox)
+
+        hw_sim_group.content.addLayout(hw_sim_layout)
+        layout.addWidget(hw_sim_group)
+
+        # Development Settings section
+        dev_group = CollapsibleGroupBox("Development Settings")
+        dev_layout = QFormLayout()
+
+        # Warning label for simulated disk I/O
+        sim_warning_label = QLabel("Simulated disk I/O encodes images but does NOT save to disk!")
+        sim_warning_label.setStyleSheet("color: #cc0000; font-weight: bold;")
+        dev_layout.addRow(sim_warning_label)
+
+        self.simulated_disk_io_checkbox = QCheckBox()
+        self.simulated_disk_io_checkbox.setChecked(
+            self._get_config_bool("DEVELOPMENT", "simulated_disk_io_enabled", False)
+        )
+        self.simulated_disk_io_checkbox.setToolTip(
+            "When enabled, images are encoded to memory but NOT saved to disk.\n"
+            "Use this mode for testing acquisition speed without wearing SSD.\n"
+            "WARNING: No data will be saved during acquisitions!"
+        )
+        dev_layout.addRow("Enable Simulated Disk I/O:", self.simulated_disk_io_checkbox)
+
+        self.simulated_speed_spinbox = QDoubleSpinBox()
+        self.simulated_speed_spinbox.setRange(10.0, 3000.0)
+        self.simulated_speed_spinbox.setSingleStep(50.0)
+        self.simulated_speed_spinbox.setValue(
+            self._get_config_float("DEVELOPMENT", "simulated_disk_io_speed_mb_s", 200.0)
+        )
+        self.simulated_speed_spinbox.setSuffix(" MB/s")
+        self.simulated_speed_spinbox.setToolTip(
+            "Simulated disk write speed in MB/s.\n"
+            "HDD: 50-100 MB/s, SATA SSD: 200-500 MB/s, NVMe: 1000-3000 MB/s"
+        )
+        dev_layout.addRow("Simulated Write Speed:", self.simulated_speed_spinbox)
+
+        self.simulated_compression_checkbox = QCheckBox()
+        self.simulated_compression_checkbox.setChecked(
+            self._get_config_bool("DEVELOPMENT", "simulated_disk_io_compression", True)
+        )
+        self.simulated_compression_checkbox.setToolTip(
+            "When enabled, simulate compression to exercise CPU/RAM realistically.\n"
+            "Disable for faster simulation with less CPU load."
+        )
+        dev_layout.addRow("Simulate Compression:", self.simulated_compression_checkbox)
+
+        self.force_save_images_checkbox = QCheckBox()
+        self.force_save_images_checkbox.setChecked(
+            self._get_config_bool("DEVELOPMENT", "simulation_force_save_images", False)
+        )
+        self.force_save_images_checkbox.setToolTip(
+            "When enabled, save images to disk even with Simulated Disk I/O enabled.\n"
+            "Useful for testing file-based viewers (NDViewer) in simulation mode."
+        )
+        dev_layout.addRow("Force Save Images:", self.force_save_images_checkbox)
+
+        dev_group.content.addLayout(dev_layout)
+        layout.addWidget(dev_group)
+
         # Legend for restart indicator
         legend_label = QLabel("* Requires software restart to take effect")
         legend_label.setStyleSheet("color: #666; font-style: italic;")
@@ -742,6 +803,71 @@ class PreferencesDialog(QDialog):
         tab_layout = QVBoxLayout(tab)
         tab_layout.addWidget(scroll)
         self.tab_widget.addTab(tab, "Advanced")
+
+    def _create_help_tab(self) -> None:
+        from squid.ui.user_preferences import load_preferences, save_preferences
+
+        tab = QWidget()
+        layout = QFormLayout(tab)
+        layout.setSpacing(10)
+
+        prefs = load_preferences()
+
+        self._help_show_tips = QCheckBox()
+        self._help_show_tips.setChecked(prefs.show_tips)
+        self._help_show_tips.setToolTip("Show contextual tips when you use a feature for the first time")
+        layout.addRow("Show Contextual Tips:", self._help_show_tips)
+
+        self._help_show_hints = QCheckBox()
+        self._help_show_hints.setChecked(prefs.show_status_hints)
+        self._help_show_hints.setToolTip("Show rotating helpful hints in the status bar")
+        layout.addRow("Show Status Bar Hints:", self._help_show_hints)
+
+        self._help_show_getting_started = QCheckBox()
+        self._help_show_getting_started.setChecked(prefs.show_getting_started)
+        self._help_show_getting_started.setToolTip("Show the Getting Started checklist panel")
+        layout.addRow("Show Getting Started Panel:", self._help_show_getting_started)
+
+        reset_btn = QPushButton("Reset All Tips && Onboarding")
+        reset_btn.setToolTip("Re-enable all tips, hints, and the welcome dialog")
+        reset_btn.clicked.connect(self._reset_all_tips)
+        layout.addRow("", reset_btn)
+
+        note = QLabel("Changes to these settings take effect on next app restart.")
+        note.setStyleSheet("color: gray; font-size: 10px; font-style: italic;")
+        layout.addRow("", note)
+
+        self.tab_widget.addTab(tab, "Help && Tips")
+
+        # Save help preferences when the main save button is clicked
+        self.save_button.clicked.connect(self._save_help_preferences)
+
+    def _save_help_preferences(self) -> None:
+        from squid.ui.user_preferences import load_preferences, save_preferences
+
+        try:
+            prefs = load_preferences()
+            updated = prefs.with_update(
+                show_tips=self._help_show_tips.isChecked(),
+                show_status_hints=self._help_show_hints.isChecked(),
+                show_getting_started=self._help_show_getting_started.isChecked(),
+            )
+            save_preferences(updated)
+        except Exception:
+            pass  # Non-critical
+
+    def _reset_all_tips(self) -> None:
+        from squid.ui.user_preferences import UserPreferences, save_preferences
+
+        save_preferences(UserPreferences())  # All defaults
+        self._help_show_tips.setChecked(True)
+        self._help_show_hints.setChecked(True)
+        self._help_show_getting_started.setChecked(True)
+        QMessageBox.information(
+            self, "Tips Reset",
+            "All tips and onboarding have been reset.\n"
+            "The welcome dialog will show on next launch."
+        )
 
     def _get_config_value(self, section: str, option: str, default: str = "") -> str:
         try:
@@ -785,14 +911,33 @@ class PreferencesDialog(QDialog):
         if not self.config.has_section(section):
             self.config.add_section(section)
 
+    def _update_zarr_options_visibility(self) -> None:
+        """Show/hide zarr-specific options based on file saving format."""
+        is_zarr = self.file_saving_combo.currentText() == "ZARR_V3"
+        self.zarr_compression_label.setVisible(is_zarr)
+        self.zarr_compression_combo.setVisible(is_zarr)
+        self.zarr_chunk_mode_label.setVisible(is_zarr)
+        self.zarr_chunk_mode_combo.setVisible(is_zarr)
+        self.zarr_6d_fov_label.setVisible(is_zarr)
+        self.zarr_6d_fov_checkbox.setVisible(is_zarr)
+
     def _apply_settings(self) -> None:
         # Ensure all required sections exist
-        for section in ["GENERAL", "CAMERA_CONFIG", "AF", "SOFTWARE_POS_LIMIT", "TRACKING", "VIEWS"]:
+        for section in ["GENERAL", "CAMERA_CONFIG", "AF", "SOFTWARE_POS_LIMIT", "TRACKING", "VIEWS", "DEVELOPMENT"]:
             self._ensure_section(section)
 
         # General settings
         self.config.set("GENERAL", "file_saving_option", self.file_saving_combo.currentText())
         self.config.set("GENERAL", "default_saving_path", self.saving_path_edit.text())
+
+        # Zarr settings
+        self.config.set("GENERAL", "zarr_compression", self.zarr_compression_combo.currentText())
+        self.config.set("GENERAL", "zarr_chunk_mode", self.zarr_chunk_mode_combo.currentText())
+        self.config.set(
+            "GENERAL",
+            "zarr_use_6d_fov_dimension",
+            "true" if self.zarr_6d_fov_checkbox.isChecked() else "false",
+        )
 
         # Acquisition settings
         self.config.set("GENERAL", "multipoint_autofocus_channel", self.autofocus_channel_edit.text())
@@ -852,6 +997,16 @@ class PreferencesDialog(QDialog):
         self.config.set("TRACKING", "default_tracker", self.default_tracker_combo.currentText())
         self.config.set("TRACKING", "search_area_ratio", str(self.search_area_ratio.value()))
 
+        # Advanced - Acquisition Throttling
+        self.config.set(
+            "GENERAL",
+            "acquisition_throttling_enabled",
+            "true" if self.throttling_enabled_checkbox.isChecked() else "false",
+        )
+        self.config.set("GENERAL", "acquisition_max_pending_jobs", str(self.max_pending_jobs_spinbox.value()))
+        self.config.set("GENERAL", "acquisition_max_pending_mb", str(self.max_pending_mb_spinbox.value()))
+        self.config.set("GENERAL", "acquisition_throttle_timeout_s", str(self.throttle_timeout_spinbox.value()))
+
         # Views settings
         self.config.set(
             "VIEWS",
@@ -873,6 +1028,44 @@ class PreferencesDialog(QDialog):
             "true" if self.display_mosaic_view_checkbox.isChecked() else "false",
         )
         self.config.set("VIEWS", "mosaic_view_target_pixel_size_um", str(self.mosaic_pixel_size_spinbox.value()))
+        self.config.set(
+            "VIEWS",
+            "enable_ndviewer",
+            "true" if self.enable_ndviewer_checkbox.isChecked() else "false",
+        )
+
+        # Development settings
+        self.config.set(
+            "DEVELOPMENT",
+            "simulated_disk_io_enabled",
+            "true" if self.simulated_disk_io_checkbox.isChecked() else "false",
+        )
+        self.config.set("DEVELOPMENT", "simulated_disk_io_speed_mb_s", str(self.simulated_speed_spinbox.value()))
+        self.config.set(
+            "DEVELOPMENT",
+            "simulated_disk_io_compression",
+            "true" if self.simulated_compression_checkbox.isChecked() else "false",
+        )
+        self.config.set(
+            "DEVELOPMENT",
+            "simulation_force_save_images",
+            "true" if self.force_save_images_checkbox.isChecked() else "false",
+        )
+
+        # Hardware Simulation settings (in [SIMULATION] section)
+        self._ensure_section("SIMULATION")
+        self.config.set("SIMULATION", "simulate_camera", str(self.sim_camera_checkbox.isChecked()).lower())
+        self.config.set("SIMULATION", "simulate_microcontroller", str(self.sim_mcu_checkbox.isChecked()).lower())
+        self.config.set(
+            "SIMULATION", "simulate_spinning_disk", str(self.sim_spinning_disk_checkbox.isChecked()).lower()
+        )
+        self.config.set("SIMULATION", "simulate_filter_wheel", str(self.sim_filter_wheel_checkbox.isChecked()).lower())
+        self.config.set(
+            "SIMULATION", "simulate_objective_changer", str(self.sim_objective_changer_checkbox.isChecked()).lower()
+        )
+        self.config.set(
+            "SIMULATION", "simulate_laser_af_camera", str(self.sim_laser_af_camera_checkbox.isChecked()).lower()
+        )
 
         # Save to file
         try:
@@ -902,8 +1095,6 @@ class PreferencesDialog(QDialog):
         except Exception:
             self._log.exception("Failed to apply live settings")
 
-        self.signal_config_changed.emit()
-
     def _apply_live_settings(self) -> None:
         """Apply settings that can take effect without restart."""
         # Local import to get the module reference for updating runtime values
@@ -916,6 +1107,14 @@ class PreferencesDialog(QDialog):
         # File saving option
         if hasattr(_def, "FileSavingOption") and hasattr(_def.FileSavingOption, "convert_to_enum"):
             _def.FILE_SAVING_OPTION = _def.FileSavingOption.convert_to_enum(self.file_saving_combo.currentText())
+
+        # Zarr settings (takes effect on next acquisition)
+        if hasattr(_def, "ZarrCompression") and hasattr(_def.ZarrCompression, "convert_to_enum"):
+            _def.ZARR_COMPRESSION = _def.ZarrCompression.convert_to_enum(self.zarr_compression_combo.currentText())
+        if hasattr(_def, "ZarrChunkMode") and hasattr(_def.ZarrChunkMode, "convert_to_enum"):
+            _def.ZARR_CHUNK_MODE = _def.ZarrChunkMode.convert_to_enum(self.zarr_chunk_mode_combo.currentText())
+        if hasattr(_def, "ZARR_USE_6D_FOV_DIMENSION"):
+            _def.ZARR_USE_6D_FOV_DIMENSION = self.zarr_6d_fov_checkbox.isChecked()
 
         # Default saving path
         if hasattr(_def, "DEFAULT_SAVING_PATH"):
@@ -963,6 +1162,16 @@ class PreferencesDialog(QDialog):
             _def.Tracking.DEFAULT_TRACKER = self.default_tracker_combo.currentText()
             _def.Tracking.SEARCH_AREA_RATIO = self.search_area_ratio.value()
 
+        # Acquisition throttling settings (takes effect on next acquisition)
+        if hasattr(_def, "ACQUISITION_THROTTLING_ENABLED"):
+            _def.ACQUISITION_THROTTLING_ENABLED = self.throttling_enabled_checkbox.isChecked()
+        if hasattr(_def, "ACQUISITION_MAX_PENDING_JOBS"):
+            _def.ACQUISITION_MAX_PENDING_JOBS = self.max_pending_jobs_spinbox.value()
+        if hasattr(_def, "ACQUISITION_MAX_PENDING_MB"):
+            _def.ACQUISITION_MAX_PENDING_MB = self.max_pending_mb_spinbox.value()
+        if hasattr(_def, "ACQUISITION_THROTTLE_TIMEOUT_S"):
+            _def.ACQUISITION_THROTTLE_TIMEOUT_S = self.throttle_timeout_spinbox.value()
+
         # Views settings
         if hasattr(_def, "SAVE_DOWNSAMPLED_WELL_IMAGES"):
             _def.SAVE_DOWNSAMPLED_WELL_IMAGES = self.generate_downsampled_checkbox.isChecked()
@@ -988,6 +1197,16 @@ class PreferencesDialog(QDialog):
         if hasattr(_def, "MOSAIC_VIEW_TARGET_PIXEL_SIZE_UM"):
             _def.MOSAIC_VIEW_TARGET_PIXEL_SIZE_UM = self.mosaic_pixel_size_spinbox.value()
 
+        # Development settings (live update)
+        if hasattr(_def, "SIMULATED_DISK_IO_ENABLED"):
+            _def.SIMULATED_DISK_IO_ENABLED = self.simulated_disk_io_checkbox.isChecked()
+        if hasattr(_def, "SIMULATED_DISK_IO_SPEED_MB_S"):
+            _def.SIMULATED_DISK_IO_SPEED_MB_S = self.simulated_speed_spinbox.value()
+        if hasattr(_def, "SIMULATED_DISK_IO_COMPRESSION"):
+            _def.SIMULATED_DISK_IO_COMPRESSION = self.simulated_compression_checkbox.isChecked()
+        if hasattr(_def, "SIMULATION_FORCE_SAVE_IMAGES"):
+            _def.SIMULATION_FORCE_SAVE_IMAGES = self.force_save_images_checkbox.isChecked()
+
     def _get_changes(self) -> List[Tuple[str, str, str, bool]]:
         """Get list of settings that have changed from current config.
 
@@ -1005,6 +1224,22 @@ class PreferencesDialog(QDialog):
         new_val = self.saving_path_edit.text()
         if old_val != new_val:
             changes.append(("Default Saving Path", old_val, new_val, False))
+
+        # Zarr settings (live update)
+        old_val = self._get_config_value("GENERAL", "zarr_compression", "fast")
+        new_val = self.zarr_compression_combo.currentText()
+        if old_val != new_val:
+            changes.append(("Zarr Compression", old_val, new_val, False))
+
+        old_val = self._get_config_value("GENERAL", "zarr_chunk_mode", "full_frame")
+        new_val = self.zarr_chunk_mode_combo.currentText()
+        if old_val != new_val:
+            changes.append(("Zarr Chunk Mode", old_val, new_val, False))
+
+        old_val_bool = self._get_config_bool("GENERAL", "zarr_use_6d_fov_dimension", False)
+        new_val_bool = self.zarr_6d_fov_checkbox.isChecked()
+        if old_val_bool != new_val_bool:
+            changes.append(("Zarr 6D FOV Dimension", str(old_val_bool), str(new_val_bool), False))
 
         # Acquisition settings (live update)
         old_val = self._get_config_value("GENERAL", "multipoint_autofocus_channel", "BF LED matrix full")
@@ -1224,6 +1459,66 @@ class PreferencesDialog(QDialog):
         if not self._floats_equal(old_float, new_float):
             changes.append(("Mosaic Target Pixel Size", f"{old_float} μm", f"{new_float} μm", False))
 
+        old_val_bool = self._get_config_bool("VIEWS", "enable_ndviewer", False)
+        new_val_bool = self.enable_ndviewer_checkbox.isChecked()
+        if old_val_bool != new_val_bool:
+            changes.append(("Enable NDViewer *", str(old_val_bool), str(new_val_bool), True))
+
+        # Development settings (live update)
+        old_val_bool = self._get_config_bool("DEVELOPMENT", "simulated_disk_io_enabled", False)
+        new_val_bool = self.simulated_disk_io_checkbox.isChecked()
+        if old_val_bool != new_val_bool:
+            changes.append(("Simulated Disk I/O", str(old_val_bool), str(new_val_bool), False))
+
+        old_float = self._get_config_float("DEVELOPMENT", "simulated_disk_io_speed_mb_s", 200.0)
+        new_float = self.simulated_speed_spinbox.value()
+        if not self._floats_equal(old_float, new_float):
+            changes.append(("Simulated Write Speed", f"{old_float} MB/s", f"{new_float} MB/s", False))
+
+        old_val_bool = self._get_config_bool("DEVELOPMENT", "simulated_disk_io_compression", True)
+        new_val_bool = self.simulated_compression_checkbox.isChecked()
+        if old_val_bool != new_val_bool:
+            changes.append(("Simulate Compression", str(old_val_bool), str(new_val_bool), False))
+
+        old_val_bool = self._get_config_bool("DEVELOPMENT", "simulation_force_save_images", False)
+        new_val_bool = self.force_save_images_checkbox.isChecked()
+        if old_val_bool != new_val_bool:
+            changes.append(("Force Save Images", str(old_val_bool), str(new_val_bool), False))
+
+        # Hardware Simulation settings (require restart)
+        old_val_bool = self._get_config_bool("SIMULATION", "simulate_camera", False)
+        new_val_bool = self.sim_camera_checkbox.isChecked()
+        if old_val_bool != new_val_bool:
+            changes.append(("Simulate Camera *", str(old_val_bool), str(new_val_bool), True))
+
+        old_val_bool = self._get_config_bool("SIMULATION", "simulate_microcontroller", False)
+        # The checkbox is created as self.sim_mcu_checkbox (see _create_advanced_tab)
+        # and saved under that name too; this change-detection path used a stale
+        # alias (sim_microcontroller_checkbox) that raised AttributeError.
+        new_val_bool = self.sim_mcu_checkbox.isChecked()
+        if old_val_bool != new_val_bool:
+            changes.append(("Simulate Microcontroller *", str(old_val_bool), str(new_val_bool), True))
+
+        old_val_bool = self._get_config_bool("SIMULATION", "simulate_spinning_disk", False)
+        new_val_bool = self.sim_spinning_disk_checkbox.isChecked()
+        if old_val_bool != new_val_bool:
+            changes.append(("Simulate Spinning Disk *", str(old_val_bool), str(new_val_bool), True))
+
+        old_val_bool = self._get_config_bool("SIMULATION", "simulate_filter_wheel", False)
+        new_val_bool = self.sim_filter_wheel_checkbox.isChecked()
+        if old_val_bool != new_val_bool:
+            changes.append(("Simulate Filter Wheel *", str(old_val_bool), str(new_val_bool), True))
+
+        old_val_bool = self._get_config_bool("SIMULATION", "simulate_objective_changer", False)
+        new_val_bool = self.sim_objective_changer_checkbox.isChecked()
+        if old_val_bool != new_val_bool:
+            changes.append(("Simulate Objective Changer *", str(old_val_bool), str(new_val_bool), True))
+
+        old_val_bool = self._get_config_bool("SIMULATION", "simulate_laser_af_camera", False)
+        new_val_bool = self.sim_laser_af_camera_checkbox.isChecked()
+        if old_val_bool != new_val_bool:
+            changes.append(("Simulate Laser AF Camera *", str(old_val_bool), str(new_val_bool), True))
+
         return changes
 
     def _save_and_close(self) -> None:
@@ -1240,9 +1535,7 @@ class PreferencesDialog(QDialog):
         if len(changes) == 1:
             self._apply_settings()
             if requires_restart:
-                QMessageBox.information(
-                    self, "Settings Saved", "Settings have been saved. This change requires a restart to take effect."
-                )
+                self._prompt_restart()
             self.accept()
             return
 
@@ -1290,4 +1583,43 @@ class PreferencesDialog(QDialog):
 
         if dialog.exec_() == QDialog.Accepted:
             self._apply_settings()
+            if requires_restart:
+                self._prompt_restart()
             self.accept()
+
+    def _prompt_restart(self) -> None:
+        """Show restart dialog when settings require restart."""
+        reply = QMessageBox.question(
+            self,
+            "Restart Required",
+            "Some settings changed require a restart to take effect.\n\n"
+            "Would you like to restart now?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if reply == QMessageBox.Yes:
+            self._restart_application()
+
+    def _restart_application(self) -> None:
+        """Restart the application with --skip-init flag."""
+        import sys
+        import os
+
+        # Build restart command with --skip-init
+        args = sys.argv.copy()
+        if "--skip-init" not in args:
+            args.append("--skip-init")
+
+        # Close the preferences dialog first
+        self.accept()
+
+        # Schedule application restart after event loop processes
+        from qtpy.QtCore import QTimer
+        from qtpy.QtWidgets import QApplication
+
+        def do_restart():
+            # Quit application and spawn new process
+            QApplication.instance().quit()
+            os.execv(sys.executable, [sys.executable] + args)
+
+        QTimer.singleShot(100, do_restart)

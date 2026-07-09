@@ -149,6 +149,19 @@ class TestEventBusWidgetBase:
 
         assert len(widget._subscriptions) == 0
 
+    def test_destroyed_signal_callback_cleans_up_with_arg(self):
+        """Destroyed signal passes QObject arg; cleanup should still run."""
+        from squid.ui.widgets.base import EventBusWidget
+
+        bus = EventBus()
+        widget = EventBusWidget(bus)
+        handler = MagicMock()
+        widget._subscribe(DummyEvent, handler)
+        assert len(widget._subscriptions) == 1
+
+        widget._on_destroyed(object())
+        assert len(widget._subscriptions) == 0
+
 
 @pytest.mark.skipif(_skip_widget_tests, reason="Skipping widget tests in offscreen mode")
 class TestEventBusFrame:
@@ -224,13 +237,6 @@ class TestWidgetInheritance:
 
         assert issubclass(DACControWidget, EventBusFrame)
 
-    def test_trigger_widget_inherits_event_bus_frame(self):
-        """Verify TriggerControlWidget inherits from EventBusFrame."""
-        from squid.ui.widgets.hardware.trigger import TriggerControlWidget
-        from squid.ui.widgets.base import EventBusFrame
-
-        assert issubclass(TriggerControlWidget, EventBusFrame)
-
     def test_navigation_widget_inherits_event_bus_frame(self):
         """Verify NavigationWidget inherits from EventBusFrame."""
         from squid.ui.widgets.stage.navigation import NavigationWidget
@@ -275,7 +281,6 @@ class TestWidgetInheritance:
         from squid.ui.widgets.stage.navigation import NavigationWidget
         from squid.ui.widgets.camera.live_control import LiveControlWidget
         from squid.ui.widgets.camera.settings import CameraSettingsWidget
-        from squid.ui.widgets.hardware.trigger import TriggerControlWidget
         from squid.ui.widgets.hardware.dac import DACControWidget
         from squid.ui.widgets.stage.autofocus import AutoFocusWidget
         from squid.ui.widgets.wellplate.format import WellplateFormatWidget
@@ -291,8 +296,6 @@ class TestWidgetInheritance:
             WellplateFormatWidget(None, None, None)  # type: ignore[arg-type]
 
         # Widgets without required args raise TypeError
-        with pytest.raises(TypeError):
-            TriggerControlWidget()  # type: ignore[call-arg]
         with pytest.raises(TypeError):
             DACControWidget()  # type: ignore[call-arg]
         with pytest.raises(TypeError):

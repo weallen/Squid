@@ -1,0 +1,14 @@
+name: "Tiled Z-Stack Imaging"
+version: "3.0"
+description: "Grid-friendly z-stack imaging over a 4-FOV test layout."
+output_directory: ../outputs
+
+resources:
+  fluidics_config_file: ../fluidics/simulation_fluidics.json
+  fov_file: ../fov_positions/test_4fov_grid.csv
+
+rounds:
+  - name: "Tiled Acquisition"
+    steps:
+      - step_type: imaging
+        protocol: resource_files/protocols/tiled_multichannel.yaml

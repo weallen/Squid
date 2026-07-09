@@ -12,7 +12,7 @@ from qtpy.QtWidgets import (
 )
 
 from squid.ui.widgets.base import EventBusFrame
-from squid.core.events import DACValueChanged, SetDACCommand
+from squid.core.events import handles, DACValueChanged, SetDACCommand
 
 if TYPE_CHECKING:
     from squid.ui.ui_event_bus import UIEventBus
@@ -28,9 +28,6 @@ class DACControWidget(EventBusFrame):
 
     def __init__(self, event_bus: "UIEventBus", *args, **kwargs) -> None:
         super().__init__(event_bus, *args, **kwargs)
-
-        # Subscribe to state updates using base class helper
-        self._subscribe(DACValueChanged, self._on_dac_changed)
 
         self.add_components()
         self.setFrameStyle(QFrame.Panel | QFrame.Raised)
@@ -93,6 +90,7 @@ class DACControWidget(EventBusFrame):
         """Set DAC1 output (0-100%)."""
         self._publish(SetDACCommand(channel=1, value=value / 100.0))
 
+    @handles(DACValueChanged)
     def _on_dac_changed(self, event: DACValueChanged) -> None:
         """Handle DAC value changed event."""
         # Update UI without triggering signal loops

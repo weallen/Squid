@@ -2,8 +2,35 @@
 # -*-mode:python ; tab-width:4 -*- ex:set tabstop=4 shiftwidth=4 expandtab: -*-
 # -*- coding:utf-8 -*-
 
-from ctypes import *
+from ctypes import (
+    CDLL,
+    CFUNCTYPE,
+    POINTER,
+    Structure,
+    WinDLL,
+    byref,
+    c_bool,
+    c_char,
+    c_char_p,
+    c_double,
+    c_int,
+    c_int64,
+    c_longlong,
+    c_size_t,
+    c_ubyte,
+    c_uint,
+    c_uint64,
+    c_ulonglong,
+    c_void_p,
+    create_string_buffer,
+    sizeof,
+    string_at,
+)
 import sys
+
+# Alias for backward compatibility: gxiapi.py imports 'string' from this module.
+# The old wildcard 'from ctypes import *' exposed ctypes.string_at as 'string'.
+string = string_at
 
 
 if sys.platform == "linux2" or sys.platform == "linux":

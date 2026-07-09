@@ -1,8 +1,8 @@
 import serial
 import time
 
-from squid.backend.drivers.peripherals.serial_base import SerialDevice
-from _def import XLIGHT_ILLUMINATION_IRIS_DEFAULT, XLIGHT_EMISSION_IRIS_DEFAULT
+from squid.backend.drivers.peripherals.serial_base import SerialDevice, SerialDeviceError
+from _def import XLIGHT_ILLUMINATION_IRIS_DEFAULT, XLIGHT_EMISSION_IRIS_DEFAULT, XLIGHT_EMISSION_FILTER_POSITIONS
 
 import squid.core.logging
 
@@ -25,6 +25,7 @@ class XLight_Simulation:
         self.spinning_disk_pos = 0
         self.illumination_iris = 0
         self.emission_iris = 0
+        self.slider_position = 0
 
     def set_emission_filter(self, position, extraction=False, validate=False):
         self.emission_wheel_pos = position
@@ -80,26 +81,24 @@ class XLight_Simulation:
         self.slider_position = position
         return self.slider_position
 
+    def get_filter_slider(self):
+        return self.slider_position
+
 
 # CrestOptics X-Light Port specs:
-# 9600 baud
-# 8 data bits
-# 1 stop bit
-# No parity
-# no flow control
+# V1/V2: 9600 baud, V3/Cicero: 115200 baud
+# 8 data bits, 1 stop bit, No parity, no flow control
 
 
 class XLight:
-    """Wrapper for communicating with CrestOptics X-Light devices over serial"""
+    """Wrapper for communicating with CrestOptics X-Light devices over serial.
+
+    Supports V1, V2, V3, and Cicero with automatic protocol detection.
+    """
 
     def __init__(
         self, SN, sleep_time_for_wheel=0.25, disable_emission_filter_wheel=True
     ):
-        """
-        Provide serial number (default is that of the device
-        cephla already has) for device-finding purposes. Otherwise, all
-        XLight devices should use the same serial protocol
-        """
         self.log = squid.core.logging.get_logger(self.__class__.__name__)
 
         self.has_spinning_disk_motor = False
@@ -112,12 +111,35 @@ class XLight:
         self.has_dichroic_filter_slider = False
         self.has_ttl_control = False
         self.sleep_time_for_wheel = sleep_time_for_wheel
-
         self.disable_emission_filter_wheel = disable_emission_filter_wheel
+        self.slider_position = 0
 
+        # Auto-detect protocol: try V3 (115200) first, then V1/V2 (9600)
+        self.protocol_version = self._connect_and_detect(SN)
+        self.log.info(f"X-Light protocol version: {self.protocol_version}")
+
+        if self.protocol_version in ("V1", "V2"):
+            # V1/V2: assume standard devices, no iris/slider
+            self.has_spinning_disk_motor = True
+            self.has_spinning_disk_slider = True
+            self.has_dichroic_filters_wheel = True
+            self.has_emission_filters_wheel = True
+        else:
+            # V3/Cicero: use idc command for config detection
+            self.parse_idc_response(self.serial_connection.write_and_read("idc\r"))
+
+        self.print_config()
+
+        if self.has_illumination_iris_diaphragm:
+            self.set_illumination_iris(XLIGHT_ILLUMINATION_IRIS_DEFAULT)
+        if self.has_emission_iris_diaphragm:
+            self.set_emission_iris(XLIGHT_EMISSION_IRIS_DEFAULT)
+
+    def _open_serial(self, SN, baudrate):
+        """Open serial connection with specified baud rate."""
         self.serial_connection = SerialDevice(
             SN=SN,
-            baudrate=115200,
+            baudrate=baudrate,
             bytesize=serial.EIGHTBITS,
             stopbits=serial.STOPBITS_ONE,
             parity=serial.PARITY_NONE,
@@ -127,13 +149,21 @@ class XLight:
         )
         self.serial_connection.open_ser()
 
-        self.parse_idc_response(self.serial_connection.write_and_read("idc\r"))
-        self.print_config()
+    def _connect_and_detect(self, SN):
+        """Try V3 baud rate first, fall back to V1/V2 if idc command fails."""
+        self._open_serial(SN, 115200)
+        try:
+            response = self.serial_connection.write_and_read("idc\r", read_delay=0.2, max_attempts=2)
+            if response:
+                int(response, 16)  # Validate hex response
+                return "V3"
+        except (ValueError, SerialDeviceError) as e:
+            self.log.debug(f"V3 detection failed ({type(e).__name__}), trying V1/V2")
 
-        if self.has_illumination_iris_diaphragm:
-            self.set_illumination_iris(XLIGHT_ILLUMINATION_IRIS_DEFAULT)
-        if self.has_emission_iris_diaphragm:
-            self.set_emission_iris(XLIGHT_EMISSION_IRIS_DEFAULT)
+        # idc failed, try V1/V2 (9600 baud)
+        self.serial_connection.close()
+        self._open_serial(SN, 9600)
+        return "V2"
 
     def parse_idc_response(self, response):
         # Convert hexadecimal response to integer
@@ -170,8 +200,11 @@ class XLight:
         if self.disable_emission_filter_wheel:
             print("emission filter wheel disabled")
             return -1
-        if str(position) not in ["1", "2", "3", "4", "5", "6", "7", "8"]:
-            raise ValueError("Invalid emission filter wheel position!")
+        valid_positions = [str(i + 1) for i in range(XLIGHT_EMISSION_FILTER_POSITIONS)]
+        if str(position) not in valid_positions:
+            raise ValueError(
+                f"Invalid emission filter position {position}, must be 1-{XLIGHT_EMISSION_FILTER_POSITIONS}"
+            )
         position_to_write = str(position)
         position_to_read = str(position)
         if extraction:
@@ -179,7 +212,7 @@ class XLight:
 
         if validate:
             current_pos = self.serial_connection.write_and_check(
-                "B" + position_to_write + "\r", "B" + position_to_read, read_delay=0.01
+                "B" + position_to_write + "\r", "B" + position_to_read, read_delay=self.sleep_time_for_wheel
             )
             self.emission_wheel_pos = int(current_pos[1])
         else:
@@ -191,7 +224,7 @@ class XLight:
 
     def get_emission_filter(self):
         current_pos = self.serial_connection.write_and_check(
-            "rB\r", "rB", read_delay=0.01
+            "rB\r", "rB", read_delay=self.sleep_time_for_wheel
         )
         self.emission_wheel_pos = int(current_pos[2])
         return self.emission_wheel_pos
@@ -205,14 +238,14 @@ class XLight:
             position_to_write += "m"
 
         current_pos = self.serial_connection.write_and_check(
-            "C" + position_to_write + "\r", "C" + position_to_read, read_delay=0.01
+            "C" + position_to_write + "\r", "C" + position_to_read, read_delay=self.sleep_time_for_wheel
         )
         self.dichroic_wheel_pos = int(current_pos[1])
         return self.dichroic_wheel_pos
 
     def get_dichroic(self):
         current_pos = self.serial_connection.write_and_check(
-            "rC\r", "rC", read_delay=0.01
+            "rC\r", "rC", read_delay=self.sleep_time_for_wheel
         )
         self.dichroic_wheel_pos = int(current_pos[2])
         return self.dichroic_wheel_pos
@@ -274,8 +307,15 @@ class XLight:
         position_to_write = str(position)
         position_to_read = str(position)
         self.serial_connection.write_and_check(
-            "P" + position_to_write + "\r", "V" + position_to_read, read_delay=5
+            "P" + position_to_write + "\r", "P" + position_to_read, read_delay=5
         )
+        return self.slider_position
+
+    def get_filter_slider(self):
+        current_pos = self.serial_connection.write_and_check(
+            "rP\r", "rP", read_delay=0.01
+        )
+        self.slider_position = int(current_pos[2])
         return self.slider_position
 
     def get_disk_position(self):

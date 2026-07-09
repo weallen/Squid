@@ -11,6 +11,7 @@ from typing import Optional, TYPE_CHECKING, Tuple, List
 import numpy as np
 
 import squid.core.logging
+from squid.backend.controllers.base import BaseController
 from squid.core.mode_gate import GlobalMode, GlobalModeGate
 from squid.core.events import (
     EventBus,
@@ -23,17 +24,16 @@ from squid.core.events import (
     StopTrackingCommand,
     TrackingStateChanged,
     TrackingWorkerFinished,
+    handles,
 )
 from squid.backend.processing.tracking_dasiamrpn import Tracker_Image
 from squid.backend.io.utils_acquisition import save_image
 
 if TYPE_CHECKING:
-    from squid.core.utils.config_utils import ChannelMode
+    from squid.core.config.models import AcquisitionChannel
     from squid.backend.controllers.live_controller import LiveController
     from squid.backend.services import CameraService, StageService, PeripheralService
-    from squid.backend.managers.channel_configuration_manager import (
-        ChannelConfigurationManager,
-    )
+    from squid.backend.managers.channel_config_service import ChannelConfigService
     from squid.backend.managers.objective_store import ObjectiveStore
 
 
@@ -41,7 +41,7 @@ if TYPE_CHECKING:
 class _TrackingRunConfig:
     experiment_id: str
     base_path: str
-    configuration: "ChannelMode"
+    configuration: "AcquisitionChannel"
     roi_bbox: Tuple[int, int, int, int]
     time_interval_s: float
     enable_stage_tracking: bool
@@ -51,7 +51,7 @@ class _TrackingRunConfig:
     image_resizing_factor: float
 
 
-class TrackingControllerCore:
+class TrackingControllerCore(BaseController):
     """Backend-only tracking controller (no Qt, services-only hardware access)."""
 
     def __init__(
@@ -61,13 +61,12 @@ class TrackingControllerCore:
         camera_service: "CameraService",
         stage_service: "StageService",
         live_controller: "LiveController",
-        channel_config_manager: "ChannelConfigurationManager",
+        channel_config_manager: "ChannelConfigService",
         objective_store: "ObjectiveStore",
         peripheral_service: Optional["PeripheralService"] = None,
         mode_gate: Optional[GlobalModeGate] = None,
     ) -> None:
-        self._log = squid.core.logging.get_logger(self.__class__.__name__)
-        self._bus = event_bus
+        super().__init__(event_bus)
         self._camera = camera_service
         self._stage = stage_service
         self._live = live_controller
@@ -97,21 +96,10 @@ class TrackingControllerCore:
         self._keep_running = threading.Event()
         self._worker: Optional[_TrackingWorker] = None
 
-        self._subscribe_to_bus()
-
-    def _subscribe_to_bus(self) -> None:
-        self._bus.subscribe(SetTrackingParametersCommand, self._on_set_parameters)
-        self._bus.subscribe(SetTrackingPathCommand, self._on_set_path)
-        self._bus.subscribe(SetTrackingChannelsCommand, self._on_set_channels)
-        self._bus.subscribe(StartTrackingExperimentCommand, self._on_start_experiment)
-        self._bus.subscribe(StartTrackingCommand, self._on_start_tracking)
-        self._bus.subscribe(StopTrackingCommand, self._on_stop_tracking)
-        self._bus.subscribe(ObjectiveChanged, self._on_objective_changed)
-        self._bus.subscribe(TrackingWorkerFinished, self._on_worker_finished)
-
     def _publish_tracking_state(self, is_tracking: bool) -> None:
-        self._bus.publish(TrackingStateChanged(is_tracking=is_tracking))
+        self._event_bus.publish(TrackingStateChanged(is_tracking=is_tracking))
 
+    @handles(ObjectiveChanged)
     def _on_objective_changed(self, event: ObjectiveChanged) -> None:
         if event.objective_name is None:
             return
@@ -120,6 +108,7 @@ class TrackingControllerCore:
             if event.pixel_size_um is not None:
                 self._pixel_size_um = event.pixel_size_um
 
+    @handles(SetTrackingParametersCommand)
     def _on_set_parameters(self, cmd: SetTrackingParametersCommand) -> None:
         with self._lock:
             if cmd.time_interval_s is not None:
@@ -137,14 +126,17 @@ class TrackingControllerCore:
             if cmd.image_resizing_factor is not None:
                 self._image_resizing_factor = float(cmd.image_resizing_factor)
 
+    @handles(SetTrackingPathCommand)
     def _on_set_path(self, cmd: SetTrackingPathCommand) -> None:
         with self._lock:
             self._base_path = cmd.base_path
 
+    @handles(SetTrackingChannelsCommand)
     def _on_set_channels(self, cmd: SetTrackingChannelsCommand) -> None:
         with self._lock:
             self._selected_configuration_names = list(cmd.channel_names)
 
+    @handles(StartTrackingExperimentCommand)
     def _on_start_experiment(self, cmd: StartTrackingExperimentCommand) -> None:
         with self._lock:
             self._experiment_id_base = cmd.experiment_id
@@ -195,6 +187,7 @@ class TrackingControllerCore:
                 image_resizing_factor=float(self._image_resizing_factor or 1.0),
             )
 
+    @handles(StartTrackingCommand)
     def _on_start_tracking(self, cmd: StartTrackingCommand) -> None:
         run_cfg = self._build_run_config(roi_bbox=cmd.roi_bbox)
 
@@ -215,10 +208,9 @@ class TrackingControllerCore:
                 self._objective_store, "current_objective", None
             )
             if objective:
-                self._configs.save_current_configuration_to_path(
-                    objective,
-                    Path(os.path.join(run_cfg.base_path, run_cfg.experiment_id, "configurations.xml")),
-                )
+                experiment_dir = Path(os.path.join(run_cfg.base_path, run_cfg.experiment_id))
+                channels = self._configs.get_enabled_configurations(objective)
+                self._configs.save_acquisition_output(experiment_dir, objective, channels)
             if was_live:
                 self._live.stop_live()
             self._live.set_microscope_mode(run_cfg.configuration)
@@ -238,7 +230,7 @@ class TrackingControllerCore:
         self._publish_tracking_state(is_tracking=True)
 
         worker = _TrackingWorker(
-            bus=self._bus,
+            bus=self._event_bus,
             camera_service=self._camera,
             stage_service=self._stage,
             live_controller=self._live,
@@ -254,12 +246,14 @@ class TrackingControllerCore:
             self._worker = worker
         worker.start()
 
+    @handles(StopTrackingCommand)
     def _on_stop_tracking(self, cmd: StopTrackingCommand) -> None:
         with self._lock:
             if not self._is_tracking:
                 return
             self._keep_running.clear()
 
+    @handles(TrackingWorkerFinished)
     def _on_worker_finished(self, event: TrackingWorkerFinished) -> None:
         with self._lock:
             worker = self._worker
@@ -270,6 +264,7 @@ class TrackingControllerCore:
         if worker is not None:
             worker.restore_after_run()
         self._publish_tracking_state(is_tracking=False)
+
 
 
 class _TrackingWorker(threading.Thread):
@@ -284,13 +279,13 @@ class _TrackingWorker(threading.Thread):
         keep_running: threading.Event,
         run_cfg: _TrackingRunConfig,
         previous_live_state: bool,
-        previous_configuration: Optional["ChannelMode"],
+        previous_configuration: Optional["AcquisitionChannel"],
         previous_mode: Optional[GlobalMode],
         mode_gate: Optional[GlobalModeGate],
     ) -> None:
         super().__init__(daemon=True)
         self._log = squid.core.logging.get_logger(self.__class__.__name__)
-        self._bus = bus
+        self._event_bus = bus
         self._camera = camera_service
         self._stage = stage_service
         self._live = live_controller
@@ -341,7 +336,7 @@ class _TrackingWorker(threading.Thread):
                 )
                 self._csv_file.flush()
                 self._run_loop()
-            self._bus.publish(
+            self._event_bus.publish(
                 TrackingWorkerFinished(
                     success=True,
                     aborted=not self._keep_running.is_set(),
@@ -350,7 +345,7 @@ class _TrackingWorker(threading.Thread):
         except Exception as exc:
             msg = str(exc) or exc.__class__.__name__
             self._log.exception("Tracking worker failed")
-            self._bus.publish(
+            self._event_bus.publish(
                 TrackingWorkerFinished(
                     success=False,
                     aborted=not self._keep_running.is_set(),

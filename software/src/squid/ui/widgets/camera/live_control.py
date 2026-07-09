@@ -1,4 +1,38 @@
-from squid.ui.widgets.camera._common import *
+from squid.ui.widgets.camera._common import (
+    AcquisitionChannel,
+    Any,
+    AutoLevelCommand,
+    ChannelConfigurationsChanged,
+    EventBusFrame,
+    List,
+    LiveStateChanged,
+    MicroscopeModeChanged,
+    ObjectiveChanged,
+    Optional,
+    ProfileChanged,
+    QComboBox,
+    QDoubleSpinBox,
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QPushButton,
+    QSizePolicy,
+    QSlider,
+    QVBoxLayout,
+    Qt,
+    SetMicroscopeModeCommand,
+    SetTriggerFPSCommand,
+    SetTriggerModeCommand,
+    StartLiveCommand,
+    StopLiveCommand,
+    StreamHandler,
+    TriggerFPSChanged,
+    TriggerMode,
+    TriggerModeChanged,
+    UpdateChannelConfigurationCommand,
+    handles,
+    squid,
+)
 
 
 class LiveControlWidget(EventBusFrame):
@@ -13,7 +47,7 @@ class LiveControlWidget(EventBusFrame):
         self,
         event_bus: "UIEventBus",
         streamHandler: StreamHandler,
-        initial_configuration: "ChannelMode",
+        initial_configuration: "AcquisitionChannel",
         initial_objective: str,
         initial_channel_configs: List[str],
         # Camera limits passed as params instead of direct camera access
@@ -66,16 +100,7 @@ class LiveControlWidget(EventBusFrame):
 
         self.is_switching_mode = False  # flag used to prevent from settings being set by twice - from both mode change slot and value change slot; another way is to use blockSignals(True)
 
-        # Subscribe to state changes using base class helper
-        self._subscribe(LiveStateChanged, self._on_live_state_changed)
-        self._subscribe(TriggerModeChanged, self._on_trigger_mode_changed)
-        self._subscribe(TriggerFPSChanged, self._on_trigger_fps_changed)
-        self._subscribe(MicroscopeModeChanged, self._on_microscope_mode_changed)
-        self._subscribe(AutoLevelCommand, self._on_autolevel_command)
-        self._subscribe(ObjectiveChanged, self._on_objective_changed)
-        self._subscribe(ChannelConfigurationsChanged, self._on_channel_configs_changed)
-        self._subscribe(ProfileChanged, self._on_profile_changed)
-
+    @handles(AutoLevelCommand)
     def _on_autolevel_command(self, event: AutoLevelCommand) -> None:
         self.toggle_autolevel(event.enabled)
 
@@ -95,6 +120,11 @@ class LiveControlWidget(EventBusFrame):
         self.dropdown_triggerManu.setCurrentText(self._initial_trigger_mode)
         sizePolicy = QSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.dropdown_triggerManu.setSizePolicy(sizePolicy)
+        self.dropdown_triggerManu.setToolTip(
+            "Software: camera triggers each frame internally. "
+            "Hardware: external trigger signal controls frame timing. "
+            "Continuous: camera streams continuously at max rate."
+        )
 
         # line 1: fps
         self.entry_triggerFPS = QDoubleSpinBox()
@@ -103,6 +133,7 @@ class LiveControlWidget(EventBusFrame):
         self.entry_triggerFPS.setMaximum(1000)
         self.entry_triggerFPS.setSingleStep(1)
         self.entry_triggerFPS.setValue(self.fps_trigger)
+        self.entry_triggerFPS.setToolTip("Camera trigger rate in frames per second")
 
         self.entry_displayFPS = QDoubleSpinBox()
         self.entry_displayFPS.setKeyboardTracking(False)
@@ -110,12 +141,16 @@ class LiveControlWidget(EventBusFrame):
         self.entry_displayFPS.setMaximum(240)
         self.entry_displayFPS.setSingleStep(1)
         self.entry_displayFPS.setValue(self.fps_display)
+        self.entry_displayFPS.setToolTip("Display refresh rate (does not affect capture rate)")
 
         # line 2: choose microscope mode / channel
         self.dropdown_modeSelection = QComboBox()
         for config_name in self._channel_config_names:
             self.dropdown_modeSelection.addItem(config_name)
         self.dropdown_modeSelection.setCurrentText(self.currentConfiguration.name)
+        self.dropdown_modeSelection.setToolTip(
+            "Select the imaging channel/mode (sets illumination, filters, and camera settings)"
+        )
 
         # line 3: exposure time and analog gain associated with the current mode
         self.entry_exposureTime = QDoubleSpinBox()
@@ -124,6 +159,7 @@ class LiveControlWidget(EventBusFrame):
         self.entry_exposureTime.setMaximum(self._exposure_limits[1])
         self.entry_exposureTime.setSingleStep(1)
         self.entry_exposureTime.setValue(self.currentConfiguration.exposure_time)
+        self.entry_exposureTime.setToolTip("Camera exposure time in milliseconds for the current channel")
 
         self.entry_analogGain = QDoubleSpinBox()
         self.entry_analogGain.setKeyboardTracking(False)
@@ -145,6 +181,7 @@ class LiveControlWidget(EventBusFrame):
         self.slider_illuminationIntensity.setMaximum(100)
         self.slider_illuminationIntensity.setValue(100)
         self.slider_illuminationIntensity.setSingleStep(1)
+        self.slider_illuminationIntensity.setToolTip("Illumination intensity (0-100%)")
 
         self.entry_illuminationIntensity = QDoubleSpinBox()
         self.entry_illuminationIntensity.setKeyboardTracking(False)
@@ -152,15 +189,20 @@ class LiveControlWidget(EventBusFrame):
         self.entry_illuminationIntensity.setMaximum(100)
         self.entry_illuminationIntensity.setSingleStep(1)
         self.entry_illuminationIntensity.setValue(100)
+        self.entry_illuminationIntensity.setToolTip("Illumination intensity (0-100%)")
 
         self.btn_live = QPushButton("Start Live")
         self.btn_live.setCheckable(True)
         self.btn_live.setChecked(False)
         self.btn_live.setDefault(False)
+        self.btn_live.setToolTip("Start or stop the live camera view (Ctrl+L)")
 
         self.btn_autolevel = QPushButton("Autolevel")
         self.btn_autolevel.setCheckable(True)
         self.btn_autolevel.setChecked(autolevel)
+        self.btn_autolevel.setToolTip(
+            "Automatically adjust display contrast to match the image brightness range"
+        )
 
         # layout
         self.grid = QVBoxLayout()
@@ -245,6 +287,7 @@ class LiveControlWidget(EventBusFrame):
             self._log.info("Publishing StopLiveCommand")
             self._publish(StopLiveCommand())
 
+    @handles(LiveStateChanged)
     def _on_live_state_changed(self, event: LiveStateChanged) -> None:
         """Handle live state changes from the event bus."""
         if getattr(event, "camera", "main") != "main":
@@ -257,6 +300,7 @@ class LiveControlWidget(EventBusFrame):
             self.btn_live.setChecked(False)
             self.btn_live.setText("Start Live")
 
+    @handles(TriggerModeChanged)
     def _on_trigger_mode_changed(self, event: TriggerModeChanged) -> None:
         """Handle trigger mode change from service."""
         if getattr(event, "camera", "main") != "main":
@@ -265,6 +309,7 @@ class LiveControlWidget(EventBusFrame):
         self.dropdown_triggerManu.setCurrentText(event.mode)
         self.dropdown_triggerManu.blockSignals(False)
 
+    @handles(TriggerFPSChanged)
     def _on_trigger_fps_changed(self, event: TriggerFPSChanged) -> None:
         """Handle trigger FPS change from service."""
         if getattr(event, "camera", "main") != "main":
@@ -273,6 +318,7 @@ class LiveControlWidget(EventBusFrame):
         self.entry_triggerFPS.setValue(event.fps)
         self.entry_triggerFPS.blockSignals(False)
 
+    @handles(MicroscopeModeChanged)
     def _on_microscope_mode_changed(self, event: MicroscopeModeChanged) -> None:
         """Handle microscope mode change from service."""
         self.dropdown_modeSelection.blockSignals(True)
@@ -300,6 +346,7 @@ class LiveControlWidget(EventBusFrame):
             self.entry_illuminationIntensity.setValue(event.illumination_intensity)
             self.entry_illuminationIntensity.blockSignals(False)
 
+    @handles(ObjectiveChanged)
     def _on_objective_changed(self, event: ObjectiveChanged) -> None:
         """Handle objective change event."""
         if event.objective_name:
@@ -312,12 +359,14 @@ class LiveControlWidget(EventBusFrame):
                 )
             )
 
+    @handles(ChannelConfigurationsChanged)
     def _on_channel_configs_changed(self, event: ChannelConfigurationsChanged) -> None:
         """Handle channel configurations changed event."""
         if event.objective_name == self._current_objective:
             self._channel_config_names = list(event.configuration_names)
             self.refresh_mode_list()
 
+    @handles(ProfileChanged)
     def _on_profile_changed(self, event: ProfileChanged) -> None:
         """Handle profile changed event - refresh mode list and reselect current mode."""
         self.refresh_mode_list()
@@ -346,7 +395,7 @@ class LiveControlWidget(EventBusFrame):
         # UI will be updated via _on_microscope_mode_changed event handler
         self.is_switching_mode = False
 
-    def update_ui_for_mode(self, configuration: "ChannelMode") -> None:
+    def update_ui_for_mode(self, configuration: "AcquisitionChannel") -> None:
         self.entry_exposureTime.blockSignals(True)
         self.entry_exposureTime.setValue(configuration.exposure_time)
         self.entry_exposureTime.blockSignals(False)
@@ -419,7 +468,7 @@ class LiveControlWidget(EventBusFrame):
                 )
             )
 
-    def set_live_configuration(self, configuration: Optional["ChannelMode"]) -> None:
+    def set_live_configuration(self, configuration: Optional["AcquisitionChannel"]) -> None:
         if configuration is None:
             return
         self.dropdown_modeSelection.setCurrentText(configuration.name)

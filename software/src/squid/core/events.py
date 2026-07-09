@@ -24,13 +24,13 @@ import queue
 import threading
 import time
 from dataclasses import dataclass
+from enum import Enum
 from threading import Lock
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Type, TypeVar
 
 import numpy as np
 
 import squid.core.logging
-from squid.core.config.focus_lock import FocusLockMode
 
 _log = squid.core.logging.get_logger("squid.events")
 
@@ -79,6 +79,14 @@ class EventBus:
         self._queue: queue.Queue[Event] = queue.Queue()
         self._dispatch_thread: Optional[threading.Thread] = None
         self._running = False
+        # Count of events published but not yet fully dispatched. Incremented in
+        # publish() BEFORE the event is enqueued and decremented in
+        # _dispatch_loop only after all handlers for the event have returned.
+        # drain() waits on this reaching zero so it never returns while a handler
+        # is still running (the queue can be momentarily empty mid-dispatch
+        # because the loop pops the event before invoking its handlers).
+        self._pending = 0
+        self._idle = threading.Condition()
 
     def start(self) -> None:
         """Start the dispatch thread.
@@ -111,6 +119,13 @@ class EventBus:
             if self._dispatch_thread.is_alive():
                 _log.warning("EventBus dispatch thread did not stop cleanly")
         self._dispatch_thread = None
+        # The dispatch loop exits without draining any events still queued, so their
+        # publish-time _pending increments would never be decremented. Reset the
+        # counter and wake any drain() waiter so a later drain() on this bus cannot
+        # block for the full timeout on phantom pending events.
+        with self._idle:
+            self._pending = 0
+            self._idle.notify_all()
         _log.debug("EventBus dispatch thread stopped")
 
     @property
@@ -167,6 +182,10 @@ class EventBus:
             self.start()
         if self._debug:
             _log.debug(f"[EventBus] enqueue {type(event).__name__}: {event}")
+        # Mark the event in flight before enqueueing so there is never a window
+        # where the queue is empty but the event is unaccounted for by drain().
+        with self._idle:
+            self._pending += 1
         self._queue.put(event)
 
     def _dispatch_loop(self) -> None:
@@ -174,11 +193,19 @@ class EventBus:
         while self._running:
             try:
                 event = self._queue.get(timeout=0.1)
-                self._dispatch(event)
             except queue.Empty:
                 continue
+            try:
+                self._dispatch(event)
             except Exception as e:
                 _log.exception(f"Unexpected error in dispatch loop: {e}")
+            finally:
+                # Event fully processed (handlers ran); release drain() waiters.
+                with self._idle:
+                    self._pending -= 1
+                    if self._pending <= 0:
+                        self._pending = 0
+                        self._idle.notify_all()
 
     def _dispatch(self, event: Event) -> None:
         """Dispatch a single event to all subscribers."""
@@ -200,41 +227,119 @@ class EventBus:
             self._subscribers.clear()
 
     def drain(self, timeout_s: float = 1.0) -> int:
-        """Drain the queue by processing all pending events.
+        """Wait until all published events have been fully dispatched.
 
-        Useful for testing to ensure all events have been processed.
+        Blocks until every event published before this call has been pulled from
+        the queue AND had all of its handlers run to completion, or until
+        timeout_s elapses. Because _dispatch_loop removes an event from the queue
+        before running its handlers, an empty queue alone does not mean dispatch
+        is finished; this method also waits for the in-flight event count to
+        reach zero.
+
+        Useful in tests to deterministically wait for handler side effects.
 
         Args:
-            timeout_s: Maximum time to wait for queue to drain.
+            timeout_s: Maximum time to wait for pending events to drain.
 
         Returns:
-            Number of events processed.
+            Always 0. Retained only for backward compatibility; callers must
+            observe handler side effects rather than rely on a processed count.
         """
-        count = 0
+        # Guard against self-deadlock: if a handler (running on the dispatch
+        # thread) calls drain(), the current event's _pending is not decremented
+        # until that handler returns, so waiting here would just burn the whole
+        # timeout. Return immediately instead.
+        if self._dispatch_thread is not None and threading.current_thread() is self._dispatch_thread:
+            return 0
         deadline = time.time() + timeout_s
-        idle_start: Optional[float] = None
-
-        while time.time() < deadline:
-            remaining = max(0.001, min(0.05, deadline - time.time()))
-            try:
-                event = self._queue.get(timeout=remaining)
-                idle_start = None
-                self._dispatch(event)
-                count += 1
-            except queue.Empty:
-                if idle_start is None:
-                    idle_start = time.time()
-                elif time.time() - idle_start >= 0.05:
-                    # Queue stayed empty for a brief period; assume drained
+        with self._idle:
+            while self._pending > 0:
+                remaining = deadline - time.time()
+                if remaining <= 0:
                     break
-                continue
-
-        return count
+                self._idle.wait(remaining)
+        return 0
 
 
 # Global event bus instance
 # Can be replaced with dependency injection if needed
 event_bus = EventBus()
+
+
+# ============================================================================
+# Event Subscription Helpers
+# ============================================================================
+
+
+def handles(*event_types: Type[Event]) -> Callable:
+    """Mark a method as handling specific event types.
+
+    Usage:
+        class MyHandler:
+            @handles(StageMoved, FocusChanged)
+            def _on_position_update(self, event):
+                ...
+
+    The decorated method will have a `_handles_events` attribute containing
+    the list of event types it handles. Use `auto_subscribe` to register
+    all decorated methods on an object.
+    """
+
+    def decorator(method: Callable) -> Callable:
+        method._handles_events = list(event_types)
+        return method
+
+    return decorator
+
+
+def auto_subscribe(obj: Any, event_bus: "EventBus") -> List[Tuple[Type[Event], Callable]]:
+    """Subscribe all @handles-decorated methods on obj to event_bus.
+
+    Args:
+        obj: Object with @handles-decorated methods
+        event_bus: EventBus to subscribe to
+
+    Returns:
+        List of (event_type, handler) tuples for later unsubscription.
+
+    Usage:
+        class MyHandler:
+            def __init__(self, event_bus):
+                self._subscriptions = auto_subscribe(self, event_bus)
+
+            @handles(StageMoved)
+            def _on_stage_moved(self, event):
+                ...
+
+            def shutdown(self):
+                auto_unsubscribe(self._subscriptions, event_bus)
+    """
+    subscriptions: List[Tuple[Type[Event], Callable]] = []
+    for name in dir(obj):
+        # Skip dunder attributes (e.g., __class__) to avoid matching class attributes
+        if name.startswith("__"):
+            continue
+        try:
+            method = getattr(obj, name, None)
+        except Exception:
+            # Some descriptors may raise; skip them
+            continue
+        if callable(method) and hasattr(method, "_handles_events"):
+            for event_type in method._handles_events:
+                event_bus.subscribe(event_type, method)
+                subscriptions.append((event_type, method))
+    return subscriptions
+
+
+def auto_unsubscribe(subscriptions: List[Tuple[Type[Event], Callable]], event_bus: "EventBus") -> None:
+    """Unsubscribe handlers previously registered via auto_subscribe.
+
+    Args:
+        subscriptions: List of (event_type, handler) tuples from auto_subscribe
+        event_bus: EventBus to unsubscribe from
+    """
+    for event_type, handler in subscriptions:
+        event_bus.unsubscribe(event_type, handler)
 
 
 # Common event types
@@ -246,6 +351,7 @@ class AcquisitionStarted(Event):
 
     experiment_id: str
     timestamp: float
+    base_path: str = ""
 
 
 @dataclass
@@ -255,6 +361,106 @@ class AcquisitionFinished(Event):
     success: bool
     experiment_id: str
     error: Optional[Exception] = None
+
+
+# -----------------------------------------------------------------------------
+# NDViewer Push-Based API Events
+# -----------------------------------------------------------------------------
+
+
+@dataclass
+class NDViewerStartAcquisition(Event):
+    """Configure NDViewer for push mode acquisition.
+
+    Emitted at acquisition start with all information needed to pre-allocate
+    the viewer's data structure for real-time image display.
+    """
+
+    channels: List[str]  # Channel names
+    num_z: int  # Number of z-levels
+    height: int  # Image height in pixels
+    width: int  # Image width in pixels
+    fov_labels: List[str]  # FOV labels (e.g., ["A1:0", "A1:1", "A2:0"])
+    experiment_id: str  # For correlation with AcquisitionStarted
+
+
+@dataclass
+class NDViewerImageRegistered(Event):
+    """Register a newly saved image file with NDViewer.
+
+    Emitted after each image is saved to disk during acquisition.
+    NDViewer uses this to immediately load and display the image.
+    """
+
+    t: int  # Timepoint index
+    fov_idx: int  # Flat FOV index (0-based, across all wells)
+    z: int  # Z-level index
+    channel: str  # Channel name
+    filepath: str  # Full path to the saved image file
+    experiment_id: str  # For filtering stale events
+
+
+@dataclass
+class NDViewerAcquisitionEnded(Event):
+    """Mark NDViewer acquisition as ended.
+
+    Emitted when acquisition completes (success or abort).
+    The viewer remains usable for navigating the acquired data.
+    """
+
+    experiment_id: str
+    dataset_path: Optional[str] = None  # Path to dataset folder for file-based loading
+
+
+@dataclass
+class NDViewerStartZarrAcquisition(Event):
+    """Configure NDViewer for zarr-based live acquisition.
+
+    Emitted at acquisition start when using ZARR_V3 format.
+    The viewer opens zarr stores for real-time display.
+    """
+
+    fov_paths: List[str]  # Zarr paths per FOV
+    channels: List[str]  # Channel names
+    num_z: int  # Number of z-levels
+    fov_labels: List[str]  # FOV labels (e.g., ["A1:0", "A1:1"])
+    height: int  # Image height in pixels
+    width: int  # Image width in pixels
+    experiment_id: str  # For correlation
+
+
+@dataclass
+class NDViewerStartZarrAcquisition6D(Event):
+    """Configure NDViewer for 6D multi-region zarr acquisition.
+
+    Emitted at acquisition start when using ZARR_V3 format with 6D FOV dimension.
+    Each region has a single zarr store with shape (FOV, T, C, Z, Y, X).
+    """
+
+    region_paths: List[str]  # Zarr paths per region
+    channels: List[str]  # Channel names
+    num_z: int  # Number of z-levels
+    fovs_per_region: List[int]  # FOV counts per region
+    height: int  # Image height in pixels
+    width: int  # Image width in pixels
+    region_labels: List[str]  # Region labels
+    experiment_id: str  # For correlation
+
+
+@dataclass
+class NDViewerZarrFrameWritten(Event):
+    """Notify NDViewer that a zarr frame was written to disk.
+
+    Emitted after each frame is written to the zarr store,
+    allowing the viewer to refresh from the zarr data.
+    """
+
+    t: int  # Timepoint index
+    fov_idx: int  # FOV index (flat for 5D, local for 6D)
+    z: int  # Z-level index
+    channel: str  # Channel name
+    experiment_id: str  # For filtering stale events
+    region_idx: int = 0  # Region index (for 6D mode)
 
 
 @dataclass
@@ -918,6 +1124,320 @@ class FluidicsInitialized(Event):
     pass
 
 
+@dataclass
+class FluidicsOperationStarted(Event):
+    """Emitted BEFORE a fluidics driver method is called.
+
+    Allows UI to show operation in progress.
+
+    Note: Would ideally be frozen=True but Event base class is not frozen.
+    """
+
+    operation: str  # "flow", "prime", "wash", "empty_syringe"
+    port: Optional[int] = None
+    solution: Optional[str] = None
+    volume_ul: float = 0.0
+    flow_rate_ul_per_min: float = 0.0
+
+
+@dataclass
+class FluidicsOperationProgress(Event):
+    """Emitted periodically during long fluidics operations.
+
+    Provides real-time progress feedback for flow operations.
+    Emitted every ~1 second during flow/wash/prime operations.
+    """
+
+    operation: str
+    progress_percent: float
+    elapsed_seconds: float
+    remaining_seconds: Optional[float] = None
+    syringe_volume_ul: Optional[float] = None
+
+
+@dataclass
+class FluidicsPhaseChanged(Event):
+    """Emitted when operation phase changes within a fluidics operation.
+
+    Provides real-time feedback about what the hardware is doing:
+    - aspirating: Drawing liquid into syringe from a port
+    - dispensing: Pushing liquid out of syringe to a port
+    - valve_switching: Moving selector valve to a different port
+
+    This enables UI to show detailed state (e.g., "Aspirating from port 5").
+    """
+
+    phase: str  # "aspirating", "dispensing", "valve_switching"
+    port: Optional[int] = None
+    solution: Optional[str] = None
+    volume_ul: Optional[float] = None
+    flow_rate_ul_per_min: Optional[float] = None
+
+
+@dataclass
+class FluidicsOperationCompleted(Event):
+    """Emitted AFTER a fluidics driver method returns.
+
+    Contains success/failure status and timing information.
+    """
+
+    operation: str
+    success: bool
+    error_message: Optional[str] = None
+    duration_seconds: float = 0.0
+
+
+@dataclass
+class FluidicsIncubationStarted(Event):
+    """Emitted when an incubation period begins.
+
+    Incubation is a timed wait period after flowing a solution,
+    allowing reagents to bind or react.
+    """
+
+    duration_seconds: float
+    solution: Optional[str] = None
+
+
+@dataclass
+class FluidicsIncubationProgress(Event):
+    """Emitted periodically (~1 second) during incubation.
+
+    Allows UI to display countdown timer.
+    """
+
+    elapsed_seconds: float
+    remaining_seconds: float
+    progress_percent: float
+
+
+@dataclass
+class FluidicsIncubationCompleted(Event):
+    """Emitted when incubation ends (completed or aborted).
+
+    Args:
+        completed: True if incubation finished normally, False if aborted.
+    """
+
+    completed: bool
+
+
+@dataclass
+class FluidicsStatusChanged(Event):
+    """Emitted when fluidics system status changes.
+
+    Fired after operations complete or on error. The status field uses
+    FluidicsOperationStatus.value string for serialization compatibility.
+    """
+
+    status: str  # FluidicsOperationStatus.value string for serialization
+    current_port: Optional[int] = None
+    current_solution: Optional[str] = None
+    syringe_volume_ul: Optional[float] = None
+    is_busy: bool = False
+    error_message: Optional[str] = None
+
+
+@dataclass
+class FluidicsSequenceStarted(Event):
+    """Emitted when a fluidics sequence begins execution.
+
+    A sequence is a series of operations (flow, incubate, etc.) loaded
+    from a CSV file and executed step by step.
+    """
+
+    sequence_name: str
+    total_steps: int
+
+
+@dataclass
+class FluidicsSequenceStepStarted(Event):
+    """Emitted when a step within a sequence begins.
+
+    Provides context about the current position in the sequence and
+    what operation is being performed.
+    """
+
+    step_index: int  # 0-based index
+    total_steps: int
+    step_description: str  # Human-readable description of current step
+    next_step_description: Optional[str] = None  # Preview of next step
+
+
+@dataclass
+class FluidicsSequenceCompleted(Event):
+    """Emitted when a fluidics sequence finishes (completed or aborted).
+
+    Args:
+        sequence_name: Name of the completed sequence.
+        success: True if all steps completed, False if aborted or errored.
+        steps_completed: Number of steps that were executed.
+        total_steps: Total steps in the sequence.
+    """
+
+    sequence_name: str
+    success: bool
+    steps_completed: int
+    total_steps: int
+
+
+# ============================================================================
+# Fluidics Controller Events
+# ============================================================================
+
+
+@dataclass
+class RunFluidicsProtocolCommand(Event):
+    """Command to run a named fluidics protocol.
+
+    The FluidicsController will look up the protocol by name and execute it.
+    """
+
+    protocol_name: str
+
+
+@dataclass
+class LoadFluidicsProtocolsCommand(Event):
+    """Command to load fluidics protocols from a YAML file."""
+
+    path: str
+
+
+@dataclass
+class PauseFluidicsCommand(Event):
+    """Command to pause fluidics protocol execution.
+
+    The controller will pause at the next checkpoint (between steps).
+    """
+
+    pass
+
+
+@dataclass
+class ResumeFluidicsCommand(Event):
+    """Command to resume paused fluidics protocol execution."""
+
+    pass
+
+
+@dataclass
+class StopFluidicsCommand(Event):
+    """Command to stop fluidics protocol execution.
+
+    Aborts the current operation and transitions to STOPPED state.
+    """
+
+    pass
+
+
+@dataclass
+class EmergencyStopFluidicsCommand(Event):
+    """Command to LATCH an emergency stop on the fluidics.
+
+    Immediately halts the pump (mid-move) and refuses any further protocol until
+    a ClearFluidicsEmergencyStopCommand re-arms it. Distinct from
+    StopFluidicsCommand, which is graceful and auto-re-armable on the next run.
+    """
+
+    pass
+
+
+@dataclass
+class ClearFluidicsEmergencyStopCommand(Event):
+    """Command to re-arm the fluidics after a latched emergency stop."""
+
+    pass
+
+
+@dataclass
+class SkipFluidicsStepCommand(Event):
+    """Command to skip the current step and move to the next one.
+
+    Args:
+        empty_syringe: If True, empty syringe to waste before next step.
+    """
+
+    empty_syringe: bool = True
+
+
+@dataclass
+class FluidicsControllerStateChanged(Event):
+    """Emitted when the FluidicsController state machine changes state.
+
+    Args:
+        old_state: Previous state name (e.g., "IDLE", "RUNNING")
+        new_state: New state name
+        protocol_name: Name of currently loaded/running protocol, if any
+    """
+
+    old_state: str
+    new_state: str
+    protocol_name: Optional[str] = None
+
+
+@dataclass
+class FluidicsProtocolStarted(Event):
+    """Emitted when a named protocol begins execution.
+
+    Provides protocol metadata for UI progress display.
+    """
+
+    protocol_name: str
+    total_steps: int
+    estimated_duration_s: float
+
+
+@dataclass
+class FluidicsProtocolStepStarted(Event):
+    """Emitted when a step within a protocol begins execution.
+
+    Provides context about the current position and operation.
+    """
+
+    protocol_name: str
+    step_index: int  # 0-based
+    total_steps: int  # Total steps in protocol
+    step_description: str
+    next_step_description: Optional[str] = None
+    estimated_remaining_s: Optional[float] = None
+
+
+@dataclass
+class FluidicsProtocolCompleted(Event):
+    """Emitted when a protocol finishes (completed, stopped, or failed).
+
+    Args:
+        protocol_name: Name of the protocol that was running.
+        success: True if all steps completed successfully.
+        steps_completed: Number of steps that were executed.
+        total_steps: Total steps in the protocol.
+        error_message: Error message if success is False.
+    """
+
+    protocol_name: str
+    success: bool
+    steps_completed: int
+    total_steps: int
+    error_message: Optional[str] = None
+
+
+@dataclass
+class FluidicsProtocolsLoaded(Event):
+    """Emitted when fluidics protocols are loaded."""
+
+    path: str
+    protocols: Dict[str, Any]
+    validation_warnings: Optional[Dict[str, list]] = None
+
+
+@dataclass
+class FluidicsProtocolsLoadFailed(Event):
+    """Emitted when fluidics protocol loading fails."""
+
+    path: str
+    error_message: str
+
+
 # ============================================================================
 # Laser Autofocus Events
 # ============================================================================
@@ -931,145 +1451,46 @@ class LaserAFCrossCorrelationResult(Event):
 
 
 # ============================================================================
-# Focus Lock Events
-# ============================================================================
-
-FocusLockStatus = Literal["disabled", "ready", "locked", "recovering", "searching", "lost", "paused"]
-
-
-@dataclass
-class FocusLockModeChanged(Event):
-    """Notification that focus lock mode changed."""
-
-    mode: FocusLockMode
-
-
-@dataclass
-class FocusLockStatusChanged(Event):
-    """Notification that focus lock status changed."""
-
-    is_locked: bool
-    status: FocusLockStatus
-    lock_buffer_fill: int
-    lock_buffer_length: int
-
-
-@dataclass
-class FocusLockMetricsUpdated(Event):
-    """Focus lock metrics update."""
-
-    z_error_um: float
-    z_position_um: float
-    spot_snr: float
-    spot_intensity: float
-    z_error_rms_um: float
-    drift_rate_um_per_s: float
-    is_good_reading: bool
-    correlation: float
-    spot_offset_px: float = float("nan")  # Spot offset from reference in pixels
-    piezo_delta_um: float = float("nan")  # Piezo position change from lock reference
-    lock_buffer_fill: int = 0  # Current lock buffer fill level
-    lock_buffer_length: int = 5  # Total lock buffer length
-    lock_quality: float = 1.0  # Smoothed RMS-based quality (0-1, higher is better)
-
-
-@dataclass
-class FocusLockWarning(Event):
-    """Focus lock warning notification."""
-
-    warning_type: str
-    message: str
-
-
-# ============================================================================
-# Focus Lock Commands
-# ============================================================================
-
-
-@dataclass
-class SetFocusLockModeCommand(Event):
-    """Command to set focus lock mode."""
-
-    mode: FocusLockMode
-
-
-@dataclass
-class StartFocusLockCommand(Event):
-    """Command to start focus lock."""
-
-    target_um: float = 0.0
-
-
-@dataclass
-class StopFocusLockCommand(Event):
-    """Command to stop focus lock."""
-
-    pass
-
-
-@dataclass
-class PauseFocusLockCommand(Event):
-    """Command to pause focus lock."""
-
-    pass
-
-
-@dataclass
-class ResumeFocusLockCommand(Event):
-    """Command to resume focus lock."""
-
-    pass
-
-
-@dataclass
-class AdjustFocusLockTargetCommand(Event):
-    """Command to adjust focus lock target by a relative offset."""
-
-    delta_um: float
-
-
-@dataclass
-class SetFocusLockReferenceCommand(Event):
-    """Command to set/lock the current position as the focus lock reference.
-
-    This forces the focus lock to immediately lock at the current Z position,
-    bypassing the normal buffer fill acquisition process.
-    """
-
-    pass
-
-
-@dataclass
-class ReleaseFocusLockReferenceCommand(Event):
-    """Command to release the focus lock reference.
-
-    This clears the lock and returns to 'searching' state while keeping
-    the focus lock loop running.
-    """
-
-    pass
-
-
-@dataclass
-class SetFocusLockAutoSearchCommand(Event):
-    """Command to enable or disable auto-search on lock loss."""
-
-    enabled: bool
-
-
-@dataclass
-class FocusLockSearchProgress(Event):
-    """Progress update during piezo sweep search."""
-
-    phase: str  # "last_position" or "sweep"
-    current_position_um: float
-    search_min_um: float
-    search_max_um: float
-
-
-# ============================================================================
 # Acquisition Commands
 # ============================================================================
+
+
+class AutofocusMode(str, Enum):
+    """Autofocus mode used for acquisition workflows."""
+
+    NONE = "none"
+    CONTRAST = "contrast"
+    LASER_REFLECTION = "laser_reflection"
+    FOCUS_LOCK = "focus_lock"
+    # FOCUS_LOCK_PER_FOV: lock is stopped during fluidics (no laser on, no
+    # piezo corrections). Before each FOV's imaging, the piezo is restored to
+    # that FOV's last known good Z (or a global seed on round 1), lock is
+    # engaged via acquire_lock_reference(), imaged, new Z saved. This
+    # avoids lock-loss from fluidics flow disturbing the sample.
+    FOCUS_LOCK_PER_FOV = "focus_lock_per_fov"
+
+
+@dataclass(frozen=True)
+class FocusLockSettings:
+    """Focus-lock specific acquisition settings."""
+
+    buffer_length: int = 5
+    recovery_attempts: int = 3
+    min_spot_snr: float = 10.0
+    acquire_threshold_um: float = 0.25
+    maintain_threshold_um: float = 0.5
+    auto_search_enabled: bool = False
+    lock_timeout_s: float = 5.0
+    # Used by FOCUS_LOCK_PER_FOV mode (PerFOVFocusLockStrategy)
+    per_fov_max_attempts: int = 2
+    per_fov_settle_s: float = 0.2
+    # Tier 2.5 bounded piezo sweep re-acquire (kept in sync with
+    # imaging_protocol.FocusLockConfig, whose model_dump() is splatted into this
+    # dataclass in imaging_executor). Enables re-grabbing a chamber that shifted
+    # in Z beyond the AF window at the seed.
+    per_fov_sweep_enabled: bool = True
+    per_fov_sweep_range_um: float = 20.0
+    per_fov_sweep_step_um: float = 2.0
 
 
 @dataclass
@@ -1085,14 +1506,46 @@ class SetAcquisitionParametersCommand(Event):
     delta_t_s: Optional[float] = None
     n_t: Optional[int] = None
     use_piezo: Optional[bool] = None
-    use_autofocus: Optional[bool] = None
-    use_reflection_af: Optional[bool] = None
+    autofocus_mode: Optional[AutofocusMode] = None
+    autofocus_interval_fovs: Optional[int] = None
+    focus_lock_settings: Optional[FocusLockSettings] = None
     gen_focus_map: Optional[bool] = None
     use_manual_focus_map: Optional[bool] = None
     z_range: Optional[Tuple[float, float]] = None
     focus_map: Optional[Any] = None
-    use_fluidics: Optional[bool] = None
     skip_saving: Optional[bool] = None
+    z_stacking_config: Optional[int] = None  # 0=FROM BOTTOM, 1=FROM CENTER, 2=FROM TOP
+
+    # Widget context for YAML saving
+    widget_type: Optional[str] = None  # "wellplate" or "flexible"
+    scan_size_mm: Optional[float] = None  # For wellplate mode
+    overlap_percent: Optional[float] = None  # FOV overlap percentage
+
+
+@dataclass
+class ApplyImagingProtocolCommand(Event):
+    """Command to apply an imaging protocol to the acquisition setup GUI.
+
+    Published by the orchestrator / ImagingExecutor so that the GUI reflects
+    the protocol that the backend is about to execute.
+    """
+
+    protocol: Any  # ImagingProtocol — typed as Any to avoid circular imports
+
+
+@dataclass
+class RequestImagingProtocolReadback(Event):
+    """Request AcquisitionSetupWidget to build and return its current ImagingProtocol."""
+
+    request_id: str
+
+
+@dataclass
+class ImagingProtocolReadbackReady(Event):
+    """Response with the GUI-built ImagingProtocol."""
+
+    request_id: str
+    protocol: Any  # ImagingProtocol
 
 
 @dataclass
@@ -1202,12 +1655,17 @@ class CurrentFOVRegistered(Event):
     """Emitted when a new FOV is acquired during multipoint acquisition.
 
     Used by NavigationViewer to draw the scan grid and track progress.
+
+    experiment_id identifies the acquisition run that produced this event so
+    consumers on the shared EventBus can filter out FOVs from a different run.
+    Defaults to "" for callers that do not set it.
     """
 
     x_mm: float
     y_mm: float
     fov_width_mm: float = 0.0  # FOV width at time of acquisition
     fov_height_mm: float = 0.0  # FOV height at time of acquisition
+    experiment_id: str = ""
 
 
 @dataclass
@@ -1215,12 +1673,18 @@ class AcquisitionCoordinates(Event):
     """Emitted during acquisition with current position and region info.
 
     Used for tracking acquisition progress with spatial context.
+
+    experiment_id identifies the acquisition run that produced this event, so
+    consumers on the shared EventBus can filter out coordinates from a different
+    (e.g. previous) acquisition - mirroring AcquisitionWorkerFinished. Defaults
+    to "" for callers that do not set it.
     """
 
     x_mm: float
     y_mm: float
     z_mm: float
     region_id: int
+    experiment_id: str = ""
 
 
 # ============================================================================
@@ -1257,18 +1721,6 @@ class AcquisitionWorkerProgress(Event):
     total_fovs: int
     current_timepoint: int
     total_timepoints: int
-
-
-# ============================================================================
-# Fluidics Commands
-# ============================================================================
-
-
-@dataclass
-class SetFluidicsRoundsCommand(Event):
-    """Command to set fluidics rounds for acquisition."""
-
-    rounds: list  # List of round numbers
 
 
 # ============================================================================
@@ -1378,6 +1830,18 @@ class SetLaserAFCharacterizationModeCommand(Event):
 @dataclass
 class UpdateLaserAFThresholdCommand(Event):
     """Command to update threshold properties."""
+
+    updates: dict
+
+
+@dataclass
+class UpdateLaserAFLiveParamsCommand(Event):
+    """Update laser AF parameters live without invalidating initialization.
+
+    Use for camera exposure/gain, spot detection params, and tolerance settings
+    that the running spot detector reads each frame. Does NOT clear is_initialized,
+    so the continuous focus lock keeps running while parameters are tuned.
+    """
 
     updates: dict
 
@@ -1762,37 +2226,6 @@ class PlateReaderLocationChanged(Event):
 
 
 # ============================================================================
-# Displacement Measurement Commands
-# ============================================================================
-
-
-@dataclass
-class SetDisplacementMeasurementSettingsCommand(Event):
-    """Command to update displacement measurement settings."""
-
-    x_offset: float
-    y_offset: float
-    x_scaling: float
-    y_scaling: float
-    n_average: int
-    n: int
-
-
-@dataclass
-class SetWaveformDisplayNCommand(Event):
-    """Command to update waveform display N parameter."""
-
-    n: int
-
-
-@dataclass
-class DisplacementReadingsChanged(Event):
-    """Notification that displacement readings have changed."""
-
-    readings: List[float]
-
-
-# ============================================================================
 # Global Mode Events
 # ============================================================================
 
@@ -1919,7 +2352,15 @@ class ImageCoordinateClickedCommand(Event):
 
 @dataclass
 class ClearScanCoordinatesCommand(Event):
-    """Command to clear all scan coordinate regions."""
+    """Command to clear all scan coordinate regions.
+
+    Attributes:
+        clear_displayed_fovs:
+            When True, UI viewers should also clear any currently displayed FOV
+            overlays (including completed FOVs), not just pending scan regions.
+    """
+
+    clear_displayed_fovs: bool = False
 
 
 @dataclass
@@ -1983,8 +2424,22 @@ class ManualShapesChanged(Event):
 
 
 @dataclass
+class ClearManualShapesCommand(Event):
+    """UI command: clear all manual ROI shapes from the mosaic view."""
+
+    pass
+
+
+@dataclass
 class MosaicLayersInitialized(Event):
     """UI state event: mosaic viewer layers initialized."""
+
+    pass
+
+
+@dataclass
+class MosaicLayersCleared(Event):
+    """UI state event: mosaic viewer layers were cleared (coordinate system lost)."""
 
     pass
 
@@ -2012,6 +2467,7 @@ class LoadScanCoordinatesCommand(Event):
 
     region_fov_coordinates: Dict[str, Tuple[Tuple[float, ...], ...]]
     region_centers: Optional[Dict[str, Tuple[float, ...]]] = None
+    apply: bool = True
 
 
 @dataclass
@@ -2182,18 +2638,32 @@ class FocusLockWarning(Event):
 
 
 @dataclass
-class FocusLockFrameUpdated(Event):
-    """Cropped AF spot region for widget preview.
+class FocusLockPiezoLimitCritical(Event):
+    """Critical warning when piezo approaches its range limits.
 
-    Published at ~10 Hz when focus lock is active. Contains a small
-    cropped region around the detected spot for display in the widget.
+    Published when the piezo is within piezo_critical_margin_um of its limits.
+    The acquisition system should subscribe to this to take preventive action
+    (e.g., pause, warn operator) before the focus lock becomes unrecoverable.
     """
 
-    frame: np.ndarray  # Small cropped region around spot (grayscale)
-    spot_x_px: float  # Centroid x position in cropped frame
-    spot_y_px: float  # Centroid y position in cropped frame
-    frame_width: int  # Width of the cropped frame
-    frame_height: int  # Height of the cropped frame
+    direction: str  # "low" or "high"
+    position_um: float
+    limit_um: float
+    margin_um: float
+
+
+@dataclass
+class FocusLockFrameUpdated(Event):
+    """AF camera frame for focus lock widget preview.
+
+    Published at ~10 Hz when focus lock is active.
+    """
+
+    frame: np.ndarray  # Grayscale AF camera frame
+    spot_x_px: float  # Centroid x position in frame
+    spot_y_px: float  # Centroid y position in frame
+    frame_width: int  # Frame width
+    frame_height: int  # Frame height
     spot_valid: bool = True  # Whether spot detection succeeded (draw marker only if True)
 
 
@@ -2273,3 +2743,69 @@ class FocusLockSearchProgress(Event):
     current_position_um: float
     search_min_um: float
     search_max_um: float
+
+
+# ============================================================================
+# Acquisition Preset Save/Load Commands
+# ============================================================================
+
+
+@dataclass
+class SaveAcquisitionPresetCommand(Event):
+    """Command to save current acquisition settings as a preset.
+
+    The handler (typically the multipoint widget) will gather all current
+    settings and save them to the experiment folder.
+    """
+
+    experiment_path: str
+
+
+@dataclass
+class LoadAcquisitionPresetCommand(Event):
+    """Command to load acquisition settings from a preset file.
+
+    The handler (typically the multipoint widget) will parse the YAML file
+    and apply the settings to the UI.
+    """
+
+    file_path: str
+
+
+@dataclass
+class AcquisitionPresetSaved(Event):
+    """Notification that acquisition preset was saved."""
+
+    file_path: str
+    success: bool
+    error_message: Optional[str] = None
+
+
+@dataclass
+class AcquisitionPresetLoaded(Event):
+    """Notification that acquisition preset was loaded."""
+
+    file_path: str
+    success: bool
+    error_message: Optional[str] = None
+
+
+# ============================================================================
+# Focus Lock Parameter Commands (for multipoint acquisition settings)
+# ============================================================================
+
+
+@dataclass
+class SetFocusLockParamsCommand(Event):
+    """Command to set focus lock parameters for acquisition.
+
+    These parameters configure how focus lock behaves during multi-point
+    acquisition. Different from SetFocusLockModeCommand which enables/disables
+    the focus lock.
+    """
+
+    buffer_length: Optional[int] = None  # Sequential good readings to acquire lock
+    recovery_attempts: Optional[int] = None  # Retry cycles before declaring lost
+    min_spot_snr: Optional[float] = None  # Minimum spot signal-to-noise ratio
+    acquire_threshold_um: Optional[float] = None  # Max displacement to count as "good"
+    maintain_threshold_um: Optional[float] = None  # Looser threshold once locked

@@ -1,0 +1,18 @@
+name: "Resource File Paths Imaging Only Test"
+version: "3.0"
+description: "Imaging-only config that auto-loads FOVs and uses individual protocol files."
+output_directory: ../outputs
+
+resources:
+  fluidics_config_file: ../fluidics/simulation_fluidics.json
+  fov_file: ../fov_positions/test_2fov_simple.csv
+
+rounds:
+  - name: "Brightfield Check"
+    steps:
+      - step_type: imaging
+        protocol: resource_files/protocols/bf_quick.yaml
+  - name: "Override Imaging Pass"
+    steps:
+      - step_type: imaging
+        protocol: resource_files/protocols/fluorescence_405_fast.yaml

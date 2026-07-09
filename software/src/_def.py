@@ -149,8 +149,7 @@ class Acquisition:
     DZ = 1.5
     NX = 1
     NY = 1
-    # Multiprocessing save jobs can cause UI stalls on macOS; default off.
-    USE_MULTIPROCESSING = False
+    USE_MULTIPROCESSING = True
 
 
 class PosUpdate:
@@ -170,6 +169,28 @@ MULTIPOINT_DISPLAY_IMAGES = False
 # If MULTIPOINT_DISPLAY_IMAGES is False, emit every Nth image to mosaic (0 = never).
 # Default to showing a periodic update so the mosaic is populated without swamping the UI.
 MULTIPOINT_DISPLAY_EVERY_NTH = 5
+
+# --- Per-round excitation-laser warm-up -----------------------------------
+# Some laser engines go to standby between rounds (during fluidics) and take a
+# few firings to reach full power, so the first FOVs of a round come out dark.
+# When enabled, each excitation laser used in the round is pulsed briefly at LOW
+# power before the FOV loop to wake it. The pulse fires at the current stage
+# position, so keep it short/low to avoid photobleaching the first FOV.
+ILLUMINATION_WARMUP_ENABLED = True
+ILLUMINATION_WARMUP_S = 0.4  # Seconds each laser is held on to warm up.
+# Warm-up power as a fraction of the channel's acquisition intensity (0-1).
+# Low by design to minimize bleaching while still driving diode current.
+ILLUMINATION_WARMUP_FRACTION = 0.1
+
+# Backpressure/throttling settings for acquisition
+# Prevents RAM exhaustion during high-speed acquisitions by throttling when limits are exceeded.
+ACQUISITION_THROTTLING_ENABLED = True
+ACQUISITION_MAX_PENDING_JOBS = 10  # Max jobs queued before throttling
+ACQUISITION_MAX_PENDING_MB = 500.0  # Max MB of image data pending before throttling
+ACQUISITION_THROTTLE_TIMEOUT_S = 30.0  # Timeout waiting for capacity
+
+# Memory profiling (for development/debugging)
+ENABLE_MEMORY_PROFILING = True
 
 
 class MCU_PINS:
@@ -197,6 +218,7 @@ class CMD_SET:
     MOVE_Z = 2
     MOVE_THETA = 3
     MOVE_W = 4
+    MOVE_W2 = 19
     HOME_OR_ZERO = 5
     TURN_ON_ILLUMINATION = 10
     TURN_OFF_ILLUMINATION = 11
@@ -225,7 +247,16 @@ class CMD_SET:
     SET_STROBE_DELAY = 31
     SET_AXIS_DISABLE_ENABLE = 32
     SET_TRIGGER_MODE = 33
+    # Multi-port illumination commands (firmware v1.0+)
+    SET_PORT_INTENSITY = 34  # Set DAC intensity for specific port only
+    TURN_ON_PORT = 35  # Turn on GPIO for specific port
+    TURN_OFF_PORT = 36  # Turn off GPIO for specific port
+    SET_PORT_ILLUMINATION = 37  # Set intensity + on/off in one command
+    SET_MULTI_PORT_MASK = 38  # Set on/off for multiple ports (partial update)
+    TURN_OFF_ALL_PORTS = 39  # Turn off all illumination ports
+    SET_ILLUMINATION_TIMEOUT = 40  # Set auto-shutoff timeout for illumination
     SET_PIN_LEVEL = 41
+    INITFILTERWHEEL_W2 = 252
     INITFILTERWHEEL = 253
     INITIALIZE = 254
     RESET = 255
@@ -255,6 +286,7 @@ class AXIS:
     THETA = 3
     XY = 4
     W = 5
+    W2 = 6
 
 
 class LIMIT_CODE:
@@ -276,6 +308,19 @@ class LIMIT_SWITCH_POLARITY:
 
 
 class ILLUMINATION_CODE:
+    """Illumination source codes for MCU communication.
+
+    LED Matrix Patterns (USB ports):
+        USB1-USB8 map to pattern codes 0-8+.
+
+    Illumination Control TTL Ports (D1-D5):
+        Port-based names (ILLUMINATION_D1-D5) are preferred for new code.
+        Wavelength-based names (ILLUMINATION_SOURCE_405NM, etc.) are kept as
+        aliases for backward compatibility. The actual wavelength is configured
+        in the illumination_channel_config.yaml file, not hardcoded here.
+    """
+
+    # LED matrix patterns (USB ports)
     ILLUMINATION_SOURCE_LED_ARRAY_FULL = 0
     ILLUMINATION_SOURCE_LED_ARRAY_LEFT_HALF = 1
     ILLUMINATION_SOURCE_LED_ARRAY_RIGHT_HALF = 2
@@ -286,11 +331,94 @@ class ILLUMINATION_CODE:
     ILLUMINATION_SOURCE_LED_ARRAY_TOP_HALF = 7
     ILLUMINATION_SOURCE_LED_ARRAY_BOTTOM_HALF = 8
     ILLUMINATION_SOURCE_LED_EXTERNAL_FET = 20
-    ILLUMINATION_SOURCE_405NM = 11
-    ILLUMINATION_SOURCE_488NM = 12
-    ILLUMINATION_SOURCE_638NM = 13
-    ILLUMINATION_SOURCE_561NM = 14
-    ILLUMINATION_SOURCE_730NM = 15
+
+    # Illumination Control TTL Ports - port-based names (preferred)
+    # Note: D3/D4 source codes are non-sequential (14, 13) for historical API compatibility
+    ILLUMINATION_D1 = 11
+    ILLUMINATION_D2 = 12
+    ILLUMINATION_D3 = 14
+    ILLUMINATION_D4 = 13
+    ILLUMINATION_D5 = 15
+
+    # Illumination Control TTL Ports - legacy wavelength-based names (deprecated, kept for compatibility)
+    ILLUMINATION_SOURCE_405NM = ILLUMINATION_D1
+    ILLUMINATION_SOURCE_488NM = ILLUMINATION_D2
+    ILLUMINATION_SOURCE_638NM = ILLUMINATION_D4
+    ILLUMINATION_SOURCE_561NM = ILLUMINATION_D3
+    ILLUMINATION_SOURCE_730NM = ILLUMINATION_D5
+
+
+class ILLUMINATION_PORT:
+    """Port indices for multi-port illumination control (firmware v1.0+).
+
+    Port indices (0-15) for up to 16 illumination ports.
+    These are used with the new multi-port illumination commands
+    (SET_PORT_INTENSITY, TURN_ON_PORT, etc.).
+
+    Note: These are port indices, NOT the legacy source codes (11-15).
+    For legacy source codes, use ILLUMINATION_CODE.ILLUMINATION_D1, etc.
+    """
+
+    D1 = 0
+    D2 = 1
+    D3 = 2
+    D4 = 3
+    D5 = 4
+
+
+def source_code_to_port_index(source_code: int) -> int:
+    """Map legacy illumination source code to port index.
+
+    Legacy source codes are non-sequential for historical API compatibility:
+        D1 = 11, D2 = 12, D3 = 14, D4 = 13, D5 = 15
+    Note: D3 and D4 are swapped!
+
+    Args:
+        source_code: Legacy source code (11-15 for D1-D5)
+
+    Returns:
+        Port index (0-4), or -1 for unknown source codes
+    """
+    mapping = {
+        ILLUMINATION_CODE.ILLUMINATION_D1: 0,  # 11 -> 0
+        ILLUMINATION_CODE.ILLUMINATION_D2: 1,  # 12 -> 1
+        ILLUMINATION_CODE.ILLUMINATION_D3: 2,  # 14 -> 2 (non-sequential!)
+        ILLUMINATION_CODE.ILLUMINATION_D4: 3,  # 13 -> 3 (non-sequential!)
+        ILLUMINATION_CODE.ILLUMINATION_D5: 4,  # 15 -> 4
+    }
+    return mapping.get(source_code, -1)
+
+
+def port_index_to_source_code(port_index: int) -> int:
+    """Map port index to legacy illumination source code.
+
+    Args:
+        port_index: Port index (0-4 for D1-D5)
+
+    Returns:
+        Legacy source code (11-15), or -1 for invalid port index
+    """
+    mapping = {
+        0: ILLUMINATION_CODE.ILLUMINATION_D1,  # 0 -> 11
+        1: ILLUMINATION_CODE.ILLUMINATION_D2,  # 1 -> 12
+        2: ILLUMINATION_CODE.ILLUMINATION_D3,  # 2 -> 14
+        3: ILLUMINATION_CODE.ILLUMINATION_D4,  # 3 -> 13
+        4: ILLUMINATION_CODE.ILLUMINATION_D5,  # 4 -> 15
+    }
+    return mapping.get(port_index, -1)
+
+
+# Response byte indices for microcontroller packet parsing
+RESPONSE_BYTE_PORT_STATUS = 19  # Illumination port on/off status (firmware v1.1+)
+RESPONSE_BYTE_FIRMWARE_VERSION = 22  # Firmware version nibble-encoded
+
+# Illumination safety timeout (firmware auto-shutoff)
+NUM_TIMEOUT_PORTS = 5  # D1-D5 (ports 0-4) have timeout protection
+DEFAULT_ILLUMINATION_TIMEOUT_MS = 3000  # 3 seconds (matches firmware)
+MAX_ILLUMINATION_TIMEOUT_MS = 3600000  # 1 hour (matches firmware)
+
+# Configurable timeout in seconds (0 = use firmware default of 3s)
+ILLUMINATION_TIMEOUT_S = DEFAULT_ILLUMINATION_TIMEOUT_MS / 1000.0
 
 
 class VOLUMETRIC_IMAGING:
@@ -327,15 +455,15 @@ class FileSavingOption(Enum):
     """File saving options.
 
     INDIVIDUAL_IMAGES: Save each image as a separate file. Format is defined in Acquisition.IMAGE_FORMAT.
-    TODO: Move all file saving related settings to this enum.
     MULTI_PAGE_TIFF: Save all images from a single FOV as a single multi-page TIFF file.
     OME_TIFF: Save data to OME-TIFF stacks with full metadata.
-    TODO: Add zarr saving options.
+    ZARR_V3: Save data to Zarr v3 format with sharding.
     """
 
     INDIVIDUAL_IMAGES = "INDIVIDUAL_IMAGES"
     MULTI_PAGE_TIFF = "MULTI_PAGE_TIFF"
     OME_TIFF = "OME_TIFF"
+    ZARR_V3 = "ZARR_V3"
 
     @staticmethod
     def convert_to_enum(option: Union[str, "FileSavingOption"]) -> "FileSavingOption":
@@ -349,6 +477,56 @@ class FileSavingOption(Enum):
             return FileSavingOption[option.upper()]
         except KeyError:
             raise ValueError(f"Invalid file saving option: {option}")
+
+
+class ZarrChunkMode(Enum):
+    """Zarr chunk size configuration.
+
+    FULL_FRAME: Each chunk is a full image plane (simplest, default).
+    TILED_512: 512x512 pixel chunks for tiled visualization.
+    TILED_256: 256x256 pixel chunks for fine-grained streaming.
+    """
+
+    FULL_FRAME = "full_frame"
+    TILED_512 = "tiled_512"
+    TILED_256 = "tiled_256"
+
+    @staticmethod
+    def convert_to_enum(option: Union[str, "ZarrChunkMode"]) -> "ZarrChunkMode":
+        """Convert string or enum to ZarrChunkMode enum."""
+        if isinstance(option, ZarrChunkMode):
+            return option
+        try:
+            return ZarrChunkMode(option.lower())
+        except ValueError:
+            raise ValueError(
+                f"Invalid zarr chunk mode: '{option}'. Expected 'full_frame', 'tiled_512', or 'tiled_256'."
+            )
+
+
+class ZarrCompression(Enum):
+    """Zarr compression presets optimized for different use cases.
+
+    NONE: No compression, maximum write speed (~2x faster than TIFF).
+    FAST: blosc-lz4, ~1000 MB/s encode, ~2x compression ratio. Safe for 10-20 fps.
+    BALANCED: blosc-zstd level 3, ~500 MB/s encode, ~3-4x compression ratio.
+    BEST: blosc-zstd level 9, slowest but best compression ratio.
+    """
+
+    NONE = "none"
+    FAST = "fast"
+    BALANCED = "balanced"
+    BEST = "best"
+
+    @staticmethod
+    def convert_to_enum(option: Union[str, "ZarrCompression"]) -> "ZarrCompression":
+        """Convert string or enum to ZarrCompression enum."""
+        if isinstance(option, ZarrCompression):
+            return option
+        try:
+            return ZarrCompression(option.lower())
+        except ValueError:
+            raise ValueError(f"Invalid zarr compression: '{option}'. Expected 'none', 'fast', 'balanced', or 'best'.")
 
 
 class FocusMeasureOperator(Enum):
@@ -473,6 +651,7 @@ STAGE_MOVEMENT_SIGN_Y = 1
 STAGE_MOVEMENT_SIGN_Z = -1
 STAGE_MOVEMENT_SIGN_THETA = 1
 STAGE_MOVEMENT_SIGN_W = 1
+STAGE_MOVEMENT_SIGN_W2 = 1
 
 STAGE_POS_SIGN_X = STAGE_MOVEMENT_SIGN_X
 STAGE_POS_SIGN_Y = STAGE_MOVEMENT_SIGN_Y
@@ -593,7 +772,7 @@ LED_MATRIX_R_FACTOR = 0
 LED_MATRIX_G_FACTOR = 0
 LED_MATRIX_B_FACTOR = 1
 
-DEFAULT_SAVING_PATH = str(Path.home()) + "/Downloads"
+DEFAULT_SAVING_PATH = str(Path.home() / "Downloads")
 FILE_ID_PADDING = 0
 
 
@@ -647,6 +826,11 @@ class CAMERA_CONFIG:
     AWB_RATIOS_R = 1.375
     AWB_RATIOS_G = 1
     AWB_RATIOS_B = 1.4141
+    # Simulated camera physical/sensor defaults.
+    # These can be overridden per machine config in [CAMERA_CONFIG].
+    SIMULATED_PIXEL_SIZE_UM = 3.76
+    SIMULATED_SENSOR_WIDTH_PX = 3088
+    SIMULATED_SENSOR_HEIGHT_PX = 2064
 
 
 class AF:
@@ -723,6 +907,25 @@ RESUME_LIVE_AFTER_ACQUISITION = True
 #   <base_path>/<experiment_ID>/acquisition.log
 ENABLE_PER_ACQUISITION_LOG = False
 
+# Simulated disk I/O for development (RAM/speed optimization testing)
+# When enabled, images are encoded to memory buffers but NOT saved to disk
+SIMULATED_DISK_IO_ENABLED = False
+SIMULATED_DISK_IO_SPEED_MB_S = 200.0  # Target write speed in MB/s (HDD: 50-100, SATA SSD: 200-500, NVMe: 1000-3000)
+SIMULATED_DISK_IO_COMPRESSION = True  # Exercise compression CPU/RAM for realistic simulation
+# Force saving images even with SIMULATED_DISK_IO_ENABLED (for testing file-based viewers)
+SIMULATION_FORCE_SAVE_IMAGES = False
+
+# Per-component hardware simulation controls
+# These settings only apply when running WITHOUT the --simulation flag.
+# When --simulation is used, ALL components are simulated regardless of these settings.
+# Values: False = use real hardware (default), True = simulate this component
+SIMULATE_CAMERA = False
+SIMULATE_MICROCONTROLLER = False  # Also controls stage (stage uses MCU)
+SIMULATE_SPINNING_DISK = False  # XLight/Dragonfly
+SIMULATE_FILTER_WHEEL = False
+SIMULATE_OBJECTIVE_CHANGER = False
+SIMULATE_LASER_AF_CAMERA = False  # Laser autofocus camera
+
 CAMERA_SN = {
     "ch 1": "SN1",
     "ch 2": "SN2",
@@ -772,10 +975,30 @@ LASER_AF_MIN_PEAK_WIDTH = 10
 LASER_AF_MIN_PEAK_DISTANCE = 10
 LASER_AF_MIN_PEAK_PROMINENCE = 0.20
 LASER_AF_SPOT_SPACING = 100
-SHOW_LEGACY_DISPLACEMENT_MEASUREMENT_WINDOWS = False
 LASER_AF_FILTER_SIGMA = None
 LASER_AF_INITIALIZE_CROP_WIDTH = 1200
 LASER_AF_INITIALIZE_CROP_HEIGHT = 800
+
+# --- Z-stack centering & laser-AF outlier guard (per-machine tunables) ----------
+# Signed um shift added to the z-stack start so the true SAMPLE focal plane (which
+# sits a fixed offset from the reflection-AF reference/coverslip plane) lands at
+# stack center. Negative shifts the stack toward lower piezo Z. 0 = unchanged.
+AF_FOCUS_OFFSET_UM = 0.0
+# Reject a per-FOV laser-AF result that deviates from the predicted focal plane
+# (temporal same-FOV prior, else spatial neighbor prior) by more than the
+# residual tolerance, then retry (seeded to the prediction) and finally fall back
+# to the predicted plane. Tolerance should sit between normal AF scatter (~few um)
+# and aliased-lock jumps (~20-35 um).
+AF_GUARD_ENABLED = True
+AF_GUARD_MAX_RESIDUAL_UM = 10.0
+AF_GUARD_MAX_RETRIES = 1
+
+# Fraction of a run's FOVs that may FAIL during acquisition before the whole run
+# is reported FAILED (rather than a silent success). FOVs that fail acquisition
+# are always logged; this only governs when the failure count flips the final
+# SUCCESS/FAILED verdict. 0.0 = any failed FOV fails the run; 0.1 = tolerate up
+# to 10% (isolated transients on a large grid) but flag systematic failure.
+ACQUISITION_MAX_FAILED_FOV_FRACTION = 0.1
 
 MULTIPOINT_REFLECTION_AUTOFOCUS_ENABLE_BY_DEFAULT = False
 MULTIPOINT_CONTRAST_AUTOFOCUS_ENABLE_BY_DEFAULT = False
@@ -801,6 +1024,11 @@ SORT_DURING_MULTIPOINT = False
 
 INVERTED_OBJECTIVE = False
 
+# Illumination intensity scaling factor - scales DAC output for different hardware:
+#   0.6 = Squid LEDs (0-1.5V output range)
+#   0.8 = Squid laser engine (0-2V output range)
+#   1.0 = Full range (0-2.5V output, when DAC gain is 1 instead of 2)
+# This factor is applied to ALL illumination commands (legacy and multi-port).
 ILLUMINATION_INTENSITY_FACTOR = 0.6
 
 CAMERA_TYPE = "Default"
@@ -816,16 +1044,10 @@ USE_ANDOR_LASER_CONTROL = False
 ANDOR_LASER_VID = 0x1BDB
 ANDOR_LASER_PID = 0x0300
 
-XLIGHT_EMISSION_FILTER_MAPPING = {
-    405: 1,
-    470: 1,
-    555: 1,
-    640: 1,
-    730: 1,
-}  # TODO: This is not being used. Need to map wavelength to illumination source in LiveController
 XLIGHT_SERIAL_NUMBER = "B00031BE"
 XLIGHT_SLEEP_TIME_FOR_WHEEL = 0.25
 XLIGHT_VALIDATE_WHEEL_POS = False
+XLIGHT_EMISSION_FILTER_POSITIONS = 8  # 5 for Cicero, 8 for XLight V3
 XLIGHT_ILLUMINATION_IRIS_DEFAULT = 100
 XLIGHT_EMISSION_IRIS_DEFAULT = 100
 
@@ -857,24 +1079,41 @@ NL5_WAVENLENGTH_MAP = {
 LASER_AF_CHARACTERIZATION_MODE = False
 
 # Focus Lock Configuration
-FOCUS_LOCK_GAIN = 0.5
-FOCUS_LOCK_GAIN_MAX = 0.7
+FOCUS_LOCK_GAIN = 0.35
+FOCUS_LOCK_GAIN_MAX = 0.5
 FOCUS_LOCK_BUFFER_LENGTH = 5
 FOCUS_LOCK_OFFSET_THRESHOLD_UM = 0.5
 FOCUS_LOCK_MIN_SPOT_SNR = 5.0
 FOCUS_LOCK_LOOP_RATE_HZ = 30
 FOCUS_LOCK_METRICS_RATE_HZ = 10
 FOCUS_LOCK_PIEZO_WARNING_MARGIN_UM = 20.0
+FOCUS_LOCK_PIEZO_CRITICAL_MARGIN_UM = 10.0
 FOCUS_LOCK_DEFAULT_MODE = "off"
+FOCUS_LOCK_GAIN_SIGMA = 0.5
+FOCUS_LOCK_KI = 0.05
+FOCUS_LOCK_INTEGRAL_LIMIT_UM = 2.0
+FOCUS_LOCK_MAX_NAN_HOLDOVER_CYCLES = 3
+FOCUS_LOCK_NAN_HOLDOVER_DECAY = 0.5
 
 # Focus Lock Recovery Parameters
-FOCUS_LOCK_RECOVERY_ATTEMPTS = 3  # Number of retry cycles before declaring lost
-FOCUS_LOCK_RECOVERY_DELAY_S = 0.2  # Delay between retry attempts
+FOCUS_LOCK_RECOVERY_ATTEMPTS = 5  # Number of retry cycles before declaring lost
+FOCUS_LOCK_RECOVERY_DELAY_S = 0.4  # Delay between retry attempts
 FOCUS_LOCK_RECOVERY_WINDOW_READINGS = 3  # Good readings needed to recover
 
 # Focus Lock Hysteresis Thresholds
 FOCUS_LOCK_ACQUIRE_THRESHOLD_UM = 0.3  # Tighter threshold to acquire lock
 FOCUS_LOCK_MAINTAIN_THRESHOLD_UM = 0.8  # Looser threshold to maintain lock
+
+# Focus Lock "Unrecoverable" Guard (true lock break)
+# Lock only breaks when the observed error exceeds this magnitude for a
+# sustained number of consecutive cycles. Normal disturbances (manual stage
+# jogs of a few microns) must not trigger this — the PI loop corrects them.
+FOCUS_LOCK_LOCK_BREAK_ERROR_UM = 15.0
+FOCUS_LOCK_LOCK_BREAK_PERSIST_CYCLES = 30  # ~1.0 s @ 30 Hz
+# Piezo settle guard: after a correction larger than this, briefly wait before
+# the next measurement to avoid sampling mid-settle (which causes ringing).
+FOCUS_LOCK_SETTLE_CORRECTION_THRESHOLD_UM = 1.0
+FOCUS_LOCK_SETTLE_DELAY_S = 0.005
 
 # Focus Lock Auto-Search Parameters
 FOCUS_LOCK_AUTO_SEARCH_ENABLED = False  # Enable auto-search on lock loss
@@ -883,6 +1122,7 @@ FOCUS_LOCK_SEARCH_MIN_PERCENT = 15.0  # Lower limit as % of piezo range (safety 
 FOCUS_LOCK_SEARCH_MAX_PERCENT = 85.0  # Upper limit as % of piezo range (safety clamp)
 FOCUS_LOCK_SEARCH_STEP_UM = 5.0  # Step size during sweep
 FOCUS_LOCK_SEARCH_SETTLE_MS = 200.0  # Settling time per step (ms)
+FOCUS_LOCK_SEARCH_TIMEOUT_S = 30.0  # Maximum duration for a single search sweep
 
 # Napari integration
 USE_NAPARI_FOR_LIVE_VIEW = False
@@ -891,6 +1131,10 @@ USE_NAPARI_FOR_MOSAIC_DISPLAY = True
 USE_NAPARI_WELL_SELECTION = False
 USE_NAPARI_FOR_LIVE_CONTROL = False
 LIVE_ONLY_MODE = False
+
+# NDViewer integration
+ENABLE_NDVIEWER = False
+
 MOSAIC_VIEW_TARGET_PIXEL_SIZE_UM = 2
 
 # Downsampled view settings (for Select Well Mode)
@@ -967,7 +1211,6 @@ OPTOSPIN_EMISSION_FILTER_WHEEL_TTL_TRIGGER = False
 SQUID_FILTERWHEEL_MAX_INDEX = 8
 SQUID_FILTERWHEEL_MIN_INDEX = 1
 SQUID_FILTERWHEEL_OFFSET = 0.008
-SQUID_FILTERWHEEL_HOMING_ENABLED = True
 SQUID_FILTERWHEEL_MOTORSLOTINDEX = 3
 SQUID_FILTERWHEEL_TRANSITIONS_PER_REVOLUTION = 4000
 
@@ -1092,12 +1335,22 @@ XERYON_OBJECTIVE_SWITCHER_POS_2 = ["20x", "40x", "60x"]
 XERYON_OBJECTIVE_SWITCHER_POS_2_OFFSET_MM = 2
 
 # fluidics
-RUN_FLUIDICS = False
+RUN_FLUIDICS = True
 FLUIDICS_CONFIG_PATH = "./merfish_config/MERFISH_config.json"
+FLUIDICS_PROTOCOLS_PATH = None  # Optional path to fluidics_protocols.yaml
 
 USE_TEMPLATE_MULTIPOINT = False
 
 FILE_SAVING_OPTION = FileSavingOption.INDIVIDUAL_IMAGES
+
+# Zarr v3 saving configuration
+ZARR_CHUNK_MODE = ZarrChunkMode.FULL_FRAME
+ZARR_COMPRESSION = ZarrCompression.FAST  # Safe for 10-20 fps, ~1000 MB/s encode
+
+# Use 6D array with FOV dimension for non-HCS acquisitions (non-standard, not OME-NGFF compliant)
+# When False (default): creates per-FOV 5D zarr files (OME-NGFF compliant)
+# When True: creates single 6D zarr with shape (FOV, T, C, Z, Y, X)
+ZARR_USE_6D_FOV_DIMENSION = False
 
 ##########################################################
 #### start of loading machine specific configurations ####
@@ -1241,12 +1494,14 @@ MULTIPOINT_USE_PIEZO_FOR_ZSTACKS = HAS_OBJECTIVE_PIEZO
 
 # convert str to enum
 FILE_SAVING_OPTION = FileSavingOption.convert_to_enum(FILE_SAVING_OPTION)
+ZARR_CHUNK_MODE = ZarrChunkMode.convert_to_enum(ZARR_CHUNK_MODE)
+ZARR_COMPRESSION = ZarrCompression.convert_to_enum(ZARR_COMPRESSION)
 FOCUS_MEASURE_OPERATOR = FocusMeasureOperator.convert_to_enum(FOCUS_MEASURE_OPERATOR)
 DEFAULT_TRIGGER_MODE = TriggerMode.convert_to_var(DEFAULT_TRIGGER_MODE)
 
 # saving path
 if not (DEFAULT_SAVING_PATH.startswith(str(Path.home()))):
-    DEFAULT_SAVING_PATH = str(Path.home()) + "/" + DEFAULT_SAVING_PATH.strip("/")
+    DEFAULT_SAVING_PATH = str(Path.home() / DEFAULT_SAVING_PATH.strip("/").strip("\\"))
 
 # Load Views settings from config file at startup
 # These values override the defaults above and are accessed via _def.XXX
@@ -1308,5 +1563,43 @@ if CACHED_CONFIG_FILE_PATH and os.path.exists(CACHED_CONFIG_FILE_PATH):
                     )
                 except ValueError:
                     pass
+            if _views_config.has_option("VIEWS", "enable_ndviewer"):
+                ENABLE_NDVIEWER = _views_config.get("VIEWS", "enable_ndviewer").lower() in ("true", "1", "yes")
     except Exception as e:
         log.warning(f"Failed to load Views settings from config: {e}")
+
+    # Load per-component simulation settings from config file
+    def _parse_sim_setting(value_str):
+        """Parse simulation setting: True (simulate) or False (real hardware)."""
+        val = value_str.strip().lower()
+        if val in ("true", "1", "yes", "simulate"):
+            return True
+        # Everything else (false, none, auto, unrecognized) = real hardware
+        return False
+
+    try:
+        _sim_config = ConfigParser()
+        _sim_config.read(CACHED_CONFIG_FILE_PATH)
+        if _sim_config.has_section("SIMULATION"):
+            if _sim_config.has_option("SIMULATION", "simulate_camera"):
+                SIMULATE_CAMERA = _parse_sim_setting(_sim_config.get("SIMULATION", "simulate_camera"))
+                log.info(f"Loaded SIMULATE_CAMERA={SIMULATE_CAMERA} from config")
+            if _sim_config.has_option("SIMULATION", "simulate_microcontroller"):
+                SIMULATE_MICROCONTROLLER = _parse_sim_setting(_sim_config.get("SIMULATION", "simulate_microcontroller"))
+                log.info(f"Loaded SIMULATE_MICROCONTROLLER={SIMULATE_MICROCONTROLLER} from config")
+            if _sim_config.has_option("SIMULATION", "simulate_spinning_disk"):
+                SIMULATE_SPINNING_DISK = _parse_sim_setting(_sim_config.get("SIMULATION", "simulate_spinning_disk"))
+                log.info(f"Loaded SIMULATE_SPINNING_DISK={SIMULATE_SPINNING_DISK} from config")
+            if _sim_config.has_option("SIMULATION", "simulate_filter_wheel"):
+                SIMULATE_FILTER_WHEEL = _parse_sim_setting(_sim_config.get("SIMULATION", "simulate_filter_wheel"))
+                log.info(f"Loaded SIMULATE_FILTER_WHEEL={SIMULATE_FILTER_WHEEL} from config")
+            if _sim_config.has_option("SIMULATION", "simulate_objective_changer"):
+                SIMULATE_OBJECTIVE_CHANGER = _parse_sim_setting(
+                    _sim_config.get("SIMULATION", "simulate_objective_changer")
+                )
+                log.info(f"Loaded SIMULATE_OBJECTIVE_CHANGER={SIMULATE_OBJECTIVE_CHANGER} from config")
+            if _sim_config.has_option("SIMULATION", "simulate_laser_af_camera"):
+                SIMULATE_LASER_AF_CAMERA = _parse_sim_setting(_sim_config.get("SIMULATION", "simulate_laser_af_camera"))
+                log.info(f"Loaded SIMULATE_LASER_AF_CAMERA={SIMULATE_LASER_AF_CAMERA} from config")
+    except Exception as e:
+        log.warning(f"Failed to load SIMULATION settings from config: {e}")

@@ -1,27 +1,38 @@
 import re
 
-from squid.ui.widgets.wellplate._common import *
+from squid.ui.widgets.wellplate._common import (
+    QColor,
+    QGridLayout,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QPushButton,
+    QVBoxLayout,
+    QWidget,
+    Qt,
+)
 from qtpy.QtCore import QPoint, QTimer
 from qtpy.QtGui import QPixmap, QPainter, QPen
 from qtpy.QtWidgets import QApplication
 from _def import WELLPLATE_OFFSET_X_mm, WELLPLATE_OFFSET_Y_mm
 
 from squid.core.events import (
+    handles,
     ClickToMoveEnabledChanged,
     MoveStageToCommand,
     SelectedWellsChanged,
     WellplateFormatChanged,
 )
+from squid.ui.widgets.base import EventBusWidget
 
 from typing import Optional, Tuple, TYPE_CHECKING
 if TYPE_CHECKING:
     from squid.ui.ui_event_bus import UIEventBus
 
 
-class Well1536SelectionWidget(QWidget):
+class Well1536SelectionWidget(EventBusWidget):
     def __init__(self, event_bus: "UIEventBus"):
-        super().__init__()
-        self._bus = event_bus
+        super().__init__(event_bus)
         self._click_to_move_enabled: bool = True
         self.format = "1536 well plate"
         self.selected_cells = {}  # Dictionary to keep track of selected cells and their colors
@@ -38,21 +49,21 @@ class Well1536SelectionWidget(QWidget):
         self.a1_x_pixel = 144  # coordinate on the png - to update
         self.a1_y_pixel = 108  # coordinate on the png - to update
 
-        self._bus.subscribe(ClickToMoveEnabledChanged, self._on_click_to_move_enabled_changed)
-        self._bus.subscribe(WellplateFormatChanged, self._on_wellplate_format_changed)
         self.initUI()
 
+    @handles(ClickToMoveEnabledChanged)
     def _on_click_to_move_enabled_changed(self, event: ClickToMoveEnabledChanged) -> None:
         self._click_to_move_enabled = event.enabled
 
     def _publish_selection(self) -> None:
-        self._bus.publish(
+        self._publish(
             SelectedWellsChanged(
                 format_name=self.format,
                 selected_cells=tuple(self.get_selected_cells()),
             )
         )
 
+    @handles(WellplateFormatChanged)
     def _on_wellplate_format_changed(self, event: WellplateFormatChanged) -> None:
         if event.format_name != "1536 well plate":
             return
@@ -434,7 +445,7 @@ class Well1536SelectionWidget(QWidget):
         x_mm = col * self.spacing_mm + self.a1_x_mm + WELLPLATE_OFFSET_X_mm
         y_mm = row * self.spacing_mm + self.a1_y_mm + WELLPLATE_OFFSET_Y_mm
         if self._click_to_move_enabled:
-            self._bus.publish(MoveStageToCommand(x_mm=x_mm, y_mm=y_mm))
+            self._publish(MoveStageToCommand(x_mm=x_mm, y_mm=y_mm))
 
     def redraw_wells(self):
         self.image.fill(QColor("white"))  # Clear the pixmap first
@@ -498,9 +509,6 @@ class Well1536SelectionWidget(QWidget):
         for char in row:
             index = index * 26 + (ord(char.upper()) - ord("A") + 1)
         return index - 1
-
-    def onSelectionChanged(self):
-        self._publish_selection()
 
     def get_selected_cells(self):
         list_of_selected_cells = list(self.selected_cells.keys())

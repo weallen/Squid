@@ -1,0 +1,14 @@
+name: "V2 Minimal Imaging"
+version: "3.0"
+description: "Minimal self-loading imaging-only protocol."
+output_directory: ../outputs
+
+resources:
+  fluidics_config_file: ../fluidics/simulation_fluidics.json
+  fov_file: ../fov_positions/test_2fov_simple.csv
+
+rounds:
+  - name: "Reference Imaging"
+    steps:
+      - step_type: imaging
+        protocol: resource_files/protocols/fluorescence_405.yaml

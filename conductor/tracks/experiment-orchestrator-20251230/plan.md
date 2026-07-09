@@ -6,6 +6,148 @@ This plan assumes the multipoint refactoring from `conductor/tracks/multipoint-r
 
 ---
 
+## Implementation Audit (2025-01-12)
+
+### Current Completion: ~45%
+
+The initial implementation pass created file structure and core logic, but significant work remains.
+
+### What Works
+| Component | Status | Tests |
+|-----------|--------|-------|
+| Protocol Schema (Pydantic) | Complete | 15 passing |
+| Protocol Loader (YAML) | Complete | 15 passing |
+| CancelToken | Complete | 14 passing |
+| State Machine Definitions | Complete | - |
+| Checkpoint Data Structures | Complete | - |
+| UI Widgets (skeleton) | Partial | - |
+| OrchestratorController | ~40% | 0 tests |
+
+### Critical Bugs Found
+
+1. **ExperimentContext not stored** (`orchestrator_controller.py:428`)
+   - Context created at line 322-328 but not stored as instance variable
+   - Line 428 passes `context=None` to `create_round_subfolder`
+   - **Will crash when running real experiments**
+
+2. **Events not frozen** (`state.py:176-279`)
+   - All 11 event dataclasses missing `frozen=True`
+   - Violates codebase pattern from `core/events.py`
+
+3. **Execution is stubbed** (`orchestrator_controller.py:408-448`)
+   - `_execute_fluidics()` calls `time.sleep(0.1)` instead of actual execution
+   - `_execute_imaging()` calls `time.sleep(0.1)` instead of actual execution
+
+### Missing Components
+
+| Component | Location | Priority |
+|-----------|----------|----------|
+| ImagingExecutor | `orchestrator/imaging_executor.py` | Critical |
+| FluidicsExecutor | `orchestrator/fluidics_executor.py` | High |
+| Application Integration | `application.py` | Critical |
+| Main Window Integration | `ui/main_window.py` | High |
+| Start Button Handler | `performance_mode_widget.py:328` | High |
+| OrchestratorController Tests | `tests/unit/orchestrator/` | High |
+| CheckpointManager Tests | `tests/unit/orchestrator/` | Medium |
+| Integration Tests | `tests/integration/` | Medium |
+
+### Completion Plan
+
+**Phase 1: Fix Critical Bugs**
+1. Store ExperimentContext as `self._context` in `__init__`
+2. Use `self._context` on line 428 instead of `None`
+3. Add `frozen=True` to all 11 event dataclasses in state.py
+
+**Phase 2: Implement Imaging Execution**
+1. Create `imaging_executor.py` that delegates to MultiPointController
+2. Update `_execute_imaging()` to use ImagingExecutor
+
+**Phase 3: Implement Fluidics Skeleton**
+1. Create `fluidics_executor.py` as skeleton for future hardware
+2. Update `_execute_fluidics()` to use FluidicsExecutor
+
+**Phase 4: Application Integration**
+1. Add orchestrator creation to `application.py`
+2. Add Performance Mode tab to `main_window.py`
+
+**Phase 5: Complete UI**
+1. Implement start button handler in `performance_mode_widget.py`
+
+**Phase 6: Add Tests**
+1. OrchestratorController unit tests
+2. CheckpointManager unit tests
+3. Integration tests
+
+---
+
+## Updates (2025-01-12)
+
+### BaseController Integration
+
+The recent `BaseController`/`BaseManager` refactoring changes how the OrchestratorController should handle event subscriptions. Instead of manual subscription:
+
+```python
+# OLD - Don't use
+def _subscribe_to_commands(self):
+    self._event_bus.subscribe(LoadProtocolCommand, self._on_load_protocol)
+```
+
+Use `@handles` decorators with automatic subscription:
+
+```python
+# NEW - Use this pattern
+from squid.core.events import handles
+
+class OrchestratorController(StateMachine[OrchestratorState]):
+    @handles(LoadProtocolCommand)
+    def _on_load_protocol(self, cmd: LoadProtocolCommand) -> None:
+        ...
+```
+
+StateMachine now calls `auto_subscribe()` in `__init__`, so handlers are automatically registered.
+
+### Pre-flight Validation (NEW)
+
+Add two-stage validation:
+
+1. **Schema validation** (in `loader.py`) - Syntax, required fields, data types
+2. **Pre-flight validation** (before RUNNING state):
+   - All referenced channels exist in ChannelConfigurationManager
+   - Positions file exists and is readable
+   - Fluidics service available if fluidics steps defined
+   - Sufficient disk space for estimated acquisition
+   - Hardware connected (camera, stage, etc.)
+   - Objective matches protocol specification
+
+### Phase 0: Missing Dependencies (NEW)
+
+Before orchestrator implementation, extract these from MultiPointController:
+
+- **ExperimentManager** (`multipoint/experiment_manager.py`) - Folder creation, metadata
+- **AcquisitionPlanner** (`multipoint/acquisition_planner.py`) - Estimation, validation
+- **ImageCaptureExecutor** - Enhance `multipoint/image_capture.py`
+
+### UI Updates
+
+Add **InterventionDialog** for user decisions during errors:
+- Triggered by `UserInterventionRequired` event
+- Shows reason and options (Retry, Skip, Abort)
+- Blocks orchestrator until user responds
+
+### Revised Timeline
+
+| Phase | Description | Effort |
+|-------|-------------|--------|
+| 0 | ExperimentManager + AcquisitionPlanner extraction | 2-3 days |
+| 1 | Protocol schema + loader + pre-flight | 2 days |
+| 2 | CancelToken + State management | 1.5 days |
+| 3 | OrchestratorController + Executors | 3 days |
+| 4 | Performance Mode UI + Intervention dialog | 2-3 days |
+| 5 | Integration + Tests | 2 days |
+| **Total** | | **~13 days** |
+
+---
+
 ## Phase 1: Protocol Definition System
 
 ### 1.1 Protocol Schema (YAML)
@@ -1575,6 +1717,8 @@ class ImagingExecutor:
 
 ## Phase 4: Performance Mode UI
 
+**Integration:** Performance Mode is a **tab in `imageDisplayTabs`** (alongside "Live View", "Mosaic View", etc.) - not a separate window. Users can switch between tabs as needed during experiments.
+
 ### 4.1 Performance Mode Widget
 
 **File:** `software/src/squid/ui/widgets/orchestrator/performance_mode.py`
@@ -1596,13 +1740,14 @@ from squid.backend.controllers.orchestrator.state import (
 
 class PerformanceModeWidget(QWidget):
     """
-    Simplified operator interface for monitoring orchestrated experiments.
+    Tab widget for monitoring orchestrated experiments.
+
+    Added to imageDisplayTabs alongside Live View, Mosaic View, etc.
 
     Shows:
     - Overall progress dashboard
     - Protocol timeline with current position
-    - Intervention controls
-    - Live image preview (optional)
+    - Intervention controls (Start/Pause/Resume/Stop, Skip)
     """
 
     def __init__(self, event_bus: EventBus, parent=None):
@@ -2117,8 +2262,16 @@ def _create_orchestrator(self):
 **File:** `software/src/squid/ui/main_window.py` (additions)
 
 ```python
-# Add menu item or button to open Performance Mode
+# Add Performance Mode as a tab in imageDisplayTabs (in setupImageDisplayTabs)
+def setupImageDisplayTabs(self):
+    # ... existing tabs ...
 
+    # Add Performance Mode tab
+    from squid.ui.widgets.orchestrator.performance_mode import PerformanceModeWidget
+    self.performanceModeWidget = PerformanceModeWidget(self._event_bus)
+    self.imageDisplayTabs.addTab(self.performanceModeWidget, "Performance Mode")
+
+# Add Experiment menu
 def _create_orchestrator_menu(self):
     orchestrator_menu = self.menuBar().addMenu("Experiment")
 
@@ -2128,20 +2281,19 @@ def _create_orchestrator_menu(self):
 
     orchestrator_menu.addSeparator()
 
-    performance_action = QAction("Performance Mode", self)
-    performance_action.triggered.connect(self._show_performance_mode)
-    orchestrator_menu.addAction(performance_action)
+    # Switch to Performance Mode tab
+    goto_action = QAction("Go to Performance Mode", self)
+    goto_action.triggered.connect(self._goto_performance_mode)
+    orchestrator_menu.addAction(goto_action)
 
 def _show_protocol_loader(self):
     from squid.ui.widgets.orchestrator.protocol_loader import ProtocolLoaderDialog
     dialog = ProtocolLoaderDialog(self._event_bus, self)
     dialog.exec_()
 
-def _show_performance_mode(self):
-    from squid.ui.widgets.orchestrator.performance_mode import PerformanceModeWidget
-    # Could be a dockable widget or separate window
-    self._performance_widget = PerformanceModeWidget(self._event_bus)
-    self._performance_widget.show()
+def _goto_performance_mode(self):
+    # Switch to the Performance Mode tab
+    self.imageDisplayTabs.setCurrentWidget(self.performanceModeWidget)
 ```
 
 ### 5.3 Test Structure

@@ -1,0 +1,17 @@
+name: "V2 Fluidics Imaging"
+version: "3.0"
+description: "Single wash followed by a two-color imaging pass."
+output_directory: ../outputs
+
+resources:
+  fluidics_protocols_file: ../fluidics/test_fluidics_protocols.yaml
+  fluidics_config_file: ../fluidics/simulation_fluidics.json
+  fov_file: ../fov_positions/test_2fov_simple.csv
+
+rounds:
+  - name: "Wash Then Image"
+    steps:
+      - step_type: fluidics
+        protocol: wash
+      - step_type: imaging
+        protocol: resource_files/protocols/fluorescence_488_561.yaml

@@ -6,11 +6,12 @@ import time
 import json
 from datetime import datetime
 from contextlib import contextmanager
-from typing import Optional, Generic, TypeVar, List, Dict, Any, Tuple, ClassVar, Union
+from typing import Optional, Generic, TypeVar, List, Dict, Any, Set, Tuple, ClassVar, Union
 from uuid import uuid4
 
 from dataclasses import dataclass, field
 from filelock import FileLock, Timeout as FileLockTimeout
+import imageio
 
 import numpy as np
 import tifffile
@@ -20,7 +21,8 @@ from _def import ZProjectionMode, DownsamplingMethod
 from squid.backend.io import utils_acquisition
 import squid.core.abc
 import squid.core.logging
-from squid.core.utils.config_utils import ChannelMode
+from squid.core.config.feature_flags import get_feature_flags
+from squid.core.config.models import AcquisitionChannel
 from squid.backend.io.writers import utils_ome_tiff_writer as ome_tiff_writer
 from squid.backend.controllers.multipoint.downsampled_views import (
     crop_overlap,
@@ -28,6 +30,8 @@ from squid.backend.controllers.multipoint.downsampled_views import (
     WellTileAccumulator,
 )
 
+_log = squid.core.logging.get_logger(__name__)
+_feature_flags = get_feature_flags()
 
 @dataclass
 class AcquisitionInfo:
@@ -76,7 +80,7 @@ class CaptureInfo:
     position: squid.core.abc.Pos
     z_index: int
     capture_time: float
-    configuration: ChannelMode
+    configuration: AcquisitionChannel
     save_directory: str
     file_id: str
     region_id: int
@@ -85,6 +89,7 @@ class CaptureInfo:
     z_piezo_um: Optional[float] = None
     time_point: Optional[int] = None
     pixel_size_um: Optional[float] = None  # Per-tile pixel size for mosaic display
+    fov_id: Optional[str] = None  # Stable FOV identifier (e.g., "A1_0001")
 
 
 @dataclass()
@@ -148,10 +153,70 @@ def _acquire_file_lock(lock_path: str, context: str = "") -> Any:
         ) from exc
 
 
+def _merged_image_path(info: "CaptureInfo", image: np.ndarray) -> str:
+    if image.dtype == np.uint16:
+        ext = ".tiff"
+    else:
+        ext = "." + _def.Acquisition.IMAGE_FORMAT
+    return os.path.join(info.save_directory, f"{info.file_id}_merged{ext}")
+
+
+def multipage_stack_path(info: "CaptureInfo") -> str:
+    """Single source of truth for the MULTI_PAGE_TIFF {region}_{fov}_stack.tiff so
+    SaveImageJob (which appends to it) and the worker's B1.4 resume guard (which
+    deletes it before re-acquiring an in-flight FOV) agree on the exact file."""
+    return os.path.join(
+        info.save_directory,
+        f"{info.region_id}_{info.fov:0{_def.FILE_ID_PADDING}}_stack.tiff",
+    )
+
+
+def _merged_lock_path(output_path: str) -> str:
+    return output_path + ".lock"
+
+
+def _prepare_merge_image(image: np.ndarray, info: "CaptureInfo") -> np.ndarray:
+    if image.ndim == 2:
+        return utils_acquisition.return_pseudo_colored_image(image, info.configuration)
+    if image.ndim == 3 and image.shape[2] == 1:
+        return utils_acquisition.return_pseudo_colored_image(
+            image[:, :, 0], info.configuration
+        )
+    if image.ndim == 3 and image.shape[2] == 3:
+        return image
+    return utils_acquisition.return_pseudo_colored_image(image.squeeze(), info.configuration)
+
+
+def _read_merged_image(path: str) -> np.ndarray:
+    if path.lower().endswith((".tif", ".tiff")):
+        return tifffile.imread(path)
+    return imageio.imread(path)
+
+
+def _write_merged_image(path: str, image: np.ndarray) -> None:
+    if path.lower().endswith((".tif", ".tiff")):
+        tifffile.imwrite(path, image)
+    else:
+        imageio.imwrite(path, image)
+
+
 class SaveImageJob(Job):
     def run(self) -> bool:
-        is_color: bool = len(self.image_array().shape) > 2
-        return self.save_image(self.image_array(), self.capture_info, is_color)
+        from squid.backend.io.io_simulation import is_simulation_enabled, simulated_tiff_write
+
+        image = self.image_array()
+
+        # Simulated disk I/O mode - encode to buffer, throttle, discard
+        if is_simulation_enabled():
+            bytes_written = simulated_tiff_write(image)
+            _log.debug(
+                f"SaveImageJob {self.job_id}: simulated write of {bytes_written} bytes "
+                f"(image shape={image.shape})"
+            )
+            return True
+
+        is_color: bool = len(image.shape) > 2
+        return self.save_image(image, self.capture_info, is_color)
 
     def save_image(self, image: np.ndarray, info: CaptureInfo, is_color: bool) -> bool:
         # NOTE(imo): We silently fall back to individual image saving here.  We should warn or do something.
@@ -175,10 +240,7 @@ class SaveImageJob(Job):
                 metadata["time"] = info.capture_time
             if info.z_piezo_um is not None:
                 metadata["z_piezo (um)"] = info.z_piezo_um
-            output_path: str = os.path.join(
-                info.save_directory,
-                f"{info.region_id}_{info.fov:0{_def.FILE_ID_PADDING}}_stack.tiff",
-            )
+            output_path: str = multipage_stack_path(info)
             # Ensure channel information is preserved across common TIFF readers by:
             # - embedding full metadata as JSON in ImageDescription (description=)
             # - setting PageName (tag 285) to the channel name via extratags
@@ -208,11 +270,45 @@ class SaveImageJob(Job):
                 is_color=is_color,
             )
 
-            if _def.MERGE_CHANNELS:
-                # TODO(imo): Add this back in
-                raise NotImplementedError("Image merging not supported yet")
+            if _feature_flags.is_enabled("MERGE_CHANNELS"):
+                try:
+                    self._merge_channels(image, info)
+                except Exception:
+                    _log.exception("Failed to merge channels for %s", info.file_id)
 
         return True
+
+    def _merge_channels(self, image: np.ndarray, info: CaptureInfo) -> None:
+        merged_path = _merged_image_path(info, image)
+        merged_image = _prepare_merge_image(image, info)
+        lock_path = _merged_lock_path(merged_path)
+
+        with _acquire_file_lock(lock_path, context=merged_path):
+            if os.path.exists(merged_path):
+                existing = _read_merged_image(merged_path)
+                if existing.shape != merged_image.shape:
+                    _log.warning(
+                        "Merged image shape mismatch for %s (existing=%s, new=%s); overwriting",
+                        merged_path,
+                        existing.shape,
+                        merged_image.shape,
+                    )
+                    combined = merged_image
+                else:
+                    target_dtype = existing.dtype
+                    max_value = (
+                        np.iinfo(target_dtype).max
+                        if np.issubdtype(target_dtype, np.integer)
+                        else np.finfo(target_dtype).max
+                    )
+                    combined = existing.astype(np.float32) + merged_image.astype(
+                        np.float32
+                    )
+                    combined = np.clip(combined, 0, max_value).astype(target_dtype)
+            else:
+                combined = merged_image
+
+            _write_merged_image(merged_path, combined)
 
 
 @dataclass
@@ -231,7 +327,42 @@ class SaveOMETiffJob(Job):
                 "This job must be dispatched via JobRunner.dispatch(), which injects acquisition_info. "
                 "If running directly, set job.acquisition_info before calling run()."
             )
-        self._save_ome_tiff(self.image_array(), self.capture_info)
+
+        from squid.backend.io.io_simulation import is_simulation_enabled, simulated_ome_tiff_write
+
+        image = self.image_array()
+
+        # Simulated disk I/O mode - encode to buffer, throttle, discard
+        if is_simulation_enabled():
+            # Build stack key from output path
+            ome_folder = ome_tiff_writer.ome_output_folder(self.acquisition_info, self.capture_info)
+            base_name = ome_tiff_writer.ome_base_name(self.capture_info)
+            stack_key = os.path.join(ome_folder, base_name)
+
+            # Determine 5D shape (T, Z, C, Y, X)
+            shape = (
+                self.acquisition_info.total_time_points,
+                self.acquisition_info.total_z_levels,
+                self.acquisition_info.total_channels,
+                image.shape[0],
+                image.shape[1],
+            )
+
+            bytes_written = simulated_ome_tiff_write(
+                image=image,
+                stack_key=stack_key,
+                shape=shape,
+                time_point=self.capture_info.time_point or 0,
+                z_index=self.capture_info.z_index,
+                channel_index=self.capture_info.configuration_idx,
+            )
+            _log.debug(
+                f"SaveOMETiffJob {self.job_id}: simulated write of {bytes_written} bytes "
+                f"(image shape={image.shape})"
+            )
+            return True
+
+        self._save_ome_tiff(image, self.capture_info)
         return True
 
     def _save_ome_tiff(self, image: np.ndarray, info: CaptureInfo) -> None:
@@ -244,7 +375,7 @@ class SaveOMETiffJob(Job):
 
         base_name: str = ome_tiff_writer.ome_base_name(info)
         output_path: str = os.path.join(ome_folder, base_name + ".ome.tiff")
-        metadata_path: str = ome_tiff_writer.metadata_temp_path(self.acquisition_info, info, base_name)
+        metadata_path: str = ome_tiff_writer.plane_tracker_path(self.acquisition_info, info, base_name)
         lock_path: str = _metadata_lock_path(metadata_path)
 
         with _acquire_file_lock(lock_path, context=output_path):
@@ -252,17 +383,44 @@ class SaveOMETiffJob(Job):
                 metadata_path
             )
             if metadata is None:
+                # B1.4 migration fallback (read-only): a tracker written by the
+                # pre-relocation build lives in OS temp; adopt it so an FOV
+                # started under the old build can still resume. It is rewritten
+                # to the new .plane_trackers location by write_metadata below.
+                legacy_path = ome_tiff_writer.metadata_temp_path(self.acquisition_info, info, base_name)
+                metadata = ome_tiff_writer.load_metadata(legacy_path)
+            if metadata is None:
                 metadata = ome_tiff_writer.initialize_metadata(self.acquisition_info, info, image)
                 target_dtype: np.dtype = np.dtype(metadata[ome_tiff_writer.DTYPE_KEY])
-                if os.path.exists(output_path):
-                    os.remove(output_path)
-                tifffile.imwrite(
-                    output_path,
-                    shape=tuple(metadata[ome_tiff_writer.SHAPE_KEY]),
-                    dtype=target_dtype,
-                    metadata=ome_tiff_writer.metadata_for_imwrite(metadata),
-                    ome=True,
-                )
+                # B1.4 non-destructive guard: only wipe on TRUE absence or a
+                # shape/dtype MISMATCH. On a fresh FOV output_path does not exist,
+                # so this reaches the identical create branch as before.
+                if os.path.exists(output_path) and ome_tiff_writer.memmap_matches(
+                    output_path, metadata[ome_tiff_writer.SHAPE_KEY], target_dtype
+                ):
+                    _log.warning(
+                        "OME resume: adopting existing stack %s (no tracker); "
+                        "rebuilding written-plane set from disk",
+                        output_path,
+                    )
+                    metadata = ome_tiff_writer.rebuild_written_indices_from_memmap(
+                        output_path, metadata
+                    )
+                else:
+                    if os.path.exists(output_path):
+                        _log.warning(
+                            "OME resume: existing stack %s does not match expected "
+                            "shape/dtype; discarding and recreating",
+                            output_path,
+                        )
+                        os.remove(output_path)
+                    tifffile.imwrite(
+                        output_path,
+                        shape=tuple(metadata[ome_tiff_writer.SHAPE_KEY]),
+                        dtype=target_dtype,
+                        metadata=ome_tiff_writer.metadata_for_imwrite(metadata),
+                        ome=True,
+                    )
             else:
                 expected_shape: Tuple[int, ...] = tuple(metadata[ome_tiff_writer.SHAPE_KEY])
                 if expected_shape[-2:] != image.shape[-2:]:
@@ -288,6 +446,15 @@ class SaveOMETiffJob(Job):
                 raise ValueError("Z index out of range for OME stack")
             if not (0 <= channel_index < shape[2]):
                 raise ValueError("Channel index out of range for OME stack")
+
+            # B1.4 per-plane skip fast-path: a plane already recorded as written
+            # (rebuilt from disk on resume, or a duplicate dispatch) is already
+            # durable and counted. Placed BEFORE the memmap write so a resumed
+            # plane never re-touches pixels/OME-XML. On a linear fresh run the
+            # key is only added AFTER the write, so this is always False.
+            index_key: str = f"{time_point}-{channel_index}-{z_index}"
+            if index_key in metadata[ome_tiff_writer.WRITTEN_INDICES_KEY]:
+                return
 
             stack: np.ndarray = tifffile.memmap(
                 output_path, dtype=target_dtype, mode="r+"
@@ -334,6 +501,389 @@ class SaveOMETiffJob(Job):
                 os.remove(lock_path)
         except OSError:
             pass  # Lock held by another process, already removed, or platform-specific issue
+
+
+@dataclass
+class ZarrWriterInfo:
+    """Info for Zarr v3 saving, injected by JobRunner.
+
+    Output path depends on acquisition mode:
+    - HCS mode: {base_path}/plate.ome.zarr/{row}/{col}/{fov}/0  (5D per FOV, OME-NGFF compliant)
+    - Non-HCS default: {base_path}/zarr/{region_id}/fov_{n}.ome.zarr  (5D per FOV, OME-NGFF compliant)
+    - Non-HCS 6D: {base_path}/zarr/{region_id}/acquisition.zarr  (6D with FOV dimension, non-standard)
+
+    Attributes:
+        base_path: Base path for zarr outputs (e.g., experiment_path)
+        t_size: Total time points
+        c_size: Total channels
+        z_size: Total z levels
+        is_hcs: True for wellplate (HCS) acquisitions
+        use_6d_fov: Use 6D (FOV, T, C, Z, Y, X) instead of per-FOV files (non-standard)
+        region_fov_counts: Map of region_id -> num_fovs (for 6D shape calculation)
+        pixel_size_um: Physical pixel size in micrometers
+        z_step_um: Z step size in micrometers (optional)
+        time_increment_s: Time between timepoints in seconds (optional)
+        channel_names: List of channel names for metadata
+        channel_colors: List of hex colors for channels (e.g., "#FF0000")
+        channel_wavelengths: List of wavelengths in nm (None for brightfield)
+    """
+
+    base_path: str
+    t_size: int
+    c_size: int
+    z_size: int
+    is_hcs: bool = False
+    use_6d_fov: bool = False
+    region_fov_counts: Dict[str, int] = field(default_factory=dict)
+    pixel_size_um: Optional[float] = None
+    z_step_um: Optional[float] = None
+    time_increment_s: Optional[float] = None
+    channel_names: List[str] = field(default_factory=list)
+    channel_colors: List[str] = field(default_factory=list)
+    channel_wavelengths: List[Optional[int]] = field(default_factory=list)
+    # B1.5 resume plumbing (across the multiprocessing pickle boundary). DERIVED
+    # from the worker's _start_fov_index > 0 in set_start_fov_index(); default
+    # False so every normal run is unchanged.
+    allow_resume: bool = False
+    force_overwrite: bool = False
+
+    def get_output_path(self, region_id: str, fov: int) -> str:
+        """Get output path for writing (array path).
+
+        HCS mode: {base}/plate.ome.zarr/{row}/{col}/{fov}/0  (array at resolution level 0)
+        Non-HCS per-FOV: {base}/zarr/{region_id}/fov_{n}.ome.zarr/0  (array at resolution level 0)
+        Non-HCS 6D: {base}/zarr/{region_id}/acquisition.zarr  (6D with FOV dimension)
+        """
+        from squid.backend.io.writers.zarr_writer import (
+            build_hcs_zarr_fov_path,
+            build_per_fov_zarr_path,
+            build_6d_zarr_path,
+        )
+
+        if self.is_hcs:
+            # build_hcs_zarr_fov_path returns group path; append /0 for array
+            group_path = build_hcs_zarr_fov_path(self.base_path, region_id, fov)
+            return os.path.join(group_path, "0")
+        elif self.use_6d_fov:
+            return build_6d_zarr_path(self.base_path, region_id)
+        else:
+            # build_per_fov_zarr_path returns group path; append /0 for array
+            group_path = build_per_fov_zarr_path(self.base_path, region_id, fov)
+            return os.path.join(group_path, "0")
+
+    def get_fov_count(self, region_id: str) -> int:
+        """Get total FOV count for a region (for 6D shape calculation)."""
+        return self.region_fov_counts.get(str(region_id), 1)
+
+    def get_plate_path(self) -> str:
+        """Get path to plate.ome.zarr directory (HCS mode only)."""
+        return os.path.join(self.base_path, "plate.ome.zarr")
+
+    def get_well_path(self, well_id: str) -> str:
+        """Get path to well directory (HCS mode only)."""
+        from squid.backend.io.writers.zarr_writer import parse_well_id
+
+        row_letter, col_num = parse_well_id(well_id)
+        return os.path.join(self.base_path, "plate.ome.zarr", row_letter, col_num)
+
+    def get_hcs_structure(self) -> Tuple[List[str], List[int], List[Tuple[str, int]]]:
+        """Extract HCS structure from region_fov_counts.
+
+        Returns:
+            Tuple of (rows, cols, wells) where:
+            - rows: sorted unique row letters (e.g., ["A", "B", "C"])
+            - cols: sorted unique column numbers (e.g., [1, 2, 3])
+            - wells: list of (row, col) tuples for all wells
+        """
+        from squid.backend.io.writers.zarr_writer import parse_well_id
+
+        rows_set: Set[str] = set()
+        cols_set: Set[int] = set()
+        wells: List[Tuple[str, int]] = []
+
+        for well_id in self.region_fov_counts.keys():
+            row_letter, col_num = parse_well_id(well_id)
+            rows_set.add(row_letter)
+            cols_set.add(int(col_num))
+            wells.append((row_letter, int(col_num)))
+
+        rows = sorted(rows_set)
+        cols = sorted(cols_set)
+        return rows, cols, wells
+
+
+@dataclass
+class ZarrWriteResult:
+    """Result from a SaveZarrJob, containing frame info for viewer notification."""
+
+    fov: int
+    time_point: int
+    z_index: int
+    channel_name: str
+    region_idx: int = 0
+
+
+@dataclass
+class SaveZarrJob(Job):
+    """Job for saving images to Zarr v3 format using TensorStore.
+
+    Uses a process-local ZarrWriter that is initialized lazily on first write.
+    The zarr_writer_info field is injected by JobRunner.dispatch() before the job runs.
+    """
+
+    _log: ClassVar = squid.core.logging.get_logger("SaveZarrJob")
+    zarr_writer_info: Optional[ZarrWriterInfo] = field(default=None)
+
+    # Class-level writer storage keyed by output_path.
+    # SAFETY: JobRunner runs in a multiprocessing.Process (not threads), so each
+    # worker process has its own independent copy of this class variable.
+    _zarr_writers: ClassVar[Dict[str, Any]] = {}
+
+    # Track HCS metadata that has been written (plate path -> True, well path -> True)
+    _hcs_plate_written: ClassVar[Set[str]] = set()
+    _hcs_wells_written: ClassVar[Set[str]] = set()
+
+    @classmethod
+    def clear_writers(cls) -> None:
+        """Clear all zarr writers, aborting any that are still active.
+
+        Call at start of new acquisition to ensure clean state.
+        Uses try-finally to guarantee dictionaries are cleared even if abort fails.
+        """
+        try:
+            for writer in list(cls._zarr_writers.values()):
+                if writer.is_initialized and not writer.is_finalized:
+                    try:
+                        writer.abort()
+                    except Exception as e:
+                        cls._log.warning(f"Error aborting writer during clear: {e}")
+        finally:
+            # Always clear dictionaries, even if abort loop fails
+            cls._zarr_writers.clear()
+            cls._hcs_plate_written.clear()
+            cls._hcs_wells_written.clear()
+
+    @classmethod
+    def finalize_all_writers(cls) -> bool:
+        """Finalize all active zarr writers.
+
+        Call at end of acquisition to ensure all data is written.
+
+        Returns:
+            True if all writers finalized successfully, False if any failed.
+        """
+        failed_paths = []
+        for path, writer in list(cls._zarr_writers.items()):
+            if writer.is_initialized and not writer.is_finalized:
+                try:
+                    writer.finalize()
+                    cls._log.info(f"Finalized zarr writer: {path}")
+                except Exception as e:
+                    cls._log.error(f"Error finalizing writer {path}: {e}")
+                    failed_paths.append(path)
+        cls._zarr_writers.clear()
+        if failed_paths:
+            cls._log.error(f"Failed to finalize {len(failed_paths)} zarr writers: {failed_paths}")
+            return False
+        return True
+
+    def _write_hcs_metadata_if_needed(self, region_id: str, fov: int) -> None:
+        """Write HCS plate and well metadata if not already written."""
+        from squid.backend.io.writers.zarr_writer import write_plate_metadata, write_well_metadata
+
+        info = self.zarr_writer_info
+
+        # Write plate metadata (once per acquisition)
+        plate_path = info.get_plate_path()
+        if plate_path not in self._hcs_plate_written:
+            rows, cols, wells = info.get_hcs_structure()
+            write_plate_metadata(plate_path, rows, cols, wells, plate_name="plate")
+            self._hcs_plate_written.add(plate_path)
+            self._log.info(f"Wrote HCS plate metadata: {len(wells)} wells")
+
+        # Write well metadata (once per well)
+        well_path = info.get_well_path(region_id)
+        if well_path not in self._hcs_wells_written:
+            fov_count = info.get_fov_count(region_id)
+            fields = list(range(fov_count))
+            write_well_metadata(well_path, fields)
+            self._hcs_wells_written.add(well_path)
+            self._log.debug(f"Wrote HCS well metadata for {region_id}: {fov_count} fields")
+
+    def run(self) -> ZarrWriteResult:
+        if self.zarr_writer_info is None:
+            raise ValueError(
+                "SaveZarrJob.run() requires zarr_writer_info but it is None. "
+                "This job must be dispatched via JobRunner.dispatch(), which injects zarr_writer_info. "
+                "If running directly, set job.zarr_writer_info before calling run()."
+            )
+
+        from squid.backend.io.io_simulation import is_simulation_enabled, simulated_zarr_write
+
+        image = self.image_array()
+        info = self.capture_info
+
+        # Get per-region/FOV output path to avoid overwriting between FOVs
+        region_id = str(info.region_id) if info.region_id is not None else "0"
+        fov = info.fov if info.fov is not None else 0
+        output_path = self.zarr_writer_info.get_output_path(region_id, fov)
+
+        # Build result with frame info for viewer notification
+        region_names = list(self.zarr_writer_info.region_fov_counts.keys())
+        result = ZarrWriteResult(
+            fov=fov,
+            time_point=info.time_point or 0,
+            z_index=info.z_index,
+            channel_name=info.configuration.name,
+            region_idx=region_names.index(region_id) if region_id in region_names else 0,
+        )
+
+        # Determine shape based on acquisition mode
+        is_hcs = self.zarr_writer_info.is_hcs
+        use_6d_fov = self.zarr_writer_info.use_6d_fov
+        if is_hcs or not use_6d_fov:
+            # 5D shape: (T, C, Z, Y, X) - one writer per FOV
+            shape = (
+                self.zarr_writer_info.t_size,
+                self.zarr_writer_info.c_size,
+                self.zarr_writer_info.z_size,
+                image.shape[0],
+                image.shape[1],
+            )
+        else:
+            # 6D shape: (FOV, T, C, Z, Y, X) - FOV first for contiguous per-FOV data
+            fov_count = self.zarr_writer_info.get_fov_count(region_id)
+            shape = (
+                fov_count,
+                self.zarr_writer_info.t_size,
+                self.zarr_writer_info.c_size,
+                self.zarr_writer_info.z_size,
+                image.shape[0],
+                image.shape[1],
+            )
+
+        # Simulated disk I/O mode
+        if is_simulation_enabled():
+            bytes_written = simulated_zarr_write(
+                image=image,
+                stack_key=output_path,
+                shape=shape,
+                time_point=info.time_point or 0,
+                z_index=info.z_index,
+                channel_index=info.configuration_idx,
+            )
+            self._log.debug(
+                f"SaveZarrJob {self.job_id}: simulated write of {bytes_written} bytes "
+                f"to {output_path} (image shape={image.shape})"
+            )
+            return result
+
+        self._save_zarr(image, info, output_path)
+        return result
+
+    def _save_zarr(self, image: np.ndarray, info: CaptureInfo, output_path: str) -> None:
+        """Write image to zarr dataset using TensorStore."""
+        from squid.backend.io.writers.zarr_writer import (
+            ZarrWriter,
+            ZarrAcquisitionConfig,
+            RefuseToOverwriteError,
+        )
+
+        is_hcs = self.zarr_writer_info.is_hcs
+        use_6d_fov = self.zarr_writer_info.use_6d_fov
+        region_id = str(info.region_id) if info.region_id is not None else "0"
+        fov = info.fov if info.fov is not None else 0
+
+        # Key logic:
+        # - HCS: unique per (region, fov) via output_path
+        # - Non-HCS 6D: shared per region (all FOVs in one 6D array)
+        # - Non-HCS default: unique per (region, fov) via output_path
+        if not is_hcs and use_6d_fov:
+            # B1.5: the 6D per-region layout keys one writer per region holding
+            # every FOV; the incremental per-FOV create=False model does not
+            # apply, and a naive reopen would delete_existing the whole region.
+            # Refuse resume for this layout rather than risk wiping written FOVs.
+            if self.zarr_writer_info.allow_resume:
+                raise RefuseToOverwriteError(
+                    f"Zarr resume is not supported for the 6D per-region layout "
+                    f"(region {region_id}); re-run without ZARR_USE_6D_FOV_DIMENSION"
+                )
+            writer_key = f"{self.zarr_writer_info.base_path}:{region_id}"
+        else:
+            writer_key = output_path  # Unique per FOV
+
+        if writer_key not in self._zarr_writers:
+            if is_hcs or not use_6d_fov:
+                # 5D shape: (T, C, Z, Y, X) - one writer per FOV
+                shape = (
+                    self.zarr_writer_info.t_size,
+                    self.zarr_writer_info.c_size,
+                    self.zarr_writer_info.z_size,
+                    image.shape[0],
+                    image.shape[1],
+                )
+            else:
+                # 6D shape: (FOV, T, C, Z, Y, X)
+                fov_count = self.zarr_writer_info.get_fov_count(region_id)
+                shape = (
+                    fov_count,
+                    self.zarr_writer_info.t_size,
+                    self.zarr_writer_info.c_size,
+                    self.zarr_writer_info.z_size,
+                    image.shape[0],
+                    image.shape[1],
+                )
+
+            config = ZarrAcquisitionConfig(
+                output_path=output_path,
+                shape=shape,
+                dtype=image.dtype,
+                pixel_size_um=self.zarr_writer_info.pixel_size_um or 1.0,
+                z_step_um=self.zarr_writer_info.z_step_um,
+                time_increment_s=self.zarr_writer_info.time_increment_s,
+                channel_names=self.zarr_writer_info.channel_names,
+                channel_colors=self.zarr_writer_info.channel_colors,
+                channel_wavelengths=self.zarr_writer_info.channel_wavelengths,
+                chunk_mode=_def.ZARR_CHUNK_MODE,
+                compression=_def.ZARR_COMPRESSION,
+                is_hcs=is_hcs or not use_6d_fov,  # 5D for HCS and non-HCS default
+                allow_resume=self.zarr_writer_info.allow_resume,
+                force_overwrite=self.zarr_writer_info.force_overwrite,
+            )
+            try:
+                writer = ZarrWriter(config)
+                writer.initialize()
+            except Exception as e:
+                self._log.error(f"Failed to initialize zarr writer for {output_path}: {e}")
+                raise
+            self._zarr_writers[writer_key] = writer
+            if is_hcs:
+                # Write HCS plate and well metadata
+                self._write_hcs_metadata_if_needed(region_id, fov)
+            self._log.info(f"Initialized zarr writer: {output_path}")
+
+        writer = self._zarr_writers[writer_key]
+
+        # Write frame
+        t = info.time_point or 0
+        c = info.configuration_idx
+        z = info.z_index
+
+        if is_hcs or not use_6d_fov:
+            # 5D write
+            writer.write_frame(image, t=t, c=c, z=z)
+        else:
+            # 6D write with FOV index
+            writer.write_frame(image, t=t, c=c, z=z, fov=fov)
+
+        # Record FOV stage position (idempotent - only stores first call per FOV)
+        writer.record_fov_position(
+            x_mm=info.position.x_mm,
+            y_mm=info.position.y_mm,
+            z_mm=info.position.z_mm,
+            fov=fov if (not is_hcs and use_6d_fov) else None,
+        )
+        pass
 
 
 @dataclass
@@ -588,17 +1138,29 @@ class JobRunner(multiprocessing.Process):
         self,
         acquisition_info: Optional[AcquisitionInfo] = None,
         cleanup_stale_ome_files: bool = False,
+        *,
+        backpressure_jobs: Any = None,
+        backpressure_bytes: Any = None,
+        backpressure_event: Any = None,
+        zarr_writer_info: Optional[ZarrWriterInfo] = None,
     ) -> None:
         super().__init__()
         self._log = squid.core.logging.get_logger(__class__.__name__)
         self._acquisition_info = acquisition_info
+        self._zarr_writer_info = zarr_writer_info
 
         self._input_queue: Optional[multiprocessing.Queue] = multiprocessing.Queue()
         self._input_timeout: float = 1.0
         self._output_queue: Optional[multiprocessing.Queue] = multiprocessing.Queue()
         self._shutdown_event: Optional[multiprocessing.Event] = multiprocessing.Event()
+        self._ready_event: multiprocessing.Event = multiprocessing.Event()  # Signals subprocess is ready
         self._pending_count: Optional[multiprocessing.Value] = multiprocessing.Value("i", 0)
         self._shutdown_called: bool = False
+
+        # Backpressure shared values (from BackpressureController)
+        self._bp_jobs = backpressure_jobs
+        self._bp_bytes = backpressure_bytes
+        self._bp_event = backpressure_event
 
         # Clean up stale metadata files from previous crashed acquisitions
         # Only run when explicitly requested (i.e., when OME-TIFF saving is being used)
@@ -614,6 +1176,8 @@ class JobRunner(multiprocessing.Process):
         where has_pending() returns False while a job is being processed.
 
         For SaveOMETiffJob instances, injects acquisition_info before serialization.
+
+        Also updates backpressure counters if configured.
         """
         # Inject acquisition_info into SaveOMETiffJob instances before serialization.
         # The job object is pickled when placed in the queue, so injection must happen here.
@@ -625,17 +1189,46 @@ class JobRunner(multiprocessing.Process):
                 )
             job.acquisition_info = self._acquisition_info
 
+        # Inject zarr_writer_info into SaveZarrJob instances before serialization.
+        if isinstance(job, SaveZarrJob):
+            if self._zarr_writer_info is None:
+                raise ValueError(
+                    "Cannot dispatch SaveZarrJob: JobRunner was initialized without zarr_writer_info. "
+                    "When using ZARR_V3 saving, initialize JobRunner with a ZarrWriterInfo instance."
+                )
+            job.zarr_writer_info = self._zarr_writer_info
+
+        # Calculate image size for backpressure tracking
+        image_bytes = 0
+        if job.capture_image.image_array is not None:
+            image_bytes = job.capture_image.image_array.nbytes
+
         # Increment counter BEFORE putting job in queue to prevent race condition
         # where worker processes job before counter is incremented, causing
         # has_pending() to return False while job is still in flight.
         with self._pending_count.get_lock():
             self._pending_count.value += 1
+
+        # Update backpressure counters
+        if self._bp_jobs is not None:
+            with self._bp_jobs.get_lock():
+                self._bp_jobs.value += 1
+        if self._bp_bytes is not None and image_bytes > 0:
+            with self._bp_bytes.get_lock():
+                self._bp_bytes.value += image_bytes
+
         try:
             self._input_queue.put_nowait(job)
         except Exception:
-            # Rollback counter on queue failure
+            # Rollback all counters on queue failure
             with self._pending_count.get_lock():
                 self._pending_count.value -= 1
+            if self._bp_jobs is not None:
+                with self._bp_jobs.get_lock():
+                    self._bp_jobs.value -= 1
+            if self._bp_bytes is not None and image_bytes > 0:
+                with self._bp_bytes.get_lock():
+                    self._bp_bytes.value -= image_bytes
             raise
         return True
 
@@ -653,6 +1246,41 @@ class JobRunner(multiprocessing.Process):
         with self._pending_count.get_lock():
             return self._pending_count.value > 0
 
+    def wait_ready(self, timeout_s: float = 5.0) -> bool:
+        """Wait for the subprocess to signal it's ready to process jobs.
+
+        Args:
+            timeout_s: Maximum time to wait in seconds.
+
+        Returns:
+            True if subprocess is ready, False if timed out.
+        """
+        return self._ready_event.wait(timeout=timeout_s)
+
+    def is_ready(self) -> bool:
+        """Check if the subprocess is ready without blocking."""
+        return self._ready_event.is_set()
+
+    def set_acquisition_info(self, acquisition_info: AcquisitionInfo) -> None:
+        """Set acquisition info for OME-TIFF saving.
+
+        Thread safety: This method and dispatch() are NOT synchronized. The caller
+        must ensure this method completes BEFORE any dispatch() calls that need
+        the acquisition_info. In practice, this is called during worker init
+        before the acquisition loop starts, so no synchronization is needed.
+        """
+        self._acquisition_info = acquisition_info
+
+    def set_zarr_writer_info(self, zarr_writer_info: ZarrWriterInfo) -> None:
+        """Set zarr writer info for ZARR_V3 saving.
+
+        Thread safety: This method and dispatch() are NOT synchronized. The caller
+        must ensure this method completes BEFORE any dispatch() calls that need
+        the zarr_writer_info. In practice, this is called during worker init
+        before the acquisition loop starts, so no synchronization is needed.
+        """
+        self._zarr_writer_info = zarr_writer_info
+
     def shutdown(self, timeout_s: float = 1.0) -> None:
         """Shutdown the job runner and release multiprocessing resources.
 
@@ -665,6 +1293,14 @@ class JobRunner(multiprocessing.Process):
 
         if self._shutdown_event is not None:
             self._shutdown_event.set()
+        # Send sentinel to wake up worker blocked on queue.get()
+        try:
+            self._input_queue.put_nowait(None)
+        except (queue.Full, OSError, ValueError) as e:
+            # queue.Full: Queue is at capacity (unlikely for sentinel)
+            # OSError: Queue's underlying pipe/semaphore closed
+            # ValueError: Queue has been closed
+            self._log.debug(f"Could not send shutdown sentinel to worker: {e}")
         self.join(timeout=timeout_s)
 
         # Terminate if still alive after timeout
@@ -673,11 +1309,25 @@ class JobRunner(multiprocessing.Process):
             self.terminate()
             self.join(timeout=0.5)
 
-        # Close queues and wait for feeder threads to finish
+        # Close queues and release their feeder threads.
+        #
+        # A multiprocessing.Queue runs a background "feeder" thread in THIS
+        # (producer) process that pushes buffered objects into the underlying pipe.
+        # By the time we reach this point the worker has already been joined or
+        # terminated above, so nothing is draining the input pipe. If more input
+        # jobs were queued than fit in the OS pipe buffer, the feeder is blocked in
+        # send_bytes and join_thread() would deadlock forever (hanging acquisition
+        # teardown and the whole unit suite). Any jobs still buffered at shutdown are
+        # unprocessed by design (the worker is gone), so cancel_join_thread() lets us
+        # abandon the feeder before closing. It makes join_thread() a no-op; the
+        # feeder is a daemon thread so an abandoned one never blocks process exit,
+        # and close() still releases the queue's semaphores.
         if self._input_queue is not None:
+            self._input_queue.cancel_join_thread()
             self._input_queue.close()
             self._input_queue.join_thread()
         if self._output_queue is not None:
+            self._output_queue.cancel_join_thread()
             self._output_queue.close()
             self._output_queue.join_thread()
 
@@ -688,10 +1338,22 @@ class JobRunner(multiprocessing.Process):
         self._pending_count = None
 
     def run(self) -> None:
+        # Signal to main process that we're ready to receive jobs
+        self._ready_event.set()
+
         while not self._shutdown_event.is_set():
             job: Optional[Job] = None
+            image_bytes: int = 0
             try:
                 job = self._input_queue.get(timeout=self._input_timeout)
+
+                # None is a shutdown sentinel - skip processing and check shutdown flag
+                if job is None:
+                    continue
+
+                # Track image bytes for backpressure release
+                if job.capture_image.image_array is not None:
+                    image_bytes = job.capture_image.image_array.nbytes
                 self._log.info(f"Running job {job.job_id}...")
                 result: Any = job.run()
                 # Only queue non-None results (DownsampledViewJob returns None for intermediate FOVs)
@@ -720,4 +1382,22 @@ class JobRunner(multiprocessing.Process):
                 if job is not None:
                     with self._pending_count.get_lock():
                         self._pending_count.value -= 1
+                    # Release backpressure counters and signal capacity
+                    # CRITICAL: Release bytes immediately per-job (not per-well) to prevent z-stack deadlock
+                    if self._bp_jobs is not None:
+                        with self._bp_jobs.get_lock():
+                            self._bp_jobs.value -= 1
+                    if self._bp_bytes is not None and image_bytes > 0:
+                        with self._bp_bytes.get_lock():
+                            self._bp_bytes.value -= image_bytes
+                    if self._bp_event is not None:
+                        self._bp_event.set()  # Signal capacity available
+        # Finalize any zarr writers that are still open
+        try:
+            success = SaveZarrJob.finalize_all_writers()
+            if not success:
+                self._log.error("ZARR FINALIZATION INCOMPLETE - Some data may not be saved correctly")
+        except Exception as e:
+            self._log.error(f"Error finalizing zarr writers during shutdown: {e}")
+
         self._log.info("Shutdown request received, exiting run.")

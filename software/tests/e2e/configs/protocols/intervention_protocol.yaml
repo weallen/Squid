@@ -1,0 +1,28 @@
+name: "Intervention Protocol"
+version: "3.0"
+description: "Imaging workflow with explicit operator checkpoints between acquisitions."
+output_directory: ../outputs
+
+resources:
+  fluidics_config_file: ../fluidics/simulation_fluidics.json
+  fov_file: ../fov_positions/test_2fov_simple.csv
+
+rounds:
+  - name: "Pre-Change Imaging"
+    steps:
+      - step_type: imaging
+        protocol: resource_files/protocols/bf_quick.yaml
+  - name: "Sample Change"
+    steps:
+      - step_type: intervention
+        message: "Replace the sample and confirm focus before resuming."
+  - name: "Post-Change Imaging"
+    steps:
+      - step_type: imaging
+        protocol: resource_files/protocols/bf_quick.yaml
+  - name: "Final Review"
+    steps:
+      - step_type: intervention
+        message: "Inspect the preview data before the final multichannel pass."
+      - step_type: imaging
+        protocol: resource_files/protocols/multichannel_quick.yaml

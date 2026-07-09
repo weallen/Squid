@@ -1,5 +1,22 @@
-from squid.ui.widgets.stage._common import *
-from squid.core.events import MoveStageRelativeCommand
+from squid.ui.widgets.stage._common import (
+    Any,
+    ENABLE_CLICK_TO_MOVE_BY_DEFAULT,
+    EventBusFrame,
+    Optional,
+    QDoubleSpinBox,
+    QFrame,
+    QGridLayout,
+    QLabel,
+    QPushButton,
+    QSizePolicy,
+    QVBoxLayout,
+    StagePositionChanged,
+    handles,
+    squid,
+)
+from qtpy.QtWidgets import QApplication
+from _def import IS_PIEZO_ONLY
+from squid.core.events import MoveStageRelativeCommand, MovePiezoRelativeCommand
 
 
 class NavigationWidget(EventBusFrame):
@@ -44,20 +61,35 @@ class NavigationWidget(EventBusFrame):
         self.btn_moveY_backward: QPushButton
         self.btn_moveZ_forward: QPushButton
         self.btn_moveZ_backward: QPushButton
-        self.checkbox_clickToMove: QCheckBox
         self.grid: QVBoxLayout
 
-        # Subscribe to position updates using base class helper
-        self._subscribe(StagePositionChanged, self._on_position_changed)
+        # Cached position for copy button
+        self._last_x_mm: float = 0.0
+        self._last_y_mm: float = 0.0
+        self._last_z_um: float = 0.0
 
         self.add_components()
         self.setFrameStyle(QFrame.Panel | QFrame.Raised)
 
+    @handles(StagePositionChanged)
     def _on_position_changed(self, event: StagePositionChanged) -> None:
         """Handle position changed event."""
         self.label_Xpos.setNum(event.x_mm)
         self.label_Ypos.setNum(event.y_mm)
         self.label_Zpos.setNum(event.z_mm * 1000)
+        self._last_x_mm = event.x_mm
+        self._last_y_mm = event.y_mm
+        self._last_z_um = event.z_mm * 1000
+
+    def _copy_position_to_clipboard(self) -> None:
+        """Copy current stage position to system clipboard."""
+        text = (
+            f"X: {self._last_x_mm:.4f} mm, "
+            f"Y: {self._last_y_mm:.4f} mm, "
+            f"Z: {self._last_z_um:.1f} um"
+        )
+        QApplication.clipboard().setText(text)
+        self.log.info(f"Position copied to clipboard: {text}")
 
     def add_components(self) -> None:
         x_label = QLabel("X :")
@@ -77,12 +109,6 @@ class NavigationWidget(EventBusFrame):
         self.btn_moveX_forward.setDefault(False)
         self.btn_moveX_backward = QPushButton("Backward")
         self.btn_moveX_backward.setDefault(False)
-
-        self.checkbox_clickToMove = QCheckBox("Click to Move")
-        self.checkbox_clickToMove.setChecked(False)
-        self.checkbox_clickToMove.setSizePolicy(
-            QSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        )
 
         y_label = QLabel("Y :")
         y_label.setFixedWidth(20)
@@ -121,6 +147,26 @@ class NavigationWidget(EventBusFrame):
         self.btn_moveZ_backward = QPushButton("Backward")
         self.btn_moveZ_backward.setDefault(False)
 
+        # Copy Position button
+        self.btn_copyPosition = QPushButton("Copy Pos")
+        self.btn_copyPosition.setDefault(False)
+        self.btn_copyPosition.setToolTip("Copy current stage position (X, Y, Z) to clipboard")
+        self.btn_copyPosition.clicked.connect(self._copy_position_to_clipboard)
+
+        # Tooltips for all controls
+        self.label_Xpos.setToolTip("Current X position in millimeters")
+        self.label_Ypos.setToolTip("Current Y position in millimeters")
+        self.label_Zpos.setToolTip("Current Z position in micrometers")
+        self.entry_dX.setToolTip("Step size for X axis movement (mm)")
+        self.entry_dY.setToolTip("Step size for Y axis movement (mm)")
+        self.entry_dZ.setToolTip("Step size for Z axis movement (um)")
+        self.btn_moveX_forward.setToolTip("Move stage forward along X axis by step size")
+        self.btn_moveX_backward.setToolTip("Move stage backward along X axis by step size")
+        self.btn_moveY_forward.setToolTip("Move stage forward along Y axis by step size")
+        self.btn_moveY_backward.setToolTip("Move stage backward along Y axis by step size")
+        self.btn_moveZ_forward.setToolTip("Move stage up (increase Z) by step size")
+        self.btn_moveZ_backward.setToolTip("Move stage down (decrease Z) by step size")
+
         grid_line0 = QGridLayout()
         grid_line0.addWidget(x_label, 0, 0)
         grid_line0.addWidget(self.label_Xpos, 0, 1)
@@ -139,14 +185,11 @@ class NavigationWidget(EventBusFrame):
         grid_line0.addWidget(self.entry_dZ, 2, 2)
         grid_line0.addWidget(self.btn_moveZ_forward, 2, 3)
         grid_line0.addWidget(self.btn_moveZ_backward, 2, 4)
+        grid_line0.addWidget(self.btn_copyPosition, 0, 5, 3, 1)
 
         self.grid = QVBoxLayout()
         self.grid.addLayout(grid_line0)
         self.set_click_to_move(ENABLE_CLICK_TO_MOVE_BY_DEFAULT)
-        if not ENABLE_CLICK_TO_MOVE_BY_DEFAULT:
-            grid_line3 = QHBoxLayout()
-            grid_line3.addWidget(self.checkbox_clickToMove, 1)
-            self.grid.addLayout(grid_line3)
         self.setLayout(self.grid)
 
         self.entry_dX.valueChanged.connect(self.set_deltaX)
@@ -163,13 +206,8 @@ class NavigationWidget(EventBusFrame):
     def set_click_to_move(self, enabled: bool) -> None:
         self.log.info(f"Click to move enabled={enabled}")
         self.setEnabled_all(enabled)
-        self.checkbox_clickToMove.setChecked(enabled)
-
-    def get_click_to_move_enabled(self) -> bool:
-        return self.checkbox_clickToMove.isChecked()
 
     def setEnabled_all(self, enabled: bool) -> None:
-        self.checkbox_clickToMove.setEnabled(enabled)
         self.btn_moveX_forward.setEnabled(enabled)
         self.btn_moveX_backward.setEnabled(enabled)
         self.btn_moveY_forward.setEnabled(enabled)
@@ -190,14 +228,16 @@ class NavigationWidget(EventBusFrame):
         self._publish(MoveStageRelativeCommand(y_mm=-self.entry_dY.value()))
 
     def move_z_forward(self) -> None:
-        self._publish(
-            MoveStageRelativeCommand(z_mm=self.entry_dZ.value() / 1000)
-        )
+        if IS_PIEZO_ONLY:
+            self._publish(MovePiezoRelativeCommand(delta_um=self.entry_dZ.value()))
+        else:
+            self._publish(MoveStageRelativeCommand(z_mm=self.entry_dZ.value() / 1000))
 
     def move_z_backward(self) -> None:
-        self._publish(
-            MoveStageRelativeCommand(z_mm=-(self.entry_dZ.value() / 1000))
-        )
+        if IS_PIEZO_ONLY:
+            self._publish(MovePiezoRelativeCommand(delta_um=-self.entry_dZ.value()))
+        else:
+            self._publish(MoveStageRelativeCommand(z_mm=-(self.entry_dZ.value() / 1000)))
 
     def set_deltaX(self, value: float) -> None:
         deltaX = round(value / self._x_mm_per_ustep) * self._x_mm_per_ustep

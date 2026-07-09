@@ -1,4 +1,17 @@
-from squid.ui.widgets.stage._common import *
+from squid.ui.widgets.stage._common import (
+    Any,
+    EventBusFrame,
+    QDoubleSpinBox,
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QPushButton,
+    QSizePolicy,
+    QSpinBox,
+    QVBoxLayout,
+    handles,
+    squid,
+)
 from squid.core.events import (
     StartAutofocusCommand,
     StopAutofocusCommand,
@@ -9,8 +22,6 @@ from squid.core.events import (
 
 
 class AutoFocusWidget(EventBusFrame):
-    signal_autoLevelSetting: Signal = Signal(bool)
-
     def __init__(self, event_bus: "UIEventBus", *args: Any, **kwargs: Any) -> None:
         super().__init__(event_bus, *args, **kwargs)
         self.log = squid.core.logging.get_logger(self.__class__.__name__)
@@ -19,12 +30,7 @@ class AutoFocusWidget(EventBusFrame):
         self.entry_delta: QDoubleSpinBox
         self.entry_N: QSpinBox
         self.btn_autofocus: QPushButton
-        self.btn_autolevel: QPushButton
         self.grid: QVBoxLayout
-
-        # Subscribe to autofocus state events
-        self._subscribe(AutofocusProgress, self._on_autofocus_progress)
-        self._subscribe(AutofocusCompleted, self._on_autofocus_completed)
 
         self.add_components()
         self.setFrameStyle(QFrame.Panel | QFrame.Raised)
@@ -55,11 +61,6 @@ class AutoFocusWidget(EventBusFrame):
         self.btn_autofocus.setCheckable(True)
         self.btn_autofocus.setChecked(False)
 
-        self.btn_autolevel = QPushButton("Autolevel")
-        self.btn_autolevel.setCheckable(True)
-        self.btn_autolevel.setChecked(False)
-        self.btn_autolevel.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-
         # layout
         self.grid = QVBoxLayout()
         grid_line0 = QHBoxLayout()
@@ -68,8 +69,6 @@ class AutoFocusWidget(EventBusFrame):
         grid_line0.addSpacing(20)
         grid_line0.addWidget(QLabel("# of Z-Planes"))
         grid_line0.addWidget(self.entry_N)
-        grid_line0.addSpacing(20)
-        grid_line0.addWidget(self.btn_autolevel)
 
         self.grid.addLayout(grid_line0)
         self.grid.addWidget(self.btn_autofocus)
@@ -77,7 +76,6 @@ class AutoFocusWidget(EventBusFrame):
 
         # connections
         self.btn_autofocus.toggled.connect(self._on_autofocus_toggled)
-        self.btn_autolevel.toggled.connect(self.signal_autoLevelSetting.emit)
         self.entry_delta.valueChanged.connect(self._publish_params)
         self.entry_N.valueChanged.connect(self._publish_params)
 
@@ -98,6 +96,7 @@ class AutoFocusWidget(EventBusFrame):
         else:
             self._publish(StopAutofocusCommand())
 
+    @handles(AutofocusProgress)
     def _on_autofocus_progress(self, event: AutofocusProgress) -> None:
         """Handle progress updates (placeholder for future UI)."""
         # No progress bar present; keep hook for future use.
@@ -105,6 +104,7 @@ class AutoFocusWidget(EventBusFrame):
             f"Autofocus progress: step {event.current_step}/{event.total_steps}"
         )
 
+    @handles(AutofocusCompleted)
     def _on_autofocus_completed(self, event: AutofocusCompleted) -> None:
         """Re-enable controls after autofocus finishes."""
         self.btn_autofocus.setChecked(False)

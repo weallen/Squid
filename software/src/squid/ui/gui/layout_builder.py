@@ -21,13 +21,10 @@ from qtpy.QtWidgets import (
 )
 import pyqtgraph.dockarea as dock
 
-from _def import (
-    USE_NAPARI_FOR_LIVE_CONTROL,
-    USE_NAPARI_WELL_SELECTION,
-    SHOW_DAC_CONTROL,
-    SUPPORT_LASER_AUTOFOCUS,
-)
+from squid.core.config.feature_flags import get_feature_flags
 from squid.ui.widgets import CollapsibleGroupBox
+
+_FEATURE_FLAGS = get_feature_flags()
 
 # Fixed width for the right control panel
 CONTROL_PANEL_WIDTH = 500
@@ -40,8 +37,14 @@ def setup_control_panel_layout(gui: "HighContentScreeningGui") -> None:
     layout.setContentsMargins(4, 4, 4, 4)
     layout.setSpacing(4)
 
+    # Getting Started panel (onboarding, shown for new users)
+    if getattr(gui, "gettingStartedWidget", None) is not None:
+        getting_started_group = CollapsibleGroupBox("Getting Started")
+        getting_started_group.content.addWidget(gui.gettingStartedWidget)
+        layout.addWidget(getting_started_group)
+
     # Top section (Profile/Live Control) - always visible, not collapsible
-    if USE_NAPARI_FOR_LIVE_CONTROL and not gui.live_only_mode:
+    if _FEATURE_FLAGS.is_enabled("USE_NAPARI_FOR_LIVE_CONTROL") and not gui.live_only_mode:
         layout.addWidget(gui.navigationWidget)
     else:
         layout.addWidget(gui.profileWidget)
@@ -53,7 +56,7 @@ def setup_control_panel_layout(gui: "HighContentScreeningGui") -> None:
     layout.addWidget(camera_group)
 
     # DAC Control section - collapsible (if enabled)
-    if SHOW_DAC_CONTROL:
+    if _FEATURE_FLAGS.is_enabled("SHOW_DAC_CONTROL"):
         dac_group = CollapsibleGroupBox("DAC Control")
         dac_group.content.addWidget(gui.dacControlWidget)
         layout.addWidget(dac_group)
@@ -123,7 +126,7 @@ def setup_single_window_layout(gui: "HighContentScreeningGui") -> None:
     # Well Selector dock (bottom)
     gui.dock_wellSelection = dock.Dock("Well Selector", autoOrientation=False)
     gui.dock_wellSelection.showTitleBar()
-    if not USE_NAPARI_WELL_SELECTION or gui.live_only_mode:
+    if not _FEATURE_FLAGS.is_enabled("USE_NAPARI_WELL_SELECTION") or gui.live_only_mode:
         gui.dock_wellSelection.addWidget(gui.wellSelectionWidget)
         gui.dock_wellSelection.setFixedHeight(
             gui.dock_wellSelection.minimumSizeHint().height()
@@ -140,7 +143,7 @@ def setup_single_window_layout(gui: "HighContentScreeningGui") -> None:
     main_dockArea.addDock(gui.dock_controls, "right")
 
     # Focus Lock dock (below Controls, if available)
-    if SUPPORT_LASER_AUTOFOCUS:
+    if _FEATURE_FLAGS.is_enabled("SUPPORT_LASER_AUTOFOCUS"):
         focus_lock_widget = getattr(gui, "focusLockStatusWidget", None)
         if focus_lock_widget is not None:
             gui.dock_focusLock = dock.Dock("Focus Lock", autoOrientation=False)
@@ -154,7 +157,9 @@ def setup_single_window_layout(gui: "HighContentScreeningGui") -> None:
             # Connect collapse to change height
             _setup_focus_lock_collapse(gui, focus_lock_widget)
 
-    gui.setCentralWidget(main_dockArea)
+    # Wrap with warning banner if simulated disk I/O is enabled
+    central_widget = _wrap_with_warning_banner(gui, main_dockArea)
+    gui.setCentralWidget(central_widget)
 
     gui.setMinimumSize(*get_main_window_minimum_size())
     gui.onTabChanged(gui.recordTabWidget.currentIndex())
@@ -181,6 +186,21 @@ def _setup_focus_lock_collapse(gui: "HighContentScreeningGui", focus_lock_widget
 
         focus_lock_widget._collapse_btn.clicked.disconnect()
         focus_lock_widget._collapse_btn.clicked.connect(on_collapse_toggle)
+
+
+def _wrap_with_warning_banner(gui: "HighContentScreeningGui", main_widget: QWidget) -> QWidget:
+    """Wrap main widget with a warning banner if simulated disk I/O is enabled."""
+    if getattr(gui, "simulated_io_warning_banner", None) is None:
+        return main_widget
+
+    # Create container with banner on top
+    container = QWidget()
+    layout = QVBoxLayout(container)
+    layout.setContentsMargins(0, 0, 0, 0)
+    layout.setSpacing(0)
+    layout.addWidget(gui.simulated_io_warning_banner)
+    layout.addWidget(main_widget)
+    return container
 
 
 def setup_multi_window_layout(gui: "HighContentScreeningGui") -> None:

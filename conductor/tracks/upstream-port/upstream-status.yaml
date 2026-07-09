@@ -1,0 +1,741 @@
+meta:
+  source_branch: upstream/master
+  target_branch: multipoint-refactor
+  cutoff_date: '2025-12-12'
+  created: '2026-01-12'
+  last_verified: '2026-03-04T14:30:43'
+commits:
+  295afbb3:
+    title: 'fix: Disable memory profiling in CI to fix test hangs (#451)'
+    status: skipped
+    skip_reason: not-applicable
+    skip_justification: CI configuration is specific to upstream repository. arch_v2 has its own CI config.
+    skip_date: '2026-01-12'
+  47e7aff7:
+    title: 'feat: Add alignment button for sample registration with previous acquisitions (#448)'
+    status: ported
+    ported_in: b4aa7255
+    ported_date: '2026-01-12'
+  c3322bb1:
+    title: 'fix: Resolve backpressure deadlock with z-stack acquisitions (#446)'
+    status: ported
+    ported_in: f5130544
+    ported_date: '2026-01-12'
+    ported_with:
+    - 081fd7e9
+    - c28b372b
+    - 97f85d1b
+    - e9c6249b
+    - 6bffd2d3
+  98c50432:
+    title: 'fix: Update stale channel_configuration_manager references after PR #441 (#449)'
+    status: ported
+    ported_date: '2026-02-02'
+    notes: Absorbed into YAML config migration (Phase 3). All consumer references updated from ChannelConfigurationManager
+      to ChannelConfigService.
+  '57378358':
+    title: 'feat: Add acquisition throttling settings in Preferences (#444)'
+    status: ported
+    ported_in: b7448360
+    ported_date: '2026-01-12'
+    ported_with:
+    - 5ad9252a
+  cc205460:
+    title: 'fix: Fix NapariLiveWidget Qt signal connection and camera attribute (#443)'
+    status: skipped
+    skip_reason: already-fixed
+    skip_justification: 'arch_v2 NapariLiveWidget already has correct .connect() syntax and
+
+      takes exposure_limits as constructor parameter rather than accessing
+
+      self.camera directly. The arch_v2 design prevents this bug.
+
+      '
+    skip_date: '2026-01-12'
+  4234d34b:
+    title: 'feat: NDViewer tab with live viewing and plate navigation (#428)'
+    status: ported
+    ported_in: 2327bb84
+    ported_date: '2026-01-12'
+    notes: 'Ported with arch_v2 EventBus integration. Added ndviewer_light as git submodule
+
+      at software/src/squid/ui/widgets/ndviewer_light (using weallen fork). Includes:
+
+      - NDViewerTab widget with lazy loading
+
+      - Auto-update on AcquisitionStarted event via EventBus
+
+      - Plate view → NDViewer FOV navigation on double-click
+
+      - Updated fluidics_v2 submodule to weallen fork
+
+      '
+  3866b183:
+    title: 'refactor: Remove legacy config managers, centralize in ConfigRepository (#441)'
+    status: ported
+    ported_date: '2026-02-02'
+    notes: Absorbed into YAML config migration (Phases 0-3). ConfigRepository ported, ChannelConfigService created as EventBus
+      wrapper. All 20+ consumer files migrated from ChannelMode to AcquisitionChannel and ChannelConfigurationManager to ChannelConfigService.
+      Old managers retained for ConfigurationManager legacy compat (Phase 4 cleanup pending).
+  e9c6249b:
+    title: 'fix: Backpressure byte tracking and multiprocessing resource cleanup (#442)'
+    status: ported
+    ported_in: f5130544
+    ported_date: '2026-01-12'
+    ported_with:
+    - 081fd7e9
+    - c28b372b
+    - 97f85d1b
+    - c3322bb1
+    - 6bffd2d3
+  6bffd2d3:
+    title: 'refactor: Simplify code from PRs 434/436, fix saving path bug, improve status bar (#440)'
+    status: ported
+    ported_in: f5130544
+    ported_date: '2026-01-12'
+    ported_with:
+    - 081fd7e9
+    - c28b372b
+    - 97f85d1b
+    - c3322bb1
+    - e9c6249b
+  13eff115:
+    title: 'refactor: New design for illumination channel configs and acquisition configs (#417)'
+    status: ported
+    ported_date: '2026-02-02'
+    notes: Absorbed into YAML config migration (Phase 0). Models ported to squid/core/config/models/ (AcquisitionChannel,
+      IlluminationChannelConfig, ConfocalConfig, etc.) with ConfigRepository in squid/core/config/repository.py.
+  97f85d1b:
+    title: 'feat: Add backpressure status bar widget for acquisition monitoring (#438)'
+    status: ported
+    ported_in: f5130544
+    ported_date: '2026-01-12'
+    ported_with:
+    - 081fd7e9
+    - c28b372b
+    - c3322bb1
+    - e9c6249b
+    - 6bffd2d3
+  081fd7e9:
+    title: 'feat: Add acquisition backpressure to prevent RAM exhaustion (#436)'
+    status: ported
+    ported_in: f5130544
+    ported_date: '2026-01-12'
+    ported_with:
+    - c28b372b
+    - 97f85d1b
+    - c3322bb1
+    - e9c6249b
+    - 6bffd2d3
+  c28b372b:
+    title: 'feat: Add live RAM usage monitoring display in status bar (#434)'
+    status: ported
+    ported_in: f5130544
+    ported_date: '2026-01-12'
+    ported_with:
+    - 081fd7e9
+    - 97f85d1b
+    - c3322bb1
+    - e9c6249b
+    - 6bffd2d3
+  a48fa4bc:
+    title: 'docs: Add simulated disk I/O documentation (#432)'
+    status: skipped
+    skip_reason: not-applicable
+    skip_justification: 'Documentation for upstream repo. arch_v2 has inline docstrings and tooltips
+
+      in the implementation. No separate docs file needed.
+
+      '
+    skip_date: '2026-01-12'
+  0ce8d626:
+    title: 'docs: Move dynamic-widget-visibility.md to software/docs/pending (#433)'
+    status: skipped
+    skip_reason: not-applicable
+    skip_justification: Internal documentation reorganization specific to upstream repository.
+    skip_date: '2026-01-12'
+  b91694f1:
+    title: 'feat: Add simulated disk I/O mode for development (#431)'
+    status: ported
+    ported_in: a8121d30
+    ported_date: '2026-01-12'
+    notes: 'Ported simulated disk I/O mode with arch_v2 adaptations. Uses lazy imports
+
+      to avoid circular dependencies. Settings UI in Preferences > Advanced.
+
+      '
+  fc57e3da:
+    title: 'feat: Persist last used base saving path for multipoint widgets (#430)'
+    status: ported
+    ported_in: 505368ed
+    ported_date: '2026-01-12'
+  5ad9252a:
+    title: 'fix: Regenerate SimulatedCamera frame when binning changes (#429)'
+    status: ported
+    ported_in: b7448360
+    ported_date: '2026-01-12'
+    ported_with:
+    - '57378358'
+  f8c05d0d:
+    title: 'feat: Add run_acquisition_from_yaml TCP command and CLI script (#422)'
+    status: ported
+    ported_in: 353673d4
+    ported_date: '2026-01-12'
+    notes: 'Ported with arch_v2 EventBus pattern. TCP server uses EventBus commands exclusively
+
+      for decoupled communication rather than direct widget manipulation. Includes:
+
+      - TCPControlServer with run_acquisition_from_yaml command
+
+      - CLI script at tools/run_acquisition.py
+
+      - --start-server flag for main_hcs.py
+
+      '
+  afd71c97:
+    title: 'feat: Add MCP commands for view settings control (RAM debugging) (#425)'
+    status: skipped
+    skip_reason: superseded
+    skip_justification: 'MCP commands for runtime view settings control. Relies on upstream''s control._def
+
+      module-level variables pattern for runtime state. arch_v2 uses EventBus and Pydantic
+
+      config for state management instead. Would require significant rearchitecting to
+
+      adapt to arch_v2''s event-driven approach. View settings can be controlled through
+
+      arch_v2''s existing Preferences dialog.
+
+      '
+    skip_date: '2026-01-12'
+  aa817c0b:
+    title: 'chore: Update napari version in setup script and app name (#426)'
+    status: skipped
+    skip_reason: not-applicable
+    skip_justification: Setup script and app name changes specific to upstream repository. arch_v2 has its own setup configuration.
+    skip_date: '2026-01-12'
+  2b1e2f6d:
+    title: 'feat: Runtime control of view settings via MCP for RAM debugging (#424)'
+    status: skipped
+    skip_reason: superseded
+    skip_justification: 'Enables runtime control of view settings via MCP by standardizing access to control._def
+
+      module variables. arch_v2 uses EventBus and Pydantic config models instead of module-level
+
+      variables. The arch_v2 PreferencesDialog already provides view settings control; runtime
+
+      MCP control would need to be redesigned around EventBus commands if desired.
+
+      '
+    skip_date: '2026-01-12'
+  98c7fbd6:
+    title: 'feat: Save and restore camera settings on close/startup (#423)'
+    status: ported
+    ported_in: 505368ed
+    ported_date: '2026-01-12'
+    ported_with:
+    - fc57e3da
+  88db4da8:
+    title: 'feat: Save and load acquisition parameters via YAML (#421)'
+    status: ported
+    ported_in: fa63dbc6
+    ported_date: '2026-01-12'
+  e3b55491:
+    title: 'perf: Optimize plate view boundary drawing for large plates (#415)'
+    status: ported
+    ported_in: 692ce880
+    ported_date: '2026-01-12'
+    ported_with:
+    - ee39b87
+    - c10c9ea
+  c10c9eae:
+    title: 'perf: Optimize downsampling with user-selectable interpolation methods (#418)'
+    status: ported
+    ported_in: 692ce880
+    ported_date: '2026-01-12'
+    ported_with:
+    - ee39b87
+    - e3b5549
+  ee39b870:
+    title: 'feat: Add Views tab to Configuration dialog for downsampled view settings (#395)'
+    status: ported
+    ported_in: 692ce880
+    ported_date: '2026-01-12'
+    ported_with:
+    - c10c9ea
+    - e3b5549
+  01cf41ae:
+    title: 'tool: Add timing instrumentation (for downsampled plate view pipeline) (#416)'
+    status: ported
+    ported_in: ae2e81eb
+    ported_date: '2026-01-12'
+  0d0e101b:
+    title: 'feat: Add level trigger support for ToupCam cameras (#386)'
+    status: ported
+    ported_in: ae2e81eb
+    ported_date: '2026-01-12'
+  3c08a706:
+    title: 'fix: strip inline comments from INI config values (#414)'
+    status: ported
+    ported_in: ae2e81eb
+    ported_date: '2026-01-12'
+  9e711ecc:
+    title: 'refactor: Improve microscope.py code quality and API design (#402)'
+    status: ported
+    ported_in: ae2e81eb
+    ported_date: '2026-01-12'
+  251baa4e:
+    title: 'fix: Fix semaphore leak in JobRunner multiprocessing primitives (#413)'
+    status: ported
+    ported_in: c9f35752
+    ported_date: '2026-01-12'
+    ported_with:
+    - 01acbf9
+    - 991b08d
+  8273609a:
+    title: 'refactor: move AcquisitionInfo to JobRunner context for metadata consistency (#367)'
+    status: ported
+    ported_in: 345c21d3
+    ported_date: '2026-01-12'
+  01acbf99:
+    title: 'fix: Fix JobRunner.has_pending() to track jobs in progress (#411)'
+    status: ported
+    ported_in: c9f35752
+    ported_date: '2026-01-12'
+    ported_with:
+    - 251baa4
+    - 991b08d
+  785ed6ef:
+    title: 'fix: Prevent segfault on application exit (#410)'
+    status: ported
+    ported_in: ae2e81eb
+    ported_date: '2026-01-12'
+  991b08d6:
+    title: 'fix: Improve SurfacePlotWidget Z-stack handling and single FOV support (#409)'
+    status: ported
+    ported_in: c9f35752
+    ported_date: '2026-01-12'
+    ported_with:
+    - 251baa4
+    - 01acbf9
+  d0ce37a7:
+    title: 'feat: Add ZMotorConfig enum and improve piezo-only mode support (#408)'
+    status: ported
+    ported_in: ae2e81eb
+    ported_date: '2026-01-12'
+  2a48f9b6:
+    title: 'feat: add Claude Code integration (#405)'
+    status: skipped
+    skip_reason: not-applicable
+    skip_justification: Claude Code integration is repository-specific tooling. arch_v2 has its own .claude/ configuration.
+    skip_date: '2026-01-12'
+  2a79ccca:
+    title: 'feat: Add desktop shortcut creation to setup script (#406)'
+    status: ported
+    ported_in: ae2e81eb
+    ported_date: '2026-01-12'
+  6651393e:
+    title: 'feat: Add build flag to disable laser interlock for systems without lasers (#401)'
+    status: ported
+    ported_in: 1eb5b286
+    ported_date: '2026-01-12'
+  3a641bb0:
+    title: 'docs: Improve firmware upload instructions (#400)'
+    status: ported
+    ported_in: 1eb5b286
+    ported_date: '2026-01-12'
+  9db787e0:
+    title: 'feat: Add laser safety interlock functionality (#399)'
+    status: ported
+    ported_in: 1eb5b286
+    ported_date: '2026-01-12'
+  b55ff21c:
+    title: 'feat: Add firmware tests, CI workflow, and firmware-software integration tests (#398)'
+    status: ported
+    ported_in: 1eb5b286
+    ported_date: '2026-01-12'
+  acc5cf7c:
+    title: 'refactor: Reorganize firmware and add PlatformIO support (#397)'
+    status: ported
+    ported_in: 1eb5b286
+    ported_date: '2026-01-12'
+  a4db687a:
+    title: Firmware v3 (#335) (#396)
+    status: ported
+    ported_in: 962a7956
+    ported_date: '2026-01-12'
+  b3859044:
+    title: 'feat: Refactor channel configuration to eliminate duplication across … (#392)'
+    status: ported
+    ported_in: 962a7956
+    ported_date: '2026-01-12'
+  ad9479d9:
+    title: 'feat: Add downsampled well and plate view for Select Wells mode (#387)'
+    status: ported
+    ported_in: a922e58d
+    ported_date: '2026-01-12'
+  e3e1730e:
+    title: 'fix: Preserve scan size consistency in Select Wells mode (#393)'
+    status: ported
+    ported_in: 962a7956
+    ported_date: '2026-01-12'
+  67dfbf56:
+    title: 'fix: Resolve test segfaults / hang + Qt compatibility update + .pre-commit-config (#391)'
+    status: ported
+    ported_in: 962a7956
+    ported_date: '2026-01-12'
+  decdcc7b:
+    title: 'feat: Add Configuration dialog for editing settings via GUI (#389)'
+    status: ported
+    ported_in: 962a7956
+    ported_date: '2026-01-12'
+  c7bf416a:
+    title: 'fix: Replace napari icon and menu with Cephla''s (#388)'
+    status: ported
+    ported_in: 962a7956
+    ported_date: '2026-01-12'
+  2fd98163:
+    title: 'fix: Actually free RAM when clearing mosaic view layers (#385)'
+    status: ported
+    ported_in: 962a7956
+    ported_date: '2026-01-12'
+  f416d581:
+    title: 'feat: Add RAM usage check for mosaic view before acquisition (#382)'
+    status: ported
+    ported_in: 962a7956
+    ported_date: '2026-01-12'
+  1b71973d:
+    title: 'feat: Add Skip Saving checkbox to multipoint acquisition widgets (#383)'
+    status: ported
+    ported_in: 962a7956
+    ported_date: '2026-01-12'
+  d8e41e23:
+    title: 'Fix: Use camera exposure time in simulation mode (#381)'
+    status: ported
+    ported_in: 962a7956
+    ported_date: '2026-01-12'
+  4bfa2a00:
+    title: 'bug fix: switching to 1536 well plate (#380)'
+    status: ported
+    ported_in: 962a7956
+    ported_date: '2026-01-12'
+  412c81dd:
+    title: Install PyVCAM using pip (#377)
+    status: ported
+    ported_in: 962a7956
+    ported_date: '2026-01-12'
+  9995e5cd:
+    title: 'feat: save log in acquisition folder (#374)'
+    status: ported
+    ported_in: 962a7956
+    ported_date: '2026-01-12'
+  4e940f75:
+    title: 'bug fix: minor fix for #372 and #373 (#375)'
+    status: ported
+    ported_in: f1725bc5
+    ported_date: '2026-01-12'
+    ported_with:
+    - 6eb3427
+  6eb34276:
+    title: 'gui: 1536 well plate mouse selection (#372)'
+    status: ported
+    ported_in: f1725bc5
+    ported_date: '2026-01-12'
+    ported_with:
+    - 4e940f7
+  1241941e:
+    title: 'gui: add dialog for showing fovs to image in fluidics runs (#373)'
+    status: ported
+    ported_in: 962a7956
+    ported_date: '2026-01-12'
+  7b9d0e3a:
+    title: Fix Laser AF exposure UI to use focus camera limits and laser AF calibration coefficient unit (#371)
+    status: ported
+    ported_in: 962a7956
+    ported_date: '2026-01-12'
+  3d5b7922:
+    title: 'feat: Skip hardware initialization on restart after settings change (#471)'
+    status: ported
+    ported_in: 3fc76ade
+    ported_date: '2026-01-24'
+    notes: Ported skip-init-on-restart feature with arch_v2 adaptations
+  364d2cf1:
+    title: 'feat: Add per-component hardware simulation controls (#468)'
+    status: ported
+    ported_in: 3fc76ade
+    ported_date: '2026-01-24'
+    notes: Ported per-component simulation controls to arch_v2
+  5b10bca4:
+    title: 'refactor: Reorganize Preferences dialog (#470)'
+    status: skipped
+    skip_reason: superseded
+    skip_justification: arch_v2 has its own PreferencesDialog structure with different organization
+    skip_date: '2026-01-24'
+  5a22a08b:
+    title: 'fix: UI improvements - maximize window and rename menu item (#469)'
+    status: ported
+    ported_in: 3fc76ade
+    ported_date: '2026-01-24'
+    notes: Window maximize and menu improvements ported
+  0346d508:
+    title: 'feat: Add Slack notifications for acquisition events (#466)'
+    status: skipped
+    skip_reason: deferred
+    skip_justification: Skipped per user request - can be added later if needed
+    skip_date: '2026-01-24'
+  17ed8c7b:
+    title: 'feat: Add status bar widget for displaying warnings and errors (#467)'
+    status: ported
+    ported_in: e307a6f0
+    ported_date: '2026-01-24'
+    notes: Ported as warning_error_widget.py with arch_v2 EventBus integration
+  03f4d11c:
+    title: FLIR camera driver update (#365)
+    status: ported
+    ported_in: 3fc76ade
+    ported_date: '2026-01-24'
+    notes: Added FLIRCameraModel enum, full driver refactor deferred
+  0dcbcef2:
+    title: 'fix: live illumination switching w/ hardware trigger (#419)'
+    status: ported
+    ported_in: 3fc76ade
+    ported_date: '2026-01-24'
+    notes: Fixed illumination switching during hardware-triggered acquisition
+  c58983c0:
+    title: 'feat: Integrate NDViewer push-based API for live acquisition (#465)'
+    status: ported
+    ported_in: 3fc76ade
+    ported_date: '2026-01-24'
+    notes: Ported NDViewer push API with EventBus events (NDViewerStartAcquisition, etc.)
+  a1dfc4ad:
+    title: 'fix: Terminate GUI after --wait acquisition completes in run_acquisition.py (#464)'
+    status: skipped
+    skip_reason: not-applicable
+    skip_justification: arch_v2 run_acquisition.py is TCP client only, no GUI launching
+    skip_date: '2026-01-24'
+  44264e3c:
+    title: 'fix: Use QMetaObject.invokeMethod for TCP acquisition GUI state update (#463)'
+    status: skipped
+    skip_reason: not-applicable
+    skip_justification: arch_v2 uses EventBus for thread-safe GUI updates, not QMetaObject.invokeMethod
+    skip_date: '2026-01-24'
+  ddd5a549:
+    title: 'feat: Add settings option to enable/disable NDViewer tab (#462)'
+    status: ported
+    ported_in: 3fc76ade
+    ported_date: '2026-01-24'
+    notes: Added ENABLE_NDVIEWER_TAB setting in _def.py and PreferencesDialog
+  5f4b158c:
+    title: 'fix: Race condition in the NapariLiveWidget for the new alignment feature (#461)'
+    status: ported
+    ported_in: 3fc76ade
+    ported_date: '2026-01-24'
+    notes: Fixed MCU timeout race condition in alignment feature
+  0f4cbb8d:
+    title: 'feat: Add detailed MCU command logging for debugging (#460)'
+    status: ported
+    ported_in: 3fc76ade
+    ported_date: '2026-01-24'
+    notes: Added verbose MCU command logging to microcontroller.py
+  606e4175:
+    title: 'fix: Initialize Optospin filter wheel positions on startup (#459)'
+    status: ported
+    ported_in: 3fc76ade
+    ported_date: '2026-01-24'
+    notes: One-line fix to initialize filter wheel positions
+  fbd9eda5:
+    title: 'fix: mcu cmd timeout and toupcam strobe delay fixes (#458)'
+    status: ported
+    ported_in: 3fc76ade
+    ported_date: '2026-01-24'
+    notes: Hardware timing fixes for MCU and ToupCam
+  9a015e0f:
+    title: Tucsen Libra25 support (#437)
+    status: ported
+    ported_in: 3fc76ade
+    ported_date: '2026-01-24'
+    notes: Added ModeLibra enum, model properties, and configuration for Libra25
+  f270061a:
+    title: 'fix: Preserve manual region drawing order during acquisition (#457)'
+    status: ported
+    ported_in: 3fc76ade
+    ported_date: '2026-01-24'
+    notes: Fixed region ordering in scan_coordinates.py
+  b352f0a7:
+    title: 'fix: Suppress stale read warnings in simulation mode (#456)'
+    status: ported
+    ported_in: 3fc76ade
+    ported_date: '2026-01-24'
+    notes: Reduced log noise in simulation mode
+  cf4f1784:
+    title: 'fix: User profile migration and spot detection mode fixes (#455)'
+    status: ported
+    ported_date: '2026-02-02'
+    notes: Absorbed into YAML config migration (Phase 2). Migration script at tools/migrate_to_yaml_configs.py handles JSON-to-YAML
+      profile migration. SpotDetectionMode included in new LaserAFConfig model.
+  e5cd025c:
+    title: 'fix: Sync contrast limits and add user feedback for alignment errors (#454)'
+    status: ported
+    ported_in: 3fc76ade
+    ported_date: '2026-01-24'
+    notes: Improved contrast sync and alignment error feedback
+  82dafa6f:
+    title: 'fix: Laser AF spot detection mode and None safety checks (#453)'
+    status: ported
+    ported_date: '2026-02-02'
+    notes: 'Absorbed into YAML config migration. New LaserAFConfig model in squid/core/config/models/laser_af_config.py includes
+      spot_detection_mode field with SpotDetectionMode enum and reference image serialization. All None-safety fixes ported:
+      x_reference guard in initialize_manual() and measure_displacement(), None configuration guard in set_microscope_mode(),
+      get_spot_detection_mode() accessor used in _detect_spot_in_frame().'
+  fe927b0f:
+    title: 'docs: Add comprehensive documentation for configuration system (#447)'
+    status: ported
+  bf30b5c9:
+    title: 'fix: XLight filter slider serial communication and add getter method (#472)'
+    status: ported
+    ported_in: 6eda4bdc
+    ported_date: '2026-01-24'
+    notes: Fixed write_and_check retry logic, set_filter_slider expected response (V->P), added get_filter_slider method
+  5a9d3c12:
+    title: 'fix: Replace Qt-based logging handler with fork-safe BufferingHandler (#487)'
+    status: ported
+    ported_in: b5d60c76
+    ported_date: '2026-02-02'
+    notes: BufferingHandler in core/logging.py with queue.Queue + QTimer polling. QtLoggingHandler preserved for backward
+      compat. 5 unit tests.
+  34920a51:
+    title: 'feat: Add illumination timeout (auto-shutoff) safety feature (#486)'
+    status: ported
+    ported_date: '2026-02-02'
+    notes: SET_ILLUMINATION_TIMEOUT cmd 40, auto-config at MCU startup (v1.1+), SimSerial timeout tracking. 3s default safety
+      shutoff for lasers.
+  ef375f28:
+    title: 'feat: Multi-port illumination control + laser port naming refactor (#481)'
+    status: ported
+    ported_date: '2026-02-02'
+    notes: 'CMD_SET 34-39 for multi-port control. SimSerial firmware version/port status. MCU: 7 new methods + firmware version
+      detection. IlluminationController multi-port API. 19 unit tests.'
+  7fc1ce34:
+    title: 'refactor: Remove dead code ImageArrayDisplayWindow (#482)'
+    status: skipped
+    skip_reason: not-applicable
+    skip_justification: arch_v2 still actively uses ImageArrayDisplayWindow, PlateReader widgets, SINGLE_WINDOW, and USE_NAPARI_FOR_MULTIPOINT.
+      These are not dead code in the 3-layer architecture. Upstream removal reflects different usage patterns.
+    skip_date: '2026-02-02'
+  064ee07d:
+    title: 'refactor: Rename laser constants from wavelength-based to port-based names (#479)'
+    status: ported
+    ported_date: '2026-02-02'
+    notes: ILLUMINATION_D1-D5 port aliases, ILLUMINATION_PORT class, mapping functions. Legacy wavelength names kept as aliases.
+      D3/D4 non-sequential mapping documented.
+  da8f193a:
+    title: 'feat: Add Workflow Runner for automating scripts with acquisitions (#480)'
+    status: ported
+    ported_in: d96b9034
+    ported_date: '2026-02-02'
+    notes: Ported to 3-layer architecture as WorkflowRunnerController (StateMachine + EventBus + CancelToken). Models in backend/controllers/workflow_runner/models.py,
+      state machine in state.py, controller in workflow_runner_controller.py. UI dialog in ui/widgets/workflow/workflow_runner_dialog.py.
+      DI wired in application.py. 46 unit tests. experiment_id filtering prevents cross-talk with OrchestratorController.
+  9a74aea7:
+    title: 'feat: Add second filter wheel (W2) support (#478)'
+    status: ported
+    ported_date: '2026-02-02'
+    notes: 'AXIS.W2, MOVE_W2, INITFILTERWHEEL_W2 constants. MCU: move_w2_usteps, home_w2, zero_w2, axis param for init_filter_wheel/configure_squidfilter.
+      SimSerial W2 handling. SquidFilterWheel driver extended for multi-wheel via _WHEEL_AXIS routing. SQUID_FILTERWHEEL_CONFIGS
+      dict for per-wheel config.'
+  171aed9b:
+    title: 'feat: Multi-camera support foundation - schema, hardware bindings, channel config UI (#450)'
+    status: ported
+    ported_date: '2026-02-02'
+    notes: 'Models absorbed into YAML config migration (Phase 0): CameraRegistryConfig, FilterWheelRegistryConfig, HardwareBindingsConfig,
+      multi-camera ConfigRepository extensions. UI dialogs for channel config editing not yet ported.'
+  1221c7e6:
+    title: 'feat: Add X-Light V1/V2 protocol support with auto-detection (#477)'
+    status: ported
+    ported_in: b5d60c76
+    ported_date: '2026-02-02'
+    notes: 'Protocol auto-detection: try V3 115200 first, fall back to V1/V2 9600. Filter slider guards added to confocal
+      widget.'
+  996d53b3:
+    title: 'feat: Add zarr v3 saving with OME-NGFF compliant output (#474)'
+    status: ported
+    ported_date: '2026-02-02'
+    notes: Zarr v3 saving with TensorStore + OME-NGFF compliant output. Adapted from Qt signals to EventBus. ZarrWriter in
+      backend/io/writers/, SaveZarrJob in job_processing, NDViewer zarr push-mode via events. 79 unit tests ported.
+  5708299d:
+    title: 'feat: Display stage position on laser-based focus tab (#476)'
+    status: ported
+    ported_in: b5d60c76
+    ported_date: '2026-02-02'
+    notes: 'One-line fix: pass event_bus to imageDisplayWindow_focus constructor. ImageDisplayWindow already handles StagePositionChanged
+      events.'
+  c99140b7:
+    title: 'fix: Use threaded operations for XLight controls to prevent UI freeze (#475)'
+    status: skipped
+    skip_reason: superseded
+    skip_justification: arch_v2 uses service layer pattern where threading is handled by the service (RLock-based), not the
+      driver or UI widget. XLight operations should go through SpinningDiskService which handles thread safety. If blocking
+      is still an issue, fix belongs in the service layer, not the widget.
+    skip_date: '2026-02-02'
+  be019383:
+    title: 'refactor: Backpressure system lifecycle enforcement and test coverage (#488)'
+    status: in-progress
+  2cbf3fa8:
+    title: 'fix: minor UI and path fixes (#494)'
+    status: ported
+    ported_date: '2026-02-07'
+    notes: Path separator fix (Path / operator) in _def.py, text selectability in warning_error_widget.py. Test dir rename
+      skipped (different structure).
+  833ae523:
+    title: 'feat: Workflow Runner - Edit button and multiple Acquisition sequences with config paths (#493)'
+    status: in-progress
+  a3962c55:
+    title: 'fix: organize files and fix install script (#491)'
+    status: ported
+    ported_date: '2026-02-07'
+    notes: Added ndv, filelock, lxml_html_clean, psutil to setup script. benchmark_plate_view move skipped (file not in arch_v2).
+  644ac383:
+    title: 'feat: Open Chamber fluidics support and FluidicsWidget enhancements (#489)'
+    status: in-progress
+  88c0065c:
+    title: 'feat: Wellplate calibration improvements - center point method and parameter editing (#490)'
+    status: in-progress
+  2408902a:
+    title: 'fix: prevent level trigger from never ending when retriggered too fast (#500)'
+    status: ported
+    ported_date: '2026-03-05'
+    analysis_file: commits/27-pending-march-ports.md
+  84b49652:
+    title: 'fix: Move z_offset_um to AcquisitionChannel level in add channel dialog (#502)'
+    status: skipped
+    skip_reason: already-fixed
+    skip_justification: arch_v2 schema already has z_offset_um on AcquisitionChannel with explicit comment referencing this upstream bug.
+    skip_date: '2026-03-05'
+  5e5fb921:
+    title: 'fix: Pin numpy<2 to fix CI test failures (#501)'
+    status: skipped
+    skip_reason: not-applicable
+    skip_justification: Build scripts only (setup_22.04.sh). arch_v2 manages dependencies separately.
+    skip_date: '2026-03-05'
+  bcad6087:
+    title: 'feat: Disable TEC when default_temperature is None for Toupcam (#499)'
+    status: ported
+    ported_date: '2026-03-05'
+    analysis_file: commits/27-pending-march-ports.md
+  623c2017:
+    title: 'fix: Use cropped image dimensions for NDViewer configuration (#498)'
+    status: skipped
+    skip_reason: already-fixed
+    skip_justification: arch_v2 _publish_ndviewer_start() already calls get_crop_size() with fallback to get_resolution().
+    skip_date: '2026-03-05'
+  08ef8c5e:
+    title: 'fix: XLight/Cicero filter wheel integration (#497)'
+    status: ported
+    ported_date: '2026-03-05'
+    analysis_file: commits/27-pending-march-ports.md
+  e5e07d25:
+    title: 'feat: Add Anthropic API key management for Claude Code (#495)'
+    status: skipped
+    skip_reason: not-applicable
+    skip_justification: GUI convenience feature for upstream main_hcs.py Claude Code integration. Not relevant to arch_v2 architecture.
+    skip_date: '2026-03-05'

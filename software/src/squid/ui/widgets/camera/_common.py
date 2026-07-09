@@ -33,7 +33,9 @@ from _def import (
 )
 from squid.core.abc import CameraPixelFormat
 from squid.core.events import (
+    auto_subscribe,
     event_bus,
+    handles,
     ExposureTimeChanged,
     AnalogGainChanged,
     SetExposureTimeCommand,
@@ -69,10 +71,9 @@ from squid.core.events import (
     ProfileChanged,
 )
 from squid.backend.io.stream_handler import StreamHandler
-from squid.ui.image_saver import ImageSaver
 from squid.backend.managers import ObjectiveStore
-from squid.backend.managers import ChannelConfigurationManager
-from squid.core.utils.config_utils import ChannelMode
+from squid.backend.managers import ChannelConfigService
+from squid.core.config.models import AcquisitionChannel
 from squid.ui.widgets.base import EventBusFrame
 
 if TYPE_CHECKING:

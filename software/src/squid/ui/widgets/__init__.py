@@ -18,34 +18,29 @@ __all__ = [
     "CollapsibleGroupBox",
     "PandasTableModel",
     # config
-    "ConfigEditor",
-    "ConfigEditorBackwardsCompatible",
     "PreferencesDialog",
     "ProfileWidget",
     # camera
     "CameraSettingsWidget",
     "LiveControlWidget",
-    "RecordingWidget",
-    "MultiCameraRecordingWidget",
     # stage
     "StageUtils",
     "PiezoWidget",
     "NavigationWidget",
     "AutoFocusWidget",
+    "AlignmentWidget",
     # acquisition
     "FlexibleMultiPointWidget",
     "WellplateMultiPointWidget",
-    "MultiPointWithFluidicsWidget",
+    "AcquisitionSetupWidget",
     # display
-    "StatsDisplayWidget",
     "FocusMapWidget",
     "NapariLiveWidget",
     "NapariMultiChannelWidget",
     "NapariMosaicDisplayWidget",
     "NapariPlateViewWidget",
-    "WaveformDisplay",
-    "PlotWidget",
     "SurfacePlotWidget",
+    "NDViewerTab",
     # hardware
     "LaserAutofocusSettingWidget",
     "SpinningDiskConfocalWidget",
@@ -53,7 +48,6 @@ __all__ = [
     "ObjectivesWidget",
     "DACControWidget",
     "FilterControllerWidget",
-    "TriggerControlWidget",
     "LaserAutofocusControlWidget",
     "LedMatrixSettingsDialog",
     "FocusLockStatusWidget",
@@ -68,18 +62,12 @@ __all__ = [
     "FluidicsWidget",
     # tracking
     "TrackingControllerWidget",
-    "PlateReaderAcquisitionWidget",
-    "PlateReaderNavigationWidget",
-    "DisplacementMeasurementWidget",
     "Joystick",
     # nl5
     "NL5Widget",
     "NL5SettingsDialog",
     # custom_multipoint
     "TemplateMultiPointWidget",
-    # spectrometer
-    "SpectrometerControlWidget",
-    "SpectrumDisplay",
 ]
 
 _LAZY_IMPORTS: Final[dict[str, tuple[str, str]]] = {
@@ -90,34 +78,29 @@ _LAZY_IMPORTS: Final[dict[str, tuple[str, str]]] = {
     "CollapsibleGroupBox": ("squid.ui.widgets.base", "CollapsibleGroupBox"),
     "PandasTableModel": ("squid.ui.widgets.base", "PandasTableModel"),
     # config
-    "ConfigEditor": ("squid.ui.widgets.config", "ConfigEditor"),
-    "ConfigEditorBackwardsCompatible": ("squid.ui.widgets.config", "ConfigEditorBackwardsCompatible"),
     "PreferencesDialog": ("squid.ui.widgets.config", "PreferencesDialog"),
     "ProfileWidget": ("squid.ui.widgets.config", "ProfileWidget"),
     # camera
     "CameraSettingsWidget": ("squid.ui.widgets.camera", "CameraSettingsWidget"),
     "LiveControlWidget": ("squid.ui.widgets.camera", "LiveControlWidget"),
-    "RecordingWidget": ("squid.ui.widgets.camera", "RecordingWidget"),
-    "MultiCameraRecordingWidget": ("squid.ui.widgets.camera", "MultiCameraRecordingWidget"),
     # stage
     "StageUtils": ("squid.ui.widgets.stage", "StageUtils"),
     "PiezoWidget": ("squid.ui.widgets.stage", "PiezoWidget"),
     "NavigationWidget": ("squid.ui.widgets.stage", "NavigationWidget"),
     "AutoFocusWidget": ("squid.ui.widgets.stage", "AutoFocusWidget"),
+    "AlignmentWidget": ("squid.ui.widgets.stage", "AlignmentWidget"),
     # acquisition
     "FlexibleMultiPointWidget": ("squid.ui.widgets.acquisition", "FlexibleMultiPointWidget"),
     "WellplateMultiPointWidget": ("squid.ui.widgets.acquisition", "WellplateMultiPointWidget"),
-    "MultiPointWithFluidicsWidget": ("squid.ui.widgets.acquisition", "MultiPointWithFluidicsWidget"),
+    "AcquisitionSetupWidget": ("squid.ui.widgets.acquisition", "AcquisitionSetupWidget"),
     # display
-    "StatsDisplayWidget": ("squid.ui.widgets.display", "StatsDisplayWidget"),
     "FocusMapWidget": ("squid.ui.widgets.display", "FocusMapWidget"),
     "NapariLiveWidget": ("squid.ui.widgets.display", "NapariLiveWidget"),
     "NapariMultiChannelWidget": ("squid.ui.widgets.display", "NapariMultiChannelWidget"),
     "NapariMosaicDisplayWidget": ("squid.ui.widgets.display", "NapariMosaicDisplayWidget"),
     "NapariPlateViewWidget": ("squid.ui.widgets.display", "NapariPlateViewWidget"),
-    "WaveformDisplay": ("squid.ui.widgets.display", "WaveformDisplay"),
-    "PlotWidget": ("squid.ui.widgets.display", "PlotWidget"),
     "SurfacePlotWidget": ("squid.ui.widgets.display", "SurfacePlotWidget"),
+    "NDViewerTab": ("squid.ui.widgets.display", "NDViewerTab"),
     # hardware
     "LaserAutofocusSettingWidget": ("squid.ui.widgets.hardware", "LaserAutofocusSettingWidget"),
     "SpinningDiskConfocalWidget": ("squid.ui.widgets.hardware", "SpinningDiskConfocalWidget"),
@@ -125,7 +108,6 @@ _LAZY_IMPORTS: Final[dict[str, tuple[str, str]]] = {
     "ObjectivesWidget": ("squid.ui.widgets.hardware", "ObjectivesWidget"),
     "DACControWidget": ("squid.ui.widgets.hardware", "DACControWidget"),
     "FilterControllerWidget": ("squid.ui.widgets.hardware", "FilterControllerWidget"),
-    "TriggerControlWidget": ("squid.ui.widgets.hardware", "TriggerControlWidget"),
     "LaserAutofocusControlWidget": ("squid.ui.widgets.hardware", "LaserAutofocusControlWidget"),
     "LedMatrixSettingsDialog": ("squid.ui.widgets.hardware", "LedMatrixSettingsDialog"),
     "FocusLockStatusWidget": ("squid.ui.widgets.hardware", "FocusLockStatusWidget"),
@@ -140,18 +122,12 @@ _LAZY_IMPORTS: Final[dict[str, tuple[str, str]]] = {
     "FluidicsWidget": ("squid.ui.widgets.fluidics", "FluidicsWidget"),
     # tracking
     "TrackingControllerWidget": ("squid.ui.widgets.tracking", "TrackingControllerWidget"),
-    "PlateReaderAcquisitionWidget": ("squid.ui.widgets.tracking", "PlateReaderAcquisitionWidget"),
-    "PlateReaderNavigationWidget": ("squid.ui.widgets.tracking", "PlateReaderNavigationWidget"),
-    "DisplacementMeasurementWidget": ("squid.ui.widgets.tracking", "DisplacementMeasurementWidget"),
     "Joystick": ("squid.ui.widgets.tracking", "Joystick"),
     # nl5
     "NL5Widget": ("squid.ui.widgets.nl5", "NL5Widget"),
     "NL5SettingsDialog": ("squid.ui.widgets.nl5", "NL5SettingsDialog"),
     # custom multipoint
     "TemplateMultiPointWidget": ("squid.ui.widgets.custom_multipoint", "TemplateMultiPointWidget"),
-    # spectrometer
-    "SpectrometerControlWidget": ("squid.ui.widgets.spectrometer", "SpectrometerControlWidget"),
-    "SpectrumDisplay": ("squid.ui.widgets.spectrometer", "SpectrumDisplay"),
 }
 
 

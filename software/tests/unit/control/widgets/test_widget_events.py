@@ -268,49 +268,6 @@ class TestAutoFocusWidgetEvents:
 
 
 @pytest.mark.skipif(_skip_widgets, reason="Skipping widget tests in offscreen mode")
-class TestTriggerControlWidgetEvents:
-    """TriggerControlWidget publishes trigger commands."""
-
-    def test_trigger_mode_and_fps_publish_events(self, qapp):
-        from squid.ui.widgets.hardware.trigger import TriggerControlWidget
-
-        bus = FakeBus()
-        widget = TriggerControlWidget(event_bus=bus)
-        bus.published.clear()
-
-        widget.dropdown_triggerManu.setCurrentText("Hardware")
-        widget.update_trigger_mode()
-        assert isinstance(bus.published[-1], SetTriggerModeCommand)
-
-        bus.published.clear()
-        widget.update_trigger_fps(20.0)
-        assert any(isinstance(evt, SetTriggerFPSCommand) for evt in bus.published)
-
-    def test_toggle_live_publishes_start_stop(self, qapp):
-        from squid.ui.widgets.hardware.trigger import TriggerControlWidget
-
-        bus = FakeBus()
-        widget = TriggerControlWidget(event_bus=bus)
-        bus.published.clear()
-
-        widget.toggle_live(True)
-        assert not bus.published  # no legacy start/stop trigger commands
-
-        bus.published.clear()
-        widget.toggle_live(False)
-        assert not bus.published
-
-    def test_trigger_subscribes_to_state(self, qapp):
-        from squid.ui.widgets.hardware.trigger import TriggerControlWidget
-
-        bus = FakeBus()
-        TriggerControlWidget(event_bus=bus)
-        subscribed_types = {sub[0] for sub in bus.subscriptions}
-        assert TriggerModeChanged in subscribed_types
-        assert TriggerFPSChanged in subscribed_types
-
-
-@pytest.mark.skipif(_skip_widgets, reason="Skipping widget tests in offscreen mode")
 class TestDACWidgetEvents:
     """DACControWidget publishes DAC commands."""
 
@@ -348,6 +305,34 @@ class TestWellplateFormatWidgetEvents:
         )
         assert "test_format" in WELLPLATE_FORMAT_SETTINGS
 
+    def test_select_calibrate_format_opens_dialog_without_nameerror(self, qapp, monkeypatch):
+        from qtpy.QtWidgets import QDialog
+        from squid.ui.widgets.wellplate.format import WellplateFormatWidget
+
+        class DummyCalibrationDialog:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+            def exec_(self):
+                return QDialog.Rejected
+
+        monkeypatch.setattr(
+            "squid.ui.widgets.wellplate.format.WellplateCalibration",
+            DummyCalibrationDialog,
+        )
+
+        bus = FakeBus()
+        widget = WellplateFormatWidget(
+            event_bus=bus,
+            streamHandler=self.DummyStream(),
+        )
+        previous_format = widget.wellplate_format
+        custom_index = widget.comboBox.findData("custom")
+
+        widget.wellplateChanged(custom_index)
+
+        assert widget.wellplate_format == previous_format
+
 
 @pytest.mark.skipif(_skip_widgets, reason="Skipping widget tests in offscreen mode")
 class TestNoDirectHardwareAttributes:
@@ -359,7 +344,6 @@ class TestNoDirectHardwareAttributes:
         from squid.ui.widgets.camera.live_control import LiveControlWidget
         from squid.ui.widgets.camera.settings import CameraSettingsWidget
         from squid.ui.widgets.stage.autofocus import AutoFocusWidget
-        from squid.ui.widgets.hardware.trigger import TriggerControlWidget
         from squid.ui.widgets.wellplate.calibration import WellplateCalibration
 
         bus = FakeBus()
@@ -401,7 +385,6 @@ class TestNoDirectHardwareAttributes:
             include_camera_auto_wb_setting=False,
         )
         af = AutoFocusWidget(event_bus=bus)
-        trig = TriggerControlWidget(event_bus=bus)
         well = WellplateCalibration(
             event_bus=bus,
             wellplateFormatWidget=DummyDeps(),
@@ -412,5 +395,4 @@ class TestNoDirectHardwareAttributes:
         assert not hasattr(live, "liveController")
         assert not hasattr(cam, "_service")
         assert not hasattr(af, "autofocusController")
-        assert not hasattr(trig, "microcontroller")
         assert not hasattr(well, "stage")

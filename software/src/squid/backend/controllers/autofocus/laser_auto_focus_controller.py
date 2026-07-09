@@ -1,25 +1,36 @@
 import time
 import threading
 from dataclasses import dataclass
-from typing import Optional, Tuple, Dict, Any, TYPE_CHECKING
-
-import cv2
+from typing import Optional, Tuple, Dict, Any, TYPE_CHECKING, List
 from datetime import datetime
 import math
 import numpy as np
 
-import squid.core.utils.hardware_utils as utils
 import _def
+import squid.core.utils.hardware_utils as utils
 from squid.backend.controllers.autofocus.laser_af_settings_manager import LaserAFSettingManager
 from squid.backend.managers import ObjectiveStore
-from squid.core.utils.config_utils import LaserAFConfig
+from squid.backend.processing.laser_spot import (
+    SpotDetectionResult,
+    compute_correlation,
+    compute_displacement,
+    detect_spot,
+    extract_spot_crop,
+    is_spot_in_range,
+    normalize_crop_for_reference,
+)
+from squid.core.config.feature_flags import get_feature_flags
+from squid.core.config.models import LaserAFConfig
 import squid.core.logging
+from squid.backend.controllers.base import BaseController
 from squid.core.events import (
+    Event,
     EventBus,
     SetLaserAFPropertiesCommand,
     InitializeLaserAFCommand,
     SetLaserAFCharacterizationModeCommand,
     UpdateLaserAFThresholdCommand,
+    UpdateLaserAFLiveParamsCommand,
     MoveToLaserAFTargetCommand,
     SetLaserAFReferenceCommand,
     MeasureLaserAFDisplacementCommand,
@@ -34,6 +45,7 @@ from squid.core.events import (
     LaserAFMoveCompleted,
     ObjectiveChanged,
     ProfileChanged,
+    handles,
 )
 
 if TYPE_CHECKING:
@@ -51,9 +63,19 @@ class LaserAFResult:
     spot_x_px: Optional[float]
     spot_y_px: Optional[float]
     timestamp: float
+    image: Optional[np.ndarray] = None
 
 
-class LaserAutofocusController:
+@dataclass
+class LaserSpotCentroid:
+    """Spot centroid measurement with the captured frame."""
+
+    x_px: float
+    y_px: float
+    image: np.ndarray
+
+
+class LaserAutofocusController(BaseController):
 
     def __init__(
         self,
@@ -66,7 +88,7 @@ class LaserAutofocusController:
         laserAFSettingManager: Optional[LaserAFSettingManager] = None,
         stream_handler: Optional[object] = None,
     ):
-        self._log = squid.core.logging.get_logger(__class__.__name__)
+        super().__init__(event_bus)
 
         self.objectiveStore: Optional[ObjectiveStore] = objectiveStore
         self.laserAFSettingManager: Optional[LaserAFSettingManager] = (
@@ -77,10 +99,12 @@ class LaserAutofocusController:
         self._stage_service: "StageService" = stage_service
         self._peripheral_service: "PeripheralService" = peripheral_service
         self._piezo_service: Optional["PiezoService"] = piezo_service
-        self._event_bus: "EventBus" = event_bus
         self._stream_handler = stream_handler
 
-        self.characterization_mode: bool = _def.LASER_AF_CHARACTERIZATION_MODE
+        self._feature_flags = get_feature_flags()
+        self.characterization_mode: bool = self._feature_flags.is_enabled(
+            "LASER_AF_CHARACTERIZATION_MODE"
+        )
         self.is_initialized: bool = False
 
         self.laser_af_properties: LaserAFConfig = LaserAFConfig()
@@ -89,35 +113,15 @@ class LaserAutofocusController:
         self.spot_spacing_pixels: Optional[float] = (
             None  # spacing between the spots from the two interfaces (unit: pixel)
         )
-
-        self.image: Optional[np.ndarray] = (
-            None  # for saving the focus camera image for debugging when centroid cannot be found
-        )
         self._last_crop: Optional[np.ndarray] = None
         self._last_crop_bounds: Optional[Tuple[int, int, int, int]] = None
         self._last_spot_metrics: Optional[Tuple[float, float, float]] = None
+        self._last_frame: Optional[np.ndarray] = None
         self._measurement_lock = threading.Lock()
 
         # Load configurations if provided
         if self.laserAFSettingManager:
             self.load_cached_configuration()
-
-        # Subscribe to EventBus commands
-        self._subscribe_to_bus()
-
-    def _subscribe_to_bus(self) -> None:
-        if self._event_bus is None:
-            return
-        self._event_bus.subscribe(SetLaserAFPropertiesCommand, self._on_set_properties)
-        self._event_bus.subscribe(InitializeLaserAFCommand, self._on_initialize)
-        self._event_bus.subscribe(SetLaserAFCharacterizationModeCommand, self._on_set_characterization_mode)
-        self._event_bus.subscribe(UpdateLaserAFThresholdCommand, self._on_update_threshold)
-        self._event_bus.subscribe(MoveToLaserAFTargetCommand, self._on_move_to_target)
-        self._event_bus.subscribe(SetLaserAFReferenceCommand, self._on_set_reference)
-        self._event_bus.subscribe(MeasureLaserAFDisplacementCommand, self._on_measure_displacement)
-        self._event_bus.subscribe(CaptureLaserAFFrameCommand, self._on_capture_frame)
-        self._event_bus.subscribe(ObjectiveChanged, lambda _e: self.on_settings_changed())
-        self._event_bus.subscribe(ProfileChanged, lambda _e: self.on_settings_changed())
 
     def _stream_image(self, image: np.ndarray) -> None:
         if self._stream_handler is None:
@@ -165,6 +169,24 @@ class LaserAutofocusController:
     def _read_camera_frame(self) -> Optional[np.ndarray]:
         """Read frame from camera."""
         return self._camera_service.read_frame()
+
+    def _capture_frame(self, *, illumination_time: Optional[float] = None) -> Optional[np.ndarray]:
+        """Capture a frame, sending a trigger when required."""
+        from squid.core.abc import CameraAcquisitionMode
+
+        acquisition_mode = self._camera_service.get_acquisition_mode()
+        if acquisition_mode == CameraAcquisitionMode.SOFTWARE_TRIGGER:
+            self._camera_service.send_trigger(
+                illumination_time=illumination_time or self._get_camera_exposure()
+            )
+        frame = self._read_camera_frame()
+        if frame is not None:
+            self._last_frame = frame
+        return frame
+
+    def get_last_frame(self) -> Optional[np.ndarray]:
+        """Return the most recently captured autofocus frame, if available."""
+        return self._last_frame
 
     def _enable_camera_callbacks(self, enabled: bool) -> None:
         """Enable/disable camera callbacks."""
@@ -216,21 +238,30 @@ class LaserAutofocusController:
 
     def initialize_manual(self, config: LaserAFConfig) -> None:
         """Initialize laser autofocus with manual parameters."""
+        has_reference = bool(config.has_reference and config.x_reference is not None)
+        x_ref_adjusted = (
+            config.x_reference - config.x_offset if has_reference else None
+        )
         adjusted_config = config.model_copy(
             update={
-                "x_reference": config.x_reference
-                - config.x_offset,  # self.x_reference is relative to the cropped region
+                "x_reference": x_ref_adjusted,  # x_reference is relative to the cropped region
+                "has_reference": has_reference,
                 "x_offset": int((config.x_offset // 8) * 8),
                 "y_offset": int((config.y_offset // 2) * 2),
                 "width": int((config.width // 8) * 8),
                 "height": int((config.height // 2) * 2),
             }
         )
+        if not has_reference:
+            # Drop stale reference image/position from cached configs.
+            adjusted_config.set_reference_image(None)
 
         self.laser_af_properties = adjusted_config
 
         if self.laser_af_properties.has_reference:
             self.reference_crop = self.laser_af_properties.reference_image_cropped
+        else:
+            self.reference_crop = None
 
         self._set_camera_roi(
             self.laser_af_properties.x_offset,
@@ -248,7 +279,8 @@ class LaserAutofocusController:
             and self.objectiveStore.current_objective
         ):
             self.laserAFSettingManager.update_laser_af_settings(
-                self.objectiveStore.current_objective, config.model_dump()
+                self.objectiveStore.current_objective,
+                self.laser_af_properties.model_dump(),
             )
 
     def load_cached_configuration(self) -> None:
@@ -267,6 +299,10 @@ class LaserAutofocusController:
             config = self.laserAFSettingManager.get_settings_for_objective(
                 current_objective
             )
+            if not config.has_reference:
+                # Prevent stale cached x_reference from being used as a live reference.
+                config = config.model_copy(update={"x_reference": None})
+                config.set_reference_image(None)
 
             # Update camera settings
             self._set_camera_exposure(config.focus_camera_exposure_time_ms)
@@ -280,6 +316,8 @@ class LaserAutofocusController:
             self.laser_af_properties = config
             if config.has_reference:
                 self.reference_crop = config.reference_image_cropped
+            else:
+                self.reference_crop = None
 
     def initialize_auto(self) -> bool:
         """Automatically initialize laser autofocus by finding the spot and calibrating.
@@ -319,7 +357,8 @@ class LaserAutofocusController:
             self._log.error("Failed to find laser spot during initialization")
             self._turn_off_af_laser()
             return False
-        x, y = result
+        x = result.x_px
+        y = result.y_px
 
         self._turn_off_af_laser()
 
@@ -333,9 +372,7 @@ class LaserAutofocusController:
         )
         self.reference_crop = None
         config.set_reference_image(None)
-        self._log.info(
-            f"Laser spot location on the full sensor is ({int(x)}, {int(y)})"
-        )
+        pass  # Spot located; proceed with ROI setup
 
         self.initialize_manual(config)
 
@@ -381,7 +418,8 @@ class LaserAutofocusController:
                 )
                 # Just fall through since we are already on a failure path.
             return False
-        x0, y0 = result
+        x0 = result.x_px
+        y0 = result.y_px
 
         # Move to second position and measure
         self._move_z(self.laser_af_properties.pixel_to_um_calibration_distance)
@@ -398,7 +436,8 @@ class LaserAutofocusController:
                 )
                 # Just fall through since we are already on a failure path.
             return False
-        x1, y1 = result
+        x1 = result.x_px
+        y1 = result.y_px
 
         try:
             self._turn_off_af_laser()
@@ -420,7 +459,7 @@ class LaserAutofocusController:
             pixel_to_um = self.laser_af_properties.pixel_to_um_calibration_distance / (
                 x1 - x0
             )
-        self._log.info(f"Pixel to um conversion factor is {pixel_to_um:.3f} um/pixel")
+        pass  # Calibration complete
         calibration_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         # Update config with new calibration values
@@ -441,9 +480,88 @@ class LaserAutofocusController:
         return True
 
     def set_laser_af_properties(self, updates: dict) -> None:
-        """Update laser autofocus properties. Used for updating settings from GUI."""
+        """Update laser autofocus properties. Used for updating settings from GUI.
+
+        Clears is_initialized so a re-init is required afterward. For live
+        parameter tuning during a running focus lock, use update_live_properties.
+        """
         self.laser_af_properties = self.laser_af_properties.model_copy(update=updates)
         self.is_initialized = False
+
+    # Fields safe to edit while the focus lock is running. The continuous lock
+    # loop reads laser_af_properties on every frame, so detection-side changes
+    # take effect on the next measurement; camera changes are pushed below.
+    _LIVE_EDITABLE_FIELDS = frozenset({
+        "focus_camera_exposure_time_ms",
+        "focus_camera_analog_gain",
+        "spot_detection_mode",
+        "y_window",
+        "x_window",
+        "min_peak_width",
+        "min_peak_distance",
+        "min_peak_prominence",
+        "spot_spacing",
+        "filter_sigma",
+        "laser_af_averaging_n",
+        "displacement_success_window_um",
+        "correlation_threshold",
+        "laser_af_range",
+    })
+
+    def update_live_properties(self, updates: dict) -> None:
+        """Update parameters live without invalidating initialization.
+
+        Intended for tuning camera exposure/gain, spot-detection params, and
+        tolerance settings while the focus lock is running. Camera parameters
+        are pushed to the camera service immediately so they take effect on the
+        next trigger. Persists to the per-objective settings cache and publishes
+        LaserAFPropertiesChanged so other widgets stay in sync.
+        """
+        if not updates:
+            return
+
+        rejected = set(updates) - self._LIVE_EDITABLE_FIELDS
+        if rejected:
+            self._log.warning(
+                "update_live_properties: ignoring non-live-editable fields: %s",
+                sorted(rejected),
+            )
+        applied = {k: v for k, v in updates.items() if k in self._LIVE_EDITABLE_FIELDS}
+        if not applied:
+            return
+
+        self.laser_af_properties = self.laser_af_properties.model_copy(update=applied)
+
+        if "focus_camera_exposure_time_ms" in applied:
+            try:
+                self._set_camera_exposure(float(applied["focus_camera_exposure_time_ms"]))
+            except Exception:
+                self._log.exception("Failed to push focus camera exposure live")
+        if "focus_camera_analog_gain" in applied:
+            try:
+                self._set_camera_analog_gain(float(applied["focus_camera_analog_gain"]))
+            except NotImplementedError:
+                pass
+            except Exception:
+                self._log.exception("Failed to push focus camera analog gain live")
+
+        if (
+            self.laserAFSettingManager
+            and self.objectiveStore
+            and self.objectiveStore.current_objective
+        ):
+            try:
+                self.laserAFSettingManager.update_laser_af_settings(
+                    self.objectiveStore.current_objective, applied
+                )
+                self.laserAFSettingManager.save_configurations(
+                    self.objectiveStore.current_objective
+                )
+            except Exception:
+                self._log.exception("Failed to persist live laser AF properties")
+
+        if self._event_bus is not None:
+            self._event_bus.publish(LaserAFPropertiesChanged(properties=applied))
 
     def update_threshold_properties(self, updates: dict) -> None:
         """Update threshold properties. Save settings without re-initializing."""
@@ -454,7 +572,7 @@ class LaserAutofocusController:
         self.laserAFSettingManager.save_configurations(
             self.objectiveStore.current_objective
         )
-        self._log.info("Updated threshold properties")
+        pass  # Threshold properties saved
 
     def measure_displacement(self) -> float:
         """Measure the displacement of the laser spot from the reference position.
@@ -464,7 +582,6 @@ class LaserAutofocusController:
         """
 
         if not self._measurement_lock.acquire(timeout=0.1):
-            self._log.warning("Measurement blocked - continuous lock is running")
             return float("nan")
 
         def finish_with(um: float) -> float:
@@ -500,11 +617,19 @@ class LaserAutofocusController:
                 )
                 return finish_with(float("nan"))  # Signal invalid measurement
 
-            x, y = result
+            if (
+                not self.laser_af_properties.has_reference
+                or self.laser_af_properties.x_reference is None
+            ):
+                self._log.warning("Cannot calculate displacement - reference position not set")
+                return finish_with(float("nan"))
+
             # calculate displacement
-            displacement_um = (
-                x - self.laser_af_properties.x_reference
-            ) * self.laser_af_properties.pixel_to_um
+            displacement_um = compute_displacement(
+                result.x_px,
+                self.laser_af_properties.x_reference,
+                self.laser_af_properties.pixel_to_um,
+            )
             return finish_with(displacement_um)
         finally:
             self._measurement_lock.release()
@@ -512,7 +637,6 @@ class LaserAutofocusController:
     def measure_displacement_continuous(self) -> LaserAFResult:
         """Measure displacement assuming laser is already on."""
         if not self._measurement_lock.acquire(timeout=0.1):
-            self._log.warning("Measurement blocked - continuous lock is running")
             return LaserAFResult(
                 displacement_um=float("nan"),
                 spot_intensity=0.0,
@@ -523,16 +647,7 @@ class LaserAutofocusController:
                 timestamp=time.monotonic(),
             )
         try:
-            from squid.core.abc import CameraAcquisitionMode
-
-            acquisition_mode = self._camera_service.get_acquisition_mode()
-            if acquisition_mode == CameraAcquisitionMode.SOFTWARE_TRIGGER:
-                self._camera_service.send_trigger(
-                    illumination_time=self._get_camera_exposure()
-                )
-
-            frame = self._camera_service.read_frame()
-            self.image = frame
+            frame = self._capture_frame(illumination_time=self._get_camera_exposure())
             if frame is None:
                 return LaserAFResult(
                     displacement_um=float("nan"),
@@ -554,6 +669,7 @@ class LaserAutofocusController:
                     spot_x_px=None,
                     spot_y_px=None,
                     timestamp=time.monotonic(),
+                    image=frame,
                 )
 
             displacement_um, spot_x, spot_y, snr, intensity, correlation = result
@@ -565,6 +681,7 @@ class LaserAutofocusController:
                 spot_x_px=spot_x,
                 spot_y_px=spot_y,
                 timestamp=time.monotonic(),
+                image=frame,
             )
         finally:
             self._measurement_lock.release()
@@ -588,9 +705,6 @@ class LaserAutofocusController:
             return False
 
         current_displacement_um = self.measure_displacement()
-        self._log.info(
-            f"Current laser AF displacement: {current_displacement_um:.1f} μm"
-        )
 
         if math.isnan(current_displacement_um):
             self._log.error(
@@ -631,12 +745,8 @@ class LaserAutofocusController:
                         success=False, target_um=target_um, error="Cross-correlation check failed"
                     ))
                 return False
-            else:
-                self._log.info("Cross correlation check passed - spots are well aligned")
-
         # Measure final displacement after move to confirm
         final_displacement = self.measure_displacement()
-        self._log.info(f"Final displacement after move: {final_displacement:.1f} μm (target: {target_um:.1f} μm)")
 
         if publish_result and self._event_bus is not None:
             self._event_bus.publish(LaserAFMoveCompleted(
@@ -673,7 +783,6 @@ class LaserAutofocusController:
 
         # get laser spot location and image
         result = self._get_laser_spot_centroid()
-        reference_image = self.image
 
         # turn off the laser
         try:
@@ -684,34 +793,25 @@ class LaserAutofocusController:
             )
             # Continue on since we got our reading, but the system is potentially in a weird state!
 
-        if result is None or reference_image is None:
+        if result is None:
             self._log.error("Failed to detect laser spot while setting reference")
             return False
 
-        x, y = result
+        reference_image = result.image
+        x = result.x_px
+        y = result.y_px
 
-        # Store cropped and normalized reference image
-        center_y = int(reference_image.shape[0] / 2)
-        x_start = max(0, int(x) - self.laser_af_properties.spot_crop_size // 2)
-        x_end = min(
-            reference_image.shape[1],
-            int(x) + self.laser_af_properties.spot_crop_size // 2,
+        crop_size = max(1, int(self.laser_af_properties.spot_crop_size))
+        center_y = reference_image.shape[0] / 2
+        reference_crop, _ = extract_spot_crop(
+            reference_image, x, center_y, crop_size
         )
-        y_start = max(0, center_y - self.laser_af_properties.spot_crop_size // 2)
-        y_end = min(
-            reference_image.shape[0],
-            center_y + self.laser_af_properties.spot_crop_size // 2,
-        )
-
-        reference_crop = reference_image[y_start:y_end, x_start:x_end].astype(
-            np.float32
-        )
-        self.reference_crop = (reference_crop - np.mean(reference_crop)) / np.max(
-            reference_crop
-        )
+        self.reference_crop = normalize_crop_for_reference(reference_crop)
+        if self.reference_crop is None:
+            self._log.error("Failed to normalize reference crop")
+            return False
 
         self._publish_displacement(0)
-        self._log.info(f"Set reference position to ({x:.1f}, {y:.1f})")
 
         # Tell simulated camera to use current Z as reference (for spot position simulation)
         try:
@@ -736,9 +836,94 @@ class LaserAutofocusController:
             self.objectiveStore.current_objective
         )
 
-        self._log.info("Reference spot position set")
-
         return True
+
+    def commit_reference_from_result(self, result: "LaserAFResult") -> bool:
+        """Commit the spot in ``result`` as the displacement reference.
+
+        Lighter equivalent of set_reference() that uses an in-flight frame
+        instead of re-acquiring. The continuous focus lock loop calls this when
+        the user clicks Lock, so subsequent measure_displacement_continuous()
+        calls compute a real displacement against the locked spot rather than
+        always returning 0 from the no-reference fallback.
+        """
+        if (
+            result is None
+            or result.image is None
+            or result.spot_x_px is None
+            or not self.is_initialized
+        ):
+            return False
+
+        crop_size = max(1, int(self.laser_af_properties.spot_crop_size))
+        center_y = result.image.shape[0] / 2
+        reference_crop, _ = extract_spot_crop(
+            result.image, float(result.spot_x_px), center_y, crop_size
+        )
+        normalized = normalize_crop_for_reference(reference_crop)
+        if normalized is None:
+            self._log.error("Failed to normalize reference crop from live result")
+            return False
+        self.reference_crop = normalized
+
+        x = float(result.spot_x_px)
+        self.laser_af_properties = self.laser_af_properties.model_copy(
+            update={"x_reference": x, "has_reference": True}
+        )
+
+        # Tell simulated camera to use current Z as reference (matches set_reference()).
+        try:
+            self._camera_service.set_reference_position()  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
+        if (
+            self.laserAFSettingManager
+            and self.objectiveStore
+            and self.objectiveStore.current_objective
+        ):
+            try:
+                self.laserAFSettingManager.update_laser_af_settings(
+                    self.objectiveStore.current_objective,
+                    {
+                        "x_reference": x + self.laser_af_properties.x_offset,
+                        "has_reference": True,
+                    },
+                    crop_image=self.reference_crop,
+                )
+                self.laserAFSettingManager.save_configurations(
+                    self.objectiveStore.current_objective
+                )
+            except Exception:
+                self._log.exception(
+                    "Failed to persist live lock reference to settings cache"
+                )
+
+        if self._event_bus is not None:
+            self._event_bus.publish(LaserAFReferenceSet(success=True))
+        return True
+
+    def clear_reference(self) -> None:
+        """Clear the displacement reference, returning to no-reference state."""
+        self.reference_crop = None
+        self.laser_af_properties = self.laser_af_properties.model_copy(
+            update={"x_reference": None, "has_reference": False}
+        )
+        if (
+            self.laserAFSettingManager
+            and self.objectiveStore
+            and self.objectiveStore.current_objective
+        ):
+            try:
+                self.laserAFSettingManager.update_laser_af_settings(
+                    self.objectiveStore.current_objective,
+                    {"has_reference": False},
+                )
+                self.laserAFSettingManager.save_configurations(
+                    self.objectiveStore.current_objective
+                )
+            except Exception:
+                self._log.exception("Failed to persist cleared reference")
 
     def on_settings_changed(self) -> None:
         """Handle objective change or profile load event.
@@ -748,6 +933,10 @@ class LaserAutofocusController:
         """
         self.is_initialized = False
         self.load_cached_configuration()
+
+    @handles(ObjectiveChanged, ProfileChanged)
+    def _on_profile_or_objective_changed(self, _event: Event) -> None:
+        self.on_settings_changed()
 
     def _verify_spot_alignment(self) -> Tuple[bool, float]:
         """Verify laser spot alignment using cross-correlation with reference image.
@@ -770,13 +959,7 @@ class LaserAutofocusController:
             )
             return failure_return_value
 
-        # TODO: create a function to get the current image (taking care of trigger mode checking and laser on/off switching)
-        """
-        self.camera.send_trigger()
-        current_image = self.camera.read_frame()
-        """
-        self._get_laser_spot_centroid()
-        current_image: Optional[np.ndarray] = self.image
+        current_image = self._capture_frame(illumination_time=self._get_camera_exposure())
 
         try:
             self._turn_off_af_laser()
@@ -789,39 +972,25 @@ class LaserAutofocusController:
         if self.reference_crop is None:
             self._log.warning("No reference crop stored")
             return failure_return_value
+        if self.laser_af_properties.x_reference is None:
+            self._log.warning("No reference position stored")
+            return failure_return_value
 
         if current_image is None:
             self._log.error("Failed to get images for cross-correlation check")
             return failure_return_value
 
-        # Crop and normalize current image
-        center_x: int = int(self.laser_af_properties.x_reference)
-        center_y: int = int(current_image.shape[0] / 2)
-
-        x_start: int = max(0, center_x - self.laser_af_properties.spot_crop_size // 2)
-        x_end: int = min(
-            current_image.shape[1],
-            center_x + self.laser_af_properties.spot_crop_size // 2,
+        crop_size = max(1, int(self.laser_af_properties.spot_crop_size))
+        current_crop, _bounds = extract_spot_crop(
+            current_image,
+            self.laser_af_properties.x_reference,
+            current_image.shape[0] / 2,
+            crop_size,
         )
-        y_start: int = max(0, center_y - self.laser_af_properties.spot_crop_size // 2)
-        y_end: int = min(
-            current_image.shape[0],
-            center_y + self.laser_af_properties.spot_crop_size // 2,
-        )
-
-        current_crop: np.ndarray = current_image[y_start:y_end, x_start:x_end].astype(
-            np.float32
-        )
-        current_norm: np.ndarray = (current_crop - np.mean(current_crop)) / np.max(
-            current_crop
-        )
-
-        # Calculate normalized cross correlation
-        correlation: float = np.corrcoef(
-            current_norm.ravel(), self.reference_crop.ravel()
-        )[0, 1]
-
-        self._log.info(f"Cross correlation with reference: {correlation:.3f}")
+        correlation = compute_correlation(current_crop, self.reference_crop)
+        if correlation is None:
+            self._log.warning("Cross correlation check failed - invalid crops")
+            return False, 0.0
 
         # Check if correlation exceeds threshold
         if correlation < self.laser_af_properties.correlation_threshold:
@@ -832,26 +1001,28 @@ class LaserAutofocusController:
 
     def get_new_frame(self) -> Optional[np.ndarray]:
         # IMPORTANT: This assumes that the autofocus laser is already on!
-        self._camera_service.send_trigger(
-            illumination_time=self._get_camera_exposure()
-        )
-        return self._read_camera_frame()
+        return self._capture_frame(illumination_time=self._get_camera_exposure())
 
     def _get_laser_spot_centroid(
         self,
         remove_background: bool = False,
         use_center_crop: Optional[Tuple[int, int]] = None,
-    ) -> Optional[Tuple[float, float]]:
+    ) -> Optional[LaserSpotCentroid]:
         """Get the centroid location of the laser spot.
 
         Averages multiple measurements to improve accuracy. The number of measurements
         is controlled by LASER_AF_AVERAGING_N.
 
         Returns:
-            Optional[Tuple[float, float]]: (x,y) coordinates of spot centroid, or None if detection fails
+            LaserSpotCentroid containing centroid and image, or None if detection fails
         """
         # disable camera callback
         self._enable_camera_callbacks(False)
+
+        # Ensure the focus camera is streaming so triggers/reads work
+        was_streaming = self._camera_service.get_is_streaming()
+        if not was_streaming:
+            self._camera_service.start_streaming()
 
         # Wait for camera to settle after disabling callbacks
         # This is necessary because if live mode just stopped, the camera
@@ -874,39 +1045,32 @@ class LaserAutofocusController:
             try:
                 image = self.get_new_frame()
                 if image is None:
-                    self._log.warning(
-                        f"Failed to read frame {i + 1}/{self.laser_af_properties.laser_af_averaging_n}"
-                    )
                     continue
 
-                self.image = image  # store for debugging # TODO: add to return instead of storing
                 result = self._detect_spot_in_frame(
                     image,
                     remove_background=remove_background,
                     use_center_crop=use_center_crop,
                 )
                 if result is None:
-                    self._log.warning(
-                        f"No spot detected in frame {i + 1}/{self.laser_af_properties.laser_af_averaging_n}"
-                    )
                     continue
 
-                x, y = result
-                tmp_x += x
-                tmp_y += y
+                tmp_x += result.x
+                tmp_y += result.y
                 successful_detections += 1
 
-            except Exception as e:
-                self._log.error(
-                    f"Error processing frame {i + 1}/{self.laser_af_properties.laser_af_averaging_n}: {str(e)}"
-                )
+            except Exception:
                 continue
+
+        # Stop streaming if we started it
+        if not was_streaming:
+            self._camera_service.stop_streaming()
 
         # Re-enable camera callbacks
         self._enable_camera_callbacks(True)
 
         # optionally display the image
-        if _def.LASER_AF_DISPLAY_SPOT_IMAGE and image is not None:
+        if self._feature_flags.is_enabled("LASER_AF_DISPLAY_SPOT_IMAGE") and image is not None:
             self._stream_image(image)
 
         # Check if we got enough successful detections
@@ -918,12 +1082,10 @@ class LaserAutofocusController:
         x: float = tmp_x / successful_detections
         y: float = tmp_y / successful_detections
 
-        self._log.debug(
-            f"Spot centroid found at ({x:.1f}, {y:.1f}) from {successful_detections} detections"
-        )
-        if self.image is not None:
-            self._update_last_crop_and_metrics(self.image, x, y)
-        return (x, y)
+        if image is not None:
+            self._update_last_crop_and_metrics(image, x, y)
+            return LaserSpotCentroid(x_px=x, y_px=y, image=image)
+        return None
 
     def _update_last_crop_and_metrics(
         self, image: np.ndarray, spot_x: float, spot_y: float
@@ -950,17 +1112,7 @@ class LaserAutofocusController:
         *,
         remove_background: bool = False,
         use_center_crop: Optional[Tuple[int, int]] = None,
-    ) -> Optional[Tuple[float, float]]:
-        full_height, full_width = frame.shape[:2]
-        image = frame
-
-        if use_center_crop is not None:
-            image = utils.crop_image(image, use_center_crop[0], use_center_crop[1])
-
-        if remove_background:
-            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (50, 50))
-            image = cv2.morphologyEx(image, cv2.MORPH_TOPHAT, kernel)
-
+    ) -> Optional[SpotDetectionResult]:
         spot_detection_params: Dict[str, Any] = {
             "y_window": self.laser_af_properties.y_window,
             "x_window": self.laser_af_properties.x_window,
@@ -969,99 +1121,70 @@ class LaserAutofocusController:
             "min_peak_prominence": self.laser_af_properties.min_peak_prominence,
             "spot_spacing": self.laser_af_properties.spot_spacing,
         }
-        try:
-            result = utils.find_spot_location(
-                image,
-                mode=self.laser_af_properties.spot_detection_mode,
-                params=spot_detection_params,
-                filter_sigma=self.laser_af_properties.filter_sigma,
-            )
-        except Exception as exc:
-            self._log.error(f"Spot detection failed: {exc}")
+        spot = detect_spot(
+            frame,
+            params=spot_detection_params,
+            mode=self.laser_af_properties.get_spot_detection_mode(),
+            filter_sigma=self.laser_af_properties.filter_sigma,
+            remove_bg=remove_background,
+            center_crop=use_center_crop,
+        )
+        if spot is None:
             return None
-
-        if result is None:
-            return None
-
-        if use_center_crop is not None:
-            x, y = (
-                result[0] + (full_width - use_center_crop[0]) // 2,
-                result[1] + (full_height - use_center_crop[1]) // 2,
-            )
-        else:
-            x, y = result
 
         x_reference = self.laser_af_properties.x_reference
         if (
             self.laser_af_properties.has_reference
             and x_reference is not None
-            and abs(x - x_reference) * self.laser_af_properties.pixel_to_um
-            > self.laser_af_properties.laser_af_range
-        ):
-            self._log.warning(
-                f"Spot detected at ({x:.1f}, {y:.1f}) is out of range ({self.laser_af_properties.laser_af_range:.1f} um), skipping it."
+            and not is_spot_in_range(
+                spot_x=spot.x,
+                reference_x=x_reference,
+                pixel_to_um=self.laser_af_properties.pixel_to_um,
+                max_range_um=self.laser_af_properties.laser_af_range,
             )
+        ):
             return None
 
-        return (x, y)
-
-    def _compute_correlation(self, frame: np.ndarray) -> Optional[float]:
-        if self.reference_crop is None:
-            return None
-        if self.laser_af_properties.x_reference is None:
-            return None
-
-        center_x = int(self.laser_af_properties.x_reference)
-        center_y = int(frame.shape[0] / 2)
-        crop_size = max(1, int(self.laser_af_properties.spot_crop_size))
-
-        x_start = max(0, center_x - crop_size // 2)
-        x_end = min(frame.shape[1], center_x + crop_size // 2)
-        y_start = max(0, center_y - crop_size // 2)
-        y_end = min(frame.shape[0], center_y + crop_size // 2)
-
-        current_crop = frame[y_start:y_end, x_start:x_end].astype(np.float32)
-        if current_crop.size == 0:
-            return None
-        max_val = float(np.max(current_crop))
-        if max_val == 0:
-            return None
-
-        current_norm = (current_crop - np.mean(current_crop)) / max_val
-        if current_norm.shape != self.reference_crop.shape:
-            return None
-
-        correlation = float(
-            np.corrcoef(current_norm.ravel(), self.reference_crop.ravel())[0, 1]
-        )
-        return correlation
+        return spot
 
     def _detect_spot_and_compute_displacement(
         self, frame: np.ndarray
     ) -> Optional[Tuple[float, float, float, float, float, Optional[float]]]:
-        result = self._detect_spot_in_frame(frame)
-        if result is None:
+        spot = self._detect_spot_in_frame(frame)
+        if spot is None:
             return None
 
-        x, y = result
-        self._update_last_crop_and_metrics(frame, x, y)
+        self._update_last_crop_and_metrics(frame, spot.x, spot.y)
         if self._last_spot_metrics is None:
             snr = 0.0
             intensity = 0.0
         else:
             snr, intensity, _background = self._last_spot_metrics
 
-        x_reference = self.laser_af_properties.x_reference or 0.0
-        displacement_um = (
-            x - x_reference
-        ) * self.laser_af_properties.pixel_to_um
-        correlation = (
-            self._compute_correlation(frame)
-            if self.laser_af_properties.has_reference
-            else None
+        if (
+            self.laser_af_properties.has_reference
+            and self.laser_af_properties.x_reference is not None
+        ):
+            x_reference = self.laser_af_properties.x_reference
+        else:
+            # No valid lock reference yet; report displacement relative to current spot.
+            x_reference = spot.x
+        displacement_um = compute_displacement(
+            spot.x, x_reference, self.laser_af_properties.pixel_to_um
         )
 
-        return (displacement_um, x, y, snr, intensity, correlation)
+        correlation: Optional[float] = None
+        if self.laser_af_properties.has_reference and self.reference_crop is not None:
+            crop_size = max(1, int(self.laser_af_properties.spot_crop_size))
+            current_crop, _bounds = extract_spot_crop(
+                frame,
+                x_reference,
+                frame.shape[0] / 2,
+                crop_size,
+            )
+            correlation = compute_correlation(current_crop, self.reference_crop)
+
+        return (displacement_um, spot.x, spot.y, snr, intensity, correlation)
 
     def get_image(self) -> Optional[np.ndarray]:
         """Capture and display a single image from the laser autofocus camera.
@@ -1107,41 +1230,54 @@ class LaserAutofocusController:
     # EventBus Command Handlers
     # =========================================================================
 
+    @handles(SetLaserAFPropertiesCommand)
     def _on_set_properties(self, cmd: SetLaserAFPropertiesCommand) -> None:
         """Handle SetLaserAFPropertiesCommand from EventBus."""
         self.set_laser_af_properties(cmd.properties)
         if self._event_bus:
             self._event_bus.publish(LaserAFPropertiesChanged(properties=cmd.properties))
 
+    @handles(InitializeLaserAFCommand)
     def _on_initialize(self, cmd: InitializeLaserAFCommand) -> None:
         """Handle InitializeLaserAFCommand from EventBus."""
         success = self.initialize_auto()
         if self._event_bus:
             self._event_bus.publish(LaserAFInitialized(is_initialized=self.is_initialized, success=success))
 
+    @handles(SetLaserAFCharacterizationModeCommand)
     def _on_set_characterization_mode(self, cmd: SetLaserAFCharacterizationModeCommand) -> None:
         """Handle SetLaserAFCharacterizationModeCommand from EventBus."""
         self.characterization_mode = cmd.enabled
 
+    @handles(UpdateLaserAFThresholdCommand)
     def _on_update_threshold(self, cmd: UpdateLaserAFThresholdCommand) -> None:
         """Handle UpdateLaserAFThresholdCommand from EventBus."""
         self.update_threshold_properties(cmd.updates)
 
+    @handles(UpdateLaserAFLiveParamsCommand)
+    def _on_update_live_params(self, cmd: UpdateLaserAFLiveParamsCommand) -> None:
+        """Handle live parameter updates without invalidating initialization."""
+        self.update_live_properties(cmd.updates)
+
+    @handles(MoveToLaserAFTargetCommand)
     def _on_move_to_target(self, cmd: MoveToLaserAFTargetCommand) -> None:
         """Handle MoveToLaserAFTargetCommand from EventBus."""
         if cmd.displacement_um is not None:
             self.move_to_target(cmd.displacement_um)
 
+    @handles(SetLaserAFReferenceCommand)
     def _on_set_reference(self, cmd: SetLaserAFReferenceCommand) -> None:
         """Handle SetLaserAFReferenceCommand from EventBus."""
         success = self.set_reference()
         if self._event_bus:
             self._event_bus.publish(LaserAFReferenceSet(success=success))
 
+    @handles(MeasureLaserAFDisplacementCommand)
     def _on_measure_displacement(self, cmd: MeasureLaserAFDisplacementCommand) -> None:
         """Handle MeasureLaserAFDisplacementCommand from EventBus."""
         self.measure_displacement()
 
+    @handles(CaptureLaserAFFrameCommand)
     def _on_capture_frame(self, cmd: CaptureLaserAFFrameCommand) -> None:
         """Handle CaptureLaserAFFrameCommand from EventBus.
 
@@ -1160,6 +1296,11 @@ class LaserAutofocusController:
             )
             return
 
+        # Ensure the focus camera is streaming so triggers/reads work
+        was_streaming = self._camera_service.get_is_streaming()
+        if not was_streaming:
+            self._camera_service.start_streaming()
+
         try:
             # Capture a single frame for spot detection
             image = self.get_new_frame()
@@ -1171,29 +1312,7 @@ class LaserAutofocusController:
                 )
                 return
 
-            self.image = image  # Store for debugging
-
-            # Run spot detection
-            spot_detection_params = {
-                "y_window": self.laser_af_properties.y_window,
-                "x_window": self.laser_af_properties.x_window,
-                "min_peak_width": self.laser_af_properties.min_peak_width,
-                "min_peak_distance": self.laser_af_properties.min_peak_distance,
-                "min_peak_prominence": self.laser_af_properties.min_peak_prominence,
-                "spot_spacing": self.laser_af_properties.spot_spacing,
-            }
-
-            try:
-                result = utils.find_spot_location(
-                    image,
-                    mode=self.laser_af_properties.spot_detection_mode,
-                    params=spot_detection_params,
-                    filter_sigma=self.laser_af_properties.filter_sigma,
-                    debug_plot=False,
-                )
-            except Exception as e:
-                self._log.error(f"Spot detection failed: {e}")
-                result = None
+            result = self._detect_spot_in_frame(image)
 
             # Stream the image to the display first
             if image is not None:
@@ -1207,14 +1326,17 @@ class LaserAutofocusController:
                     )
                 )
             else:
-                x, y = result
-                self._log.info(f"Spot detected at ({x:.1f}, {y:.1f})")
+                x = result.x
+                y = result.y
                 self._event_bus.publish(LaserAFFrameCaptured(success=True))
                 # Include the image in the event so the widget can display it with the crosshair
                 self._event_bus.publish(
                     LaserAFSpotCentroidMeasured(success=True, x_px=x, y_px=y, image=image)
                 )
         finally:
+            # Stop streaming if we started it
+            if not was_streaming:
+                self._camera_service.stop_streaming()
             try:
                 self._turn_off_af_laser()
             except TimeoutError:
