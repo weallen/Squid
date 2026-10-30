@@ -185,6 +185,7 @@ class Microscope:
     ):
         super().__init__()
         self._log = squid.core.logging.get_logger(self.__class__.__name__)
+        self._closed = False
 
         self.stage: AbstractStage = stage
         self.camera: AbstractCamera = camera
@@ -420,6 +421,10 @@ class Microscope:
             raise e
 
     def close(self) -> None:
+        """Shut down the hardware. Calling close() more than once is a no-op."""
+        if self._closed:
+            return
+        self._closed = True
         self.stop_live()
         self.low_level_drivers.microcontroller.close()
         if self.addons.emission_filter_wheel:
