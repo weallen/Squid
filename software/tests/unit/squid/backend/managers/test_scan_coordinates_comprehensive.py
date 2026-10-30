@@ -900,3 +900,31 @@ class TestRegionManagement:
         scan_coords.remove_region("R1")
         event_bus.drain()
         assert len(collected) == 1
+
+
+# ============================================================================
+# 12. TestRegionShapesPopulated — every add path records a shape (upstream #554)
+# ============================================================================
+
+
+class TestRegionShapesPopulated:
+
+    def test_flexible_region_has_square_shape(self, scan_coords):
+        scan_coords.add_flexible_region("R0", 20.0, 20.0, 0.0, 2, 2, 10.0)
+        assert scan_coords.region_shapes["R0"] == "Square"
+        assert scan_coords.get_region_shape("R0") == "Square"
+        assert scan_coords.region_contains_coordinate("R0", 20.0, 20.0)
+
+    def test_flexible_region_with_step_size_has_square_shape(self, scan_coords):
+        scan_coords.add_flexible_region_with_step_size("R0", 20.0, 20.0, 0.0, 2, 2, 1.0, 1.0)
+        assert scan_coords.region_shapes["R0"] == "Square"
+
+    def test_single_fov_region_has_square_shape(self, scan_coords):
+        scan_coords.add_single_fov_region("R0", 20.0, 20.0, 0.0)
+        assert scan_coords.region_shapes["R0"] == "Square"
+        assert scan_coords.region_contains_coordinate("R0", 20.0, 20.0)
+
+    def test_template_region_has_square_shape(self, scan_coords):
+        scan_coords.add_template_region(20.0, 20.0, 0.0, np.array([0.0, 1.0]), np.array([0.0, 1.0]), "R0")
+        assert scan_coords.region_shapes["R0"] == "Square"
+        assert scan_coords.region_contains_coordinate("R0", 20.5, 20.5)

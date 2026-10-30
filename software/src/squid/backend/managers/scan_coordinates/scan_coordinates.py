@@ -830,6 +830,7 @@ class ScanCoordinates:
             self._log.info(f"Added Flexible Region: {region_id}")
             self.region_centers[region_id] = [center_x, center_y, center_z]
             self.region_fov_coordinates[region_id] = scan_coordinates
+            self.region_shapes[region_id] = "Square"
             self._publish_update(
                 AddScanCoordinateRegion(
                     fov_centers=FovCenter.from_scan_coordinates(
@@ -860,6 +861,7 @@ class ScanCoordinates:
 
         self.region_centers[region_id] = [clamped_x, clamped_y, center_z]
         self.region_fov_coordinates[region_id] = [(clamped_x, clamped_y)]
+        self.region_shapes[region_id] = "Square"
         fov_width_mm, fov_height_mm = self._get_current_fov_dimensions()
         self._publish_update(
             AddScanCoordinateRegion(
@@ -908,6 +910,7 @@ class ScanCoordinates:
             self._log.info(f"Added Flexible Region: {region_id}")
             self.region_centers[region_id] = [center_x, center_y, center_z]
             self.region_fov_coordinates[region_id] = scan_coordinates
+            self.region_shapes[region_id] = "Square"
             fov_width_mm, fov_height_mm = self._get_current_fov_dimensions()
             self._publish_update(
                 AddScanCoordinateRegion(
@@ -979,6 +982,7 @@ class ScanCoordinates:
                 scan_coordinates.append((x, y))
         self.region_centers[region_id] = [x_mm, y_mm, z_mm]
         self.region_fov_coordinates[region_id] = scan_coordinates
+        self.region_shapes[region_id] = "Square"
         fov_width_mm, fov_height_mm = self._get_current_fov_dimensions()
         self._publish_update(
             AddScanCoordinateRegion(
