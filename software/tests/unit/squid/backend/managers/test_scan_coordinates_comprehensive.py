@@ -900,3 +900,17 @@ class TestRegionManagement:
         scan_coords.remove_region("R1")
         event_bus.drain()
         assert len(collected) == 1
+
+
+def test_region_registered_without_a_shape_falls_back_to_square(scan_coords):
+    """Code that writes the region dicts directly may leave no shape; focus-map grid generation
+    (region_contains_coordinate -> get_region_shape) used to raise KeyError on it (upstream #618)."""
+    scan_coords.region_centers["loaded"] = [21.0, 21.0]
+    scan_coords.region_fov_coordinates["loaded"] = [
+        (20.0 + 0.5 * i, 20.0 + 0.5 * j) for i in range(4) for j in range(4)
+    ]
+    assert "loaded" not in scan_coords.region_shapes
+
+    assert scan_coords.get_region_shape("loaded") == "Square"
+    assert scan_coords.region_contains_coordinate("loaded", 20.75, 20.75)
+    assert not scan_coords.region_contains_coordinate("loaded", 30.0, 30.0)
