@@ -469,6 +469,21 @@ class TestZarrWriterInfo:
         assert info.z_size == 10
         assert info.is_hcs is False  # Default
 
+    def test_hcs_structure_orders_1536_rows_after_z(self):
+        """Rows AA..AF on a 1536-well plate belong after Z, not between A and B (upstream #600)."""
+        info = ZarrWriterInfo(
+            base_path="/tmp/experiment",
+            t_size=1,
+            c_size=1,
+            z_size=1,
+            is_hcs=True,
+            region_fov_counts={"AA1": 1, "B2": 1, "A1": 1, "Z3": 1, "AF1": 1},
+        )
+        rows, cols, wells = info.get_hcs_structure()
+        assert rows == ["A", "B", "Z", "AA", "AF"]
+        assert cols == [1, 2, 3]
+        assert len(wells) == 5
+
     def test_zarr_writer_info_hcs_output_path(self):
         """Test HCS mode output paths use plate hierarchy."""
         info = ZarrWriterInfo(
