@@ -67,6 +67,9 @@ else:
     NL5 = TypeVar("NL5")
 
 
+_log = squid.core.logging.get_logger(__name__)
+
+
 class MicroscopeAddons:
     @staticmethod
     def build_from_global_config(
@@ -112,7 +115,17 @@ class MicroscopeAddons:
         if self.emission_filter_wheel:
             fw_config = squid.core.config.get_filter_wheel_config()
             self.emission_filter_wheel.initialize(fw_config.indices)
-            self.emission_filter_wheel.home()
+            try:
+                self.emission_filter_wheel.home()
+            except Exception:
+                # A filter-wheel homing failure (e.g. a post-home CMD_EXECUTION_ERROR) must not abort startup: the
+                # wheel controller leaves its tracked position unchanged (possibly stale), so treat it as unknown,
+                # come up anyway, and let the operator re-home from the GUI.
+                _log.error(
+                    "Filter wheel homing failed during startup; continuing with the filter wheel position unknown. "
+                    "Re-home from the GUI before relying on filter selection.",
+                    exc_info=True,
+                )
         if self.piezo_stage:
             self.piezo_stage.home()
         # Objective turret: home once and move to the default objective. The Xeryon
