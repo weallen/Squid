@@ -208,27 +208,30 @@ class ApplicationContext:
 
             # Restore cached position (previously done in main_window)
             try:
+                # X/Y are restored whenever X and Y are homed; Z only when it is referenced (an XY-only
+                # Cephla stage runs with homing_enabled_z = False and reports a meaningless raw Z).
                 if _config is not None and all(
                     [
                         getattr(_config, "HOMING_ENABLED_X", False),
                         getattr(_config, "HOMING_ENABLED_Y", False),
-                        getattr(_config, "HOMING_ENABLED_Z", False),
                     ]
                 ):
                     import squid.backend.drivers.stages.stage_utils as stage_utils
 
                     cached_pos = stage_utils.get_cached_position()
-                    safety_z = float(getattr(_config, "Z_HOME_SAFETY_POINT", 0)) / 1000.0
                     if cached_pos is not None:
                         stage_service.move_to(
                             x_mm=float(cached_pos.x_mm),
                             y_mm=float(cached_pos.y_mm),
                             blocking=True,
                         )
-                        target_z = float(cached_pos.z_mm) if safety_z < float(cached_pos.z_mm) else safety_z
-                        stage_service.move_to(z_mm=target_z, blocking=True)
-                    else:
-                        stage_service.move_to(z_mm=safety_z, blocking=True)
+                    if stage_utils.z_is_referenced():
+                        safety_z = float(getattr(_config, "Z_HOME_SAFETY_POINT", 0)) / 1000.0
+                        if cached_pos is not None:
+                            target_z = float(cached_pos.z_mm) if safety_z < float(cached_pos.z_mm) else safety_z
+                            stage_service.move_to(z_mm=target_z, blocking=True)
+                        else:
+                            stage_service.move_to(z_mm=safety_z, blocking=True)
             except Exception:
                 self._log.exception("Failed to restore cached stage position")
 
@@ -1297,6 +1300,7 @@ class ApplicationContext:
                 stage_utils.cache_position(
                     pos=stage_service.get_position(),
                     stage_config=stage_service.get_config(),
+                    validate_z=stage_utils.z_is_referenced(),
                 )
             except Exception:
                 self._log.exception("Failed to cache stage position during shutdown")
