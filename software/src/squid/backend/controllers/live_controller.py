@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from dataclasses import dataclass, replace
 from enum import Enum, auto
 from typing import Optional, Set, TYPE_CHECKING
@@ -473,9 +474,13 @@ class LiveController(StateMachine[LiveControllerState]):
             self._mode_gate.set_mode(GlobalMode.IDLE, reason="live stop")
 
     def _trigger_acquisition_timer_fn(self) -> None:
+        trigger_start = time.monotonic()
         if self.trigger_acquisition():
             if self.is_live:
-                self._start_new_timer()
+                # The live FPS is a trigger rate, so the interval runs from the start of this trigger. A trigger
+                # can block for a whole frame, and waiting the full interval after it returned lowers the rate.
+                elapsed_ms = (time.monotonic() - trigger_start) * 1000
+                self._start_new_timer(maybe_custom_interval_ms=max(0.0, self.timer_trigger_interval - elapsed_ms))
         else:
             if self.is_live:
                 # It failed, try again real soon
@@ -522,7 +527,7 @@ class LiveController(StateMachine[LiveControllerState]):
                 self.timer_trigger.cancel()
             self.timer_trigger = None
 
-            if maybe_custom_interval_ms:
+            if maybe_custom_interval_ms is not None:
                 interval_s = maybe_custom_interval_ms / 1000.0
             else:
                 interval_s = self.timer_trigger_interval / 1000.0
