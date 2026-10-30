@@ -302,8 +302,8 @@ class LiveController(StateMachine[LiveControllerState]):
                 if self.trigger_mode == TriggerMode.HARDWARE:
                     delay = -self._camera_service.get_strobe_time()
                 self._filter_wheel_service.set_delay_offset_ms(delay)
-                self._filter_wheel_service.set_filter_wheel_position(
-                    {1: self.currentConfiguration.emission_filter_position}
+                self._filter_wheel_service.set_emission_filter_position(
+                    self.currentConfiguration.emission_filter_position
                 )
             except Exception:
                 self._log.exception("Failed to set emission filter position via service")
