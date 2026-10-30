@@ -302,9 +302,12 @@ def test_focus_lock_allows_locked_run_without_laser_reference() -> None:
         bus.stop()
 
 
-def test_acquire_current_fov_focus_map_does_not_mutate_global_scan_coordinates(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_acquire_current_fov_skips_focus_map_interpolation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Single-FOV snaps use a temporary "current" region that no focus map knows about (upstream #577).
+
+    Interpolating would raise for per-region focus maps, so the focus-map block must be skipped and
+    neither the temporary nor the global scan coordinates may be touched.
+    """
     class _LocalScanCoordinates:
         last_instance: Optional["_LocalScanCoordinates"] = None
 
@@ -367,16 +370,18 @@ def test_acquire_current_fov_focus_map_does_not_mutate_global_scan_coordinates(
         )
         controller.set_base_path(str(tmp_path))
         controller.start_new_experiment("unit_test")
-        controller.set_focus_map(_FakeFocusMap())
+        focus_map = _FakeFocusMap()
+        controller.set_focus_map(focus_map)
 
         controller.run_acquisition(acquire_current_fov=True)
         bus.drain(timeout_s=1.0)
         if controller.thread:
             controller.thread.join(timeout=1.0)
 
+        assert focus_map.calls == []
         assert global_scan.update_calls == []
         local_scan = _LocalScanCoordinates.last_instance
         assert local_scan is not None
-        assert local_scan.update_calls != []
+        assert local_scan.update_calls == []
     finally:
         bus.stop()

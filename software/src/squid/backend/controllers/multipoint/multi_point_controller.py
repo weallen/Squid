@@ -949,7 +949,7 @@ class MultiPointController(StateMachine[AcquisitionControllerState]):
             # run the acquisition
             self.timestamp_acquisition_started: float = time.time()
 
-            if self._focus_map:
+            if self._focus_map and not acquire_current_fov:
                 self._log.info("Using focus surface for Z interpolation")
                 for region_id in scan_position_information.scan_region_names:
                     region_fov_coords = scan_position_information.scan_region_fov_coords_mm[
