@@ -250,3 +250,21 @@ class TestIsSpotInRange:
             spot_x=95, reference_x=100, pixel_to_um=0.5, max_range_um=10.0
         )
         assert result is True
+
+
+class TestDetectSpotParams:
+    """Ported from upstream 2a550c86 (#674): a misspelled key used to be dropped silently and its default used."""
+
+    def test_unknown_key_raises(self):
+        from squid.backend.processing.laser_spot import detect_spot
+
+        image = np.zeros((64, 64), dtype=np.uint8)
+        with pytest.raises(ValueError, match="peak_width"):
+            detect_spot(image, params={"peak_width": 3})
+
+    def test_known_keys_are_accepted(self):
+        from squid.backend.processing.laser_spot import SPOT_DETECTION_PARAM_KEYS, detect_spot
+
+        image = np.zeros((64, 64), dtype=np.uint8)
+        # Only validation is under test; a blank image simply yields no spot.
+        detect_spot(image, params={key: 1 for key in SPOT_DETECTION_PARAM_KEYS})
