@@ -1,6 +1,7 @@
 import time
 
 import pytest
+from qtpy.QtCore import Qt
 
 from tests.gui_helpers import (
     EventCollector,
@@ -67,7 +68,7 @@ def test_workflow_flexible_snap_acquisition(gui_factory):
     set_line_edit_text(widget.lineEdit_experimentID, "snap_workflow")
 
     if widget.list_configurations.count() > 0:
-        widget.list_configurations.setCurrentRow(0)
+        widget.list_configurations.item(0).setCheckState(Qt.Checked)
 
     collector = EventCollector(event_bus).subscribe(AcquisitionStateChanged)
     click_widget(widget.btn_snap_images)
@@ -139,7 +140,7 @@ def test_workflow_focus_lock_snap_acquisition(gui_factory):
     click_widget(widget.btn_setSavingDir)
     set_line_edit_text(widget.lineEdit_experimentID, "focus_lock")
     if widget.list_configurations.count() > 0:
-        widget.list_configurations.setCurrentRow(0)
+        widget.list_configurations.item(0).setCheckState(Qt.Checked)
 
     set_checkbox_value(widget.checkbox_withReflectionAutofocus, True)
 

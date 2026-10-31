@@ -74,9 +74,7 @@ from qtpy.QtWidgets import (
     QFileDialog,
     QMessageBox,
     QSizePolicy,
-    QAbstractItemView,
     QWidget,
-    QListWidget,
     QProgressBar,
 )
 from qtpy.QtGui import QIcon
@@ -95,6 +93,16 @@ from _def import (
 from squid.core.config.feature_flags import get_feature_flags
 from squid.core.utils import get_last_used_saving_path, save_last_used_saving_path
 from squid.ui.widgets.acquisition.yaml_drop_mixin import AcquisitionYAMLDropMixin
+from squid.ui.widgets.acquisition.channel_order_widget import (
+    ChannelOrderWidget,
+    load_cached_channel_order,
+    save_cached_channel_order,
+)
+from squid.ui.widgets.acquisition.coordinates_csv import (
+    coordinate_rows_for_save,
+    parfocal_adjusted_z_mm,
+    regions_from_coordinates_dataframe,
+)
 from squid.backend.io.acquisition_yaml import (
     AcquisitionYAMLData,
     save_acquisition_preset,
@@ -108,6 +116,8 @@ from squid.ui.widgets.wellplate import WellSelectionWidget
 
 
 class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, EventBusFrame):
+    _CHANNEL_ORDER_CACHE_KEY = "wellplate"
+
     def __init__(
         self,
         event_bus: "UIEventBus",
@@ -353,8 +363,7 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, EventBusFrame):
         if event.objective_name and event.objective_name != self._current_objective:
             return
         self._channel_configs = list(event.configuration_names)
-        self.list_configurations.clear()
-        self.list_configurations.addItems(self._channel_configs)
+        self.channel_order_widget.set_channels(self._channel_configs)
 
     def add_components(self):
         self.entry_well_coverage = QDoubleSpinBox()
@@ -485,10 +494,16 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, EventBusFrame):
         )
         self.combobox_z_stack.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
-        # Channel configurations (populated from initial_channel_configs)
-        self.list_configurations = QListWidget()
-        self.list_configurations.addItems(self._channel_configs)
-        self.list_configurations.setSelectionMode(QAbstractItemView.MultiSelection)
+        # Channel configurations (populated from initial_channel_configs). The selection
+        # order is the acquisition order and is persisted per widget.
+        self.channel_order_widget = ChannelOrderWidget(
+            initial_channels=self._channel_configs, ordered_selection=True
+        )
+        cached_order = load_cached_channel_order(self._CHANNEL_ORDER_CACHE_KEY)
+        if cached_order:
+            self.channel_order_widget.set_selected_channels(cached_order)
+        # Underlying list, kept for callers that only need row access/counts.
+        self.list_configurations = self.channel_order_widget.list_channels
 
         # Add a combo box for shape selection
         self.combobox_shape = QComboBox()
@@ -842,7 +857,7 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, EventBusFrame):
 
         # Configuration list
         config_row = 3 if _FEATURE_FLAGS.is_enabled("SUPPORT_LASER_AUTOFOCUS") else 2
-        grid.addWidget(self.list_configurations, config_row, 0)
+        grid.addWidget(self.channel_order_widget, config_row, 0)
 
         # Options and Start button
         options_layout = QVBoxLayout()
@@ -928,18 +943,13 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, EventBusFrame):
         self.checkbox_useFocusMap.toggled.connect(self._on_use_focus_map_toggled)
         self.checkbox_usePiezo.toggled.connect(self._on_use_piezo_toggled)
         self.checkbox_skipSaving.toggled.connect(self._on_skip_saving_toggled)
-        self.list_configurations.itemSelectionChanged.connect(
-            self.emit_selected_channels
-        )
+        self.channel_order_widget.selection_changed.connect(self._on_channel_selection_changed)
         # Note: acquisition_finished, signal_acquisition_progress, signal_region_progress
         # are now handled via EventBus subscriptions (see _on_acquisition_state_changed etc.)
         self.eta_timer.timeout.connect(self.update_eta_display)
 
-        # Connect save/clear coordinates button
-        self.btn_save_scan_coordinates.clicked.connect(
-            self.on_save_or_clear_coordinates_clicked
-        )
-        self.btn_load_scan_coordinates.clicked.connect(self.on_load_coordinates_clicked)
+        self.btn_save_scan_coordinates.clicked.connect(self.save_coordinates)
+        self.btn_load_scan_coordinates.clicked.connect(self.on_load_or_clear_coordinates_clicked)
 
         # Connect acquisition tabs
         self.checkbox_xy.toggled.connect(self.on_xy_toggled)
@@ -976,9 +986,8 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, EventBusFrame):
             self.save_multipoint_widget_config_to_cache
         )
         self.entry_NZ.valueChanged.connect(self.save_multipoint_widget_config_to_cache)
-        self.list_configurations.itemSelectionChanged.connect(
-            self.save_multipoint_widget_config_to_cache
-        )
+        # Channel selection/order is persisted by _on_channel_selection_changed (channel
+        # sequence cache), not by this settings cache.
         self.checkbox_withAutofocus.toggled.connect(
             self.save_multipoint_widget_config_to_cache
         )
@@ -1009,9 +1018,6 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, EventBusFrame):
                 "nt": self.entry_Nt.value(),
                 "dz": self.entry_deltaZ.value(),
                 "nz": self.entry_NZ.value(),
-                "selected_channels": [
-                    item.text() for item in self.list_configurations.selectedItems()
-                ],
                 "autofocus_mode": self._current_autofocus_mode().value,
             }
 
@@ -1042,7 +1048,7 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, EventBusFrame):
             self.entry_Nt.blockSignals(True)
             self.entry_deltaZ.blockSignals(True)
             self.entry_NZ.blockSignals(True)
-            self.list_configurations.blockSignals(True)
+            self.channel_order_widget.blockSignals(True)
             self.checkbox_withAutofocus.blockSignals(True)
             self.checkbox_withReflectionAutofocus.blockSignals(True)
 
@@ -1087,14 +1093,12 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, EventBusFrame):
             self.entry_deltaZ.setValue(settings.get("dz", 1.0))
             self.entry_NZ.setValue(settings.get("nz", 1))
 
-            # Restore selected channels
-            selected_channels = settings.get("selected_channels", [])
-            if selected_channels:
-                self.list_configurations.clearSelection()
-                for i in range(self.list_configurations.count()):
-                    item = self.list_configurations.item(i)
-                    if item.text() in selected_channels:
-                        item.setSelected(True)
+            # Channel selection/order is restored from the channel sequence cache at
+            # construction; fall back to this cache's legacy (unordered) entry once.
+            if load_cached_channel_order(self._CHANNEL_ORDER_CACHE_KEY) is None:
+                selected_channels = settings.get("selected_channels", [])
+                if selected_channels:
+                    self.channel_order_widget.set_selected_channels(selected_channels)
 
             # Restore autofocus settings
             autofocus_mode = AutofocusMode(settings.get("autofocus_mode", AutofocusMode.NONE.value))
@@ -1115,7 +1119,7 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, EventBusFrame):
             self.entry_Nt.blockSignals(False)
             self.entry_deltaZ.blockSignals(False)
             self.entry_NZ.blockSignals(False)
-            self.list_configurations.blockSignals(False)
+            self.channel_order_widget.blockSignals(False)
             self.checkbox_withAutofocus.blockSignals(False)
             self.checkbox_withReflectionAutofocus.blockSignals(False)
 
@@ -1371,7 +1375,7 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, EventBusFrame):
             if self.cached_loaded_coordinates_df is None and not getattr(
                 self, "_loading_from_cache", False
             ):
-                QTimer.singleShot(100, self.on_load_coordinates_clicked)
+                QTimer.singleShot(100, self.on_load_or_clear_coordinates_clicked)
             else:
                 # Restore cached coordinates when switching to Load Coordinates mode
                 self.restore_cached_coordinates()
@@ -1382,6 +1386,8 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, EventBusFrame):
                 and self._previous_xy_mode == "Load Coordinates"
             ):
                 self._publish(ClearScanCoordinatesCommand())
+                # The cached file is kept (restored on switching back), but no plan is active now.
+                self._set_has_loaded_coordinates(False)
 
         # Store the current mode as previous for next time
         self._previous_xy_mode = mode
@@ -2183,7 +2189,7 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, EventBusFrame):
             )
             return
 
-        if not self.list_configurations.selectedItems():
+        if not self._selected_channel_names():
             self.btn_startAcquisition.setChecked(False)
             QMessageBox.warning(
                 self, "Warning", "Please select at least one imaging channel"
@@ -2253,7 +2259,7 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, EventBusFrame):
                 overlap_percent=self.entry_overlap.value(),
             ))
             self._publish(SetAcquisitionChannelsCommand(
-                channel_names=[item.text() for item in self.list_configurations.selectedItems()]
+                channel_names=self._selected_channel_names()
             ))
             self._publish_focus_lock_params()
             self._publish(StartNewExperimentCommand(
@@ -2300,7 +2306,6 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, EventBusFrame):
             self.focusMapWidget.update_focus_point_display()
             self.focusMapWidget.enable_updating_focus_points_on_signal()
         self.setEnabled_all(True)
-        self.toggle_coordinate_controls(self.has_loaded_coordinates)
 
     def setEnabled_all(self, enabled):
         for widget in self.findChildren(QWidget):
@@ -2427,9 +2432,7 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, EventBusFrame):
         experiment_path = os.path.join(base_path, experiment_id)
 
         # Collect selected channels
-        selected_channels = [
-            item.text() for item in self.list_configurations.selectedItems()
-        ]
+        selected_channels = self._selected_channel_names()
 
         try:
             save_acquisition_preset(
@@ -2512,7 +2515,7 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, EventBusFrame):
             )
 
     def on_snap_images(self):
-        if not self.list_configurations.selectedItems():
+        if not self._selected_channel_names():
             QMessageBox.warning(
                 self, "Warning", "Please select at least one imaging channel"
             )
@@ -2520,7 +2523,7 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, EventBusFrame):
 
         # Set the selected channels and acquisition parameters via events
         self._publish(SetAcquisitionChannelsCommand(
-            channel_names=[item.text() for item in self.list_configurations.selectedItems()]
+            channel_names=self._selected_channel_names()
         ))
 
         z = self._cached_z_mm
@@ -2579,140 +2582,93 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, EventBusFrame):
         self.entry_deltaZ.setValue(deltaZ)
         self._publish(SetAcquisitionParametersCommand(delta_z_um=deltaZ))
 
+    def _selected_channel_names(self) -> List[str]:
+        """Selected channels in acquisition order."""
+        return self.channel_order_widget.get_selected_channels_ordered()
+
+    def _on_channel_selection_changed(self, names: List[str]) -> None:
+        save_cached_channel_order(self._CHANNEL_ORDER_CACHE_KEY, names)
+        if getattr(self, "_is_active_tab", False):
+            self.emit_selected_channels()
+
     def emit_selected_channels(self):
-        selected_channels = [
-            item.text() for item in self.list_configurations.selectedItems()
-        ]
         self._publish(
-            SetAcquisitionChannelsCommand(channel_names=list(selected_channels))
+            SetAcquisitionChannelsCommand(channel_names=self._selected_channel_names())
         )
 
-    def toggle_coordinate_controls(self, has_coordinates: bool):
-        """Toggle button text and control states based on whether coordinates are loaded"""
-        if has_coordinates:
-            self.btn_save_scan_coordinates.setText("Clear Coordinates")
-            # Disable scan controls when coordinates are loaded
-            self.combobox_shape.setEnabled(False)
-            self.entry_scan_size.setEnabled(False)
-            self.entry_well_coverage.setEnabled(False)
-            self.entry_overlap.setEnabled(False)
-            # Disable well selector
-            if self.well_selection_widget is not None:
-                self.well_selection_widget.setEnabled(False)
-        else:
-            self.btn_save_scan_coordinates.setText("Save Coordinates")
-            # Re-enable scan controls when coordinates are cleared - use update_scan_control_ui for proper logic
-            self.update_scan_control_ui()
-
-        self.has_loaded_coordinates = has_coordinates
-
-    def on_save_or_clear_coordinates_clicked(self):
-        """Handle save/clear coordinates button click"""
+    def on_load_or_clear_coordinates_clicked(self):
+        """Toggle for btn_load_scan_coordinates: open the load dialog when nothing is
+        loaded, clear the loaded coordinates otherwise."""
         if self.has_loaded_coordinates:
-            # Clear coordinates
-            self._publish(ClearScanCoordinatesCommand())
-            self.toggle_coordinate_controls(has_coordinates=False)
-            # Update display/coordinates as needed
-            self.update_coordinates()
-        else:
-            # Save coordinates (existing save functionality)
-            self.save_coordinates()
-
-    def on_load_coordinates_clicked(self):
-        """Open file dialog and load coordinates from selected CSV file"""
+            self.clear_loaded_coordinates()
+            return
         file_path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Load Scan Coordinates",
-            "",
-            "CSV Files (*.csv);;All Files (*)",  # Default directory
+            self, "Load Scan Coordinates", "", "CSV Files (*.csv);;All Files (*)"
         )
-
         if file_path:
             self._log.info(f"Loading coordinates from {file_path}")
             self.load_coordinates(file_path)
 
-    def restore_cached_coordinates(self):
-        """Restore previously loaded coordinates from cached dataframe"""
-        if self.cached_loaded_coordinates_df is None:
-            return
+    def clear_loaded_coordinates(self):
+        self._publish(ClearScanCoordinatesCommand())
+        self.cached_loaded_coordinates_df = None
+        self.cached_loaded_file_path = None
+        self.text_loaded_coordinates.clear()
+        self._set_has_loaded_coordinates(False)
 
-        df = self.cached_loaded_coordinates_df
+    def _set_has_loaded_coordinates(self, loaded: bool):
+        self.has_loaded_coordinates = loaded
+        self.btn_load_scan_coordinates.setText("Clear Coords" if loaded else "Load New Coords")
 
-        region_fov_coordinates = {}
-        region_centers = {}
-        for region_id in df["region"].unique():
-            region_points = df[df["region"] == region_id]
-            coords = tuple(
-                (float(x), float(y))
-                for x, y in zip(region_points["x (mm)"], region_points["y (mm)"])
-            )
-            region_fov_coordinates[str(region_id)] = coords
+    def _publish_loaded_regions(self, df: pd.DataFrame) -> bool:
+        """Parse a coordinates dataframe and publish it as the scan plan.
 
-            # Calculate and store region center (average of points)
-            center_x = region_points["x (mm)"].mean()
-            center_y = region_points["y (mm)"].mean()
-            region_centers[str(region_id)] = (float(center_x), float(center_y))
-
+        Parsing/validation completes before anything is published, so a bad file
+        never replaces the existing regions. Returns whether the z column was dropped.
+        """
+        region_fov_coordinates, region_centers, z_dropped = regions_from_coordinates_dataframe(df)
         self._publish(
             LoadScanCoordinatesCommand(
                 region_fov_coordinates=region_fov_coordinates,
                 region_centers=region_centers,
             )
         )
+        return z_dropped
 
-        # Update text area to show loaded file path
-        if self.cached_loaded_file_path:
-            self.text_loaded_coordinates.setText(
-                f"Loaded: {self.cached_loaded_file_path}"
-            )
+    def restore_cached_coordinates(self):
+        """Restore previously loaded coordinates from the cached dataframe."""
+        if self.cached_loaded_coordinates_df is None:
+            return
+        try:
+            self._publish_loaded_regions(self.cached_loaded_coordinates_df)
+            if self.cached_loaded_file_path:
+                self.text_loaded_coordinates.setText(f"Loaded: {self.cached_loaded_file_path}")
+            self._set_has_loaded_coordinates(True)
+        except Exception as e:
+            # SOFTWARE_POS_LIMIT is runtime-mutable, so a cached dataframe that validated
+            # at load time can fail on a later restore. This runs from a Qt slot; an
+            # unhandled exception would abort PyQt5.
+            self._log.error(f"Failed to restore cached coordinates: {str(e)}")
+            QMessageBox.warning(self, "Load Error", f"Failed to restore cached coordinates\nError: {str(e)}")
 
     def load_coordinates(self, file_path: str):
-        """Load scan coordinates from a CSV file.
-
-        Args:
-            file_path: Path to CSV file containing coordinates
-        """
+        """Load scan coordinates (optionally with per-FOV z) from a CSV file."""
         try:
-            # Read coordinates from CSV
             df = pd.read_csv(file_path)
+            z_dropped = self._publish_loaded_regions(df)
 
-            # Validate CSV format
-            required_columns = ["region", "x (mm)", "y (mm)"]
-            if not all(col in df.columns for col in required_columns):
-                raise ValueError(
-                    "CSV file must contain 'region', 'x (mm)', and 'y (mm)' columns"
-                )
-
-            # Cache the dataframe and file path
             self.cached_loaded_coordinates_df = df.copy()
             self.cached_loaded_file_path = file_path
 
-            region_fov_coordinates = {}
-            region_centers = {}
-            for region_id in df["region"].unique():
-                region_points = df[df["region"] == region_id]
-                coords = tuple(
-                    (float(x), float(y))
-                    for x, y in zip(region_points["x (mm)"], region_points["y (mm)"])
-                )
-                region_fov_coordinates[str(region_id)] = coords
-
-                # Calculate and store region center (average of points)
-                center_x = region_points["x (mm)"].mean()
-                center_y = region_points["y (mm)"].mean()
-                region_centers[str(region_id)] = (float(center_x), float(center_y))
-
-            self._publish(
-                LoadScanCoordinatesCommand(
-                    region_fov_coordinates=region_fov_coordinates,
-                    region_centers=region_centers,
-                )
-            )
-
             self._log.info(f"Loaded {len(df)} coordinates from {file_path}")
-
-            # Update text area to show loaded file path
             self.text_loaded_coordinates.setText(f"Loaded: {file_path}")
+            self._set_has_loaded_coordinates(True)
+            if z_dropped:
+                QMessageBox.warning(
+                    self,
+                    "Z column ignored",
+                    "The 'z (mm)' column contains empty or non-numeric values; coordinates were loaded as XY-only.",
+                )
 
         except Exception as e:
             self._log.error(f"Failed to load coordinates: {str(e)}")
@@ -2723,10 +2679,12 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, EventBusFrame):
             )
 
     def save_coordinates(self):
-        """Save scan coordinates to a CSV file.
+        """Save scan coordinates to CSV files (one per objective).
 
-        Opens a file dialog for the user to specify a folder name and location.
-        Coordinates are saved in CSV format with headers for each objective.
+        Each FOV row carries 'z (mm)': the current stage z for the objective in use,
+        shifted for the other objectives by the objective switcher's per-machine Z
+        offset (XERYON_OBJECTIVE_SWITCHER_POS_2_OFFSET_MM). FOVs that already carry
+        z (e.g. a loaded plan) keep it.
         """
         # Open file dialog for user to specify folder name and location
         folder_path, _ = QFileDialog.getSaveFileName(
@@ -2744,19 +2702,14 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, EventBusFrame):
 
             current_objective = self._current_objective
             objective_names = self._objective_names or [current_objective]
+            z_current_mm = self._cached_z_mm
 
-            def _helper_save_coordinates(self, file_path: str):
+            def _helper_save_coordinates(self, file_path: str, objective_name: str):
                 snapshot = self._request_scan_coordinates_snapshot()
                 if snapshot is None:
                     raise RuntimeError("Timed out waiting for scan coordinate snapshot")
-                coordinates = []
-                for region_id, fov_coords in snapshot.region_fov_coordinates.items():
-                    for coord in fov_coords:
-                        coordinates.append([region_id, coord[0], coord[1]])
-
-                # Save to CSV with headers
-
-                df = pd.DataFrame(coordinates, columns=["region", "x (mm)", "y (mm)"])
+                z_mm = parfocal_adjusted_z_mm(current_objective, objective_name, z_current_mm)
+                df = coordinate_rows_for_save(snapshot.region_fov_coordinates, z_mm)
                 df.to_csv(file_path, index=False)
 
                 self._log.info(f"Saved scan coordinates to {file_path}")
@@ -2773,7 +2726,7 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, EventBusFrame):
                     obj_file_path = os.path.join(
                         folder_path, f"{folder_name}_{objective_name}.csv"
                     )
-                    _helper_save_coordinates(self, obj_file_path)
+                    _helper_save_coordinates(self, obj_file_path, objective_name)
 
                 # Restore current objective factor and coordinates
                 self._pixel_size_factor = original_factor
@@ -2982,7 +2935,6 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, EventBusFrame):
             self.entry_scan_size,
             self.checkbox_withAutofocus,
             self.checkbox_withReflectionAutofocus,
-            self.list_configurations,
             self.combobox_xy_mode,
             self.checkbox_focus_lock,
             self.spinbox_buffer_length,
@@ -3036,12 +2988,8 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, EventBusFrame):
             if index >= 0:
                 self.combobox_xy_mode.setCurrentIndex(index)
 
-            # Channels - select matching channels in list
-            self.list_configurations.clearSelection()
-            for i in range(self.list_configurations.count()):
-                item = self.list_configurations.item(i)
-                if item and item.text() in yaml_data.channel_names:
-                    item.setSelected(True)
+            # Channels - restore selection AND order from the YAML
+            self.channel_order_widget.set_selected_channels(yaml_data.channel_names)
 
             # Load well regions if present
             if yaml_data.wellplate_regions:

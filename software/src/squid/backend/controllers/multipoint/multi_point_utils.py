@@ -1,3 +1,4 @@
+import copy
 from dataclasses import dataclass, field
 from typing import List, Tuple, Dict, Optional, Callable, TYPE_CHECKING
 import time
@@ -20,9 +21,12 @@ class ScanPositionInformation:
     @staticmethod
     def from_scan_coordinates(scan_coordinates: ScanCoordinates):
         return ScanPositionInformation(
-            scan_region_coords_mm=list(scan_coordinates.region_centers.values()),
+            # Deep-copy so the acquisition owns a true snapshot: the controller's
+            # focus-map branch rewrites FOV entries in place, and sharing the inner
+            # lists would leak interpolated z into the GUI's ScanCoordinates.
+            scan_region_coords_mm=copy.deepcopy(list(scan_coordinates.region_centers.values())),
             scan_region_names=list(scan_coordinates.region_centers.keys()),
-            scan_region_fov_coords_mm=dict(scan_coordinates.region_fov_coordinates),
+            scan_region_fov_coords_mm=copy.deepcopy(dict(scan_coordinates.region_fov_coordinates)),
         )
 
 

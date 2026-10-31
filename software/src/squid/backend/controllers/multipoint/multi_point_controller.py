@@ -892,7 +892,6 @@ class MultiPointController(StateMachine[AcquisitionControllerState]):
                 )
                 self._config = self._config.with_updates(**{"zstack.z_range": z_range})
 
-            scan_coordinates_target = acquisition_scan_coordinates
             scan_position_information: ScanPositionInformation = (
                 ScanPositionInformation.from_scan_coordinates(acquisition_scan_coordinates)
             )
@@ -954,13 +953,12 @@ class MultiPointController(StateMachine[AcquisitionControllerState]):
                     region_fov_coords = scan_position_information.scan_region_fov_coords_mm[
                         region_id
                     ]
-                    # Convert each tuple to list for modification
+                    # Rewrite this acquisition's private snapshot only; the GUI's
+                    # ScanCoordinates keeps the user-configured coordinates.
                     for i, coords in enumerate(region_fov_coords):
                         x, y = coords[:2]  # This handles both (x,y) and (x,y,z) formats
                         z = self._focus_map.interpolate(x, y, region_id)
-                        # Modify the list directly
                         region_fov_coords[i] = (x, y, z)
-                        scan_coordinates_target.update_fov_z_level(region_id, i, z)
 
             elif (
                 self._config.focus.gen_focus_map

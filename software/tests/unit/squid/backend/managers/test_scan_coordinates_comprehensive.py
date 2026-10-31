@@ -902,13 +902,6 @@ class TestRegionManagement:
             assert len(coord) == 3
             assert coord[2] == pytest.approx(5.0)
 
-    def test_update_fov_z(self, scan_coords):
-        scan_coords.add_flexible_region("R1", 20.0, 20.0, 0.0, 2, 2, 10.0)
-        scan_coords.update_fov_z_level("R1", 0, 3.0)
-        assert scan_coords.region_fov_coordinates["R1"][0][2] == pytest.approx(3.0)
-        # First FOV → also updates region center
-        assert scan_coords.region_centers["R1"][2] == pytest.approx(3.0)
-
     def test_add_single_fov_clamps_out_of_bounds(self, scan_coords):
         scan_coords.add_single_fov_region("R1", -100.0, -100.0, 0.0)
         coord = scan_coords.region_fov_coordinates["R1"][0]
