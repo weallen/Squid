@@ -828,6 +828,34 @@ class TestSortCoordinates:
         assert keys[1] == "manual1"
 
 
+    def _set_regions(self, scan_coords, names):
+        scan_coords.region_centers = {name: [0.0, 0.0] for name in names}
+        scan_coords.region_fov_coordinates = {name: [(0.0, 0.0, 0.0)] for name in names}
+
+    def test_sort_multi_letter_rows_after_single_letter(self, scan_coords):
+        """1536-well rows AA..AF must come after Z, not interleave with A..F (upstream #600)."""
+        scan_coords.acquisition_pattern = "Unidirectional"
+        self._set_regions(scan_coords, ["AB1", "B1", "AA2", "A1", "Z1", "AA1", "A2"])
+        scan_coords.sort_coordinates()
+        assert list(scan_coords.region_centers.keys()) == ["A1", "A2", "B1", "Z1", "AA1", "AA2", "AB1"]
+        assert list(scan_coords.region_fov_coordinates.keys()) == list(scan_coords.region_centers.keys())
+
+    def test_sort_s_pattern_treats_multi_letter_rows_as_distinct_rows(self, scan_coords):
+        """Serpentine grouping must key on the whole row label, not its first character."""
+        scan_coords.acquisition_pattern = "S-Pattern"
+        self._set_regions(scan_coords, ["A1", "A2", "AA1", "AA2", "AB1", "AB2"])
+        scan_coords.sort_coordinates()
+        # Three separate rows (A, AA, AB), so only the middle one is reversed.
+        assert list(scan_coords.region_centers.keys()) == ["A1", "A2", "AA2", "AA1", "AB1", "AB2"]
+
+    def test_sort_keeps_non_well_region_names_last(self, scan_coords):
+        """Region names that aren't well IDs sort last (insertion order) instead of raising."""
+        scan_coords.acquisition_pattern = "S-Pattern"
+        self._set_regions(scan_coords, ["B1", "current", "A1", "my region"])
+        scan_coords.sort_coordinates()
+        assert list(scan_coords.region_centers.keys()) == ["A1", "B1", "current", "my region"]
+
+
 # ============================================================================
 # 11. TestRegionManagement — Add/remove/rename/z-update
 # ============================================================================
@@ -914,3 +942,31 @@ def test_region_registered_without_a_shape_falls_back_to_square(scan_coords):
     assert scan_coords.get_region_shape("loaded") == "Square"
     assert scan_coords.region_contains_coordinate("loaded", 20.75, 20.75)
     assert not scan_coords.region_contains_coordinate("loaded", 30.0, 30.0)
+
+
+# ============================================================================
+# 12. TestRegionShapesPopulated — every add path records a shape (upstream #554)
+# ============================================================================
+
+
+class TestRegionShapesPopulated:
+
+    def test_flexible_region_has_square_shape(self, scan_coords):
+        scan_coords.add_flexible_region("R0", 20.0, 20.0, 0.0, 2, 2, 10.0)
+        assert scan_coords.region_shapes["R0"] == "Square"
+        assert scan_coords.get_region_shape("R0") == "Square"
+        assert scan_coords.region_contains_coordinate("R0", 20.0, 20.0)
+
+    def test_flexible_region_with_step_size_has_square_shape(self, scan_coords):
+        scan_coords.add_flexible_region_with_step_size("R0", 20.0, 20.0, 0.0, 2, 2, 1.0, 1.0)
+        assert scan_coords.region_shapes["R0"] == "Square"
+
+    def test_single_fov_region_has_square_shape(self, scan_coords):
+        scan_coords.add_single_fov_region("R0", 20.0, 20.0, 0.0)
+        assert scan_coords.region_shapes["R0"] == "Square"
+        assert scan_coords.region_contains_coordinate("R0", 20.0, 20.0)
+
+    def test_template_region_has_square_shape(self, scan_coords):
+        scan_coords.add_template_region(20.0, 20.0, 0.0, np.array([0.0, 1.0]), np.array([0.0, 1.0]), "R0")
+        assert scan_coords.region_shapes["R0"] == "Square"
+        assert scan_coords.region_contains_coordinate("R0", 20.5, 20.5)

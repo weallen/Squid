@@ -1314,7 +1314,8 @@ class ApplicationContext:
         filter_service = self._services.get("filter_wheel")
         if filter_service is not None:
             try:
-                filter_service.set_filter_wheel_position({1: 1})
+                # Back to position 1 on the first configured wheel (not always index 1).
+                filter_service.set_emission_filter_position(1)
             except Exception:
                 self._log.exception("Failed to reset emission filter wheel during shutdown")
 

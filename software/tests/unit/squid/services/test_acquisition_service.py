@@ -78,6 +78,10 @@ class FakeFilterWheelService:
     def set_filter_wheel_position(self, positions: Dict[int, int]) -> None:
         self.calls.append(("set_filter_wheel_position", positions))
 
+    def set_emission_filter_position(self, position: int) -> bool:
+        self.calls.append(("set_emission_filter_position", position))
+        return True
+
 
 class FakePeripheralService:
     """Fake peripheral service for testing."""
@@ -210,7 +214,7 @@ class TestApplyConfiguration:
 
         # Should set delay to 0 for software trigger
         assert ("set_delay_offset_ms", 0) in filter_wheel.calls
-        assert ("set_filter_wheel_position", {1: 5}) in filter_wheel.calls
+        assert ("set_emission_filter_position", 5) in filter_wheel.calls
 
     def test_sets_filter_wheel_position_hardware_trigger(self):
         camera = FakeCameraService()
@@ -225,7 +229,7 @@ class TestApplyConfiguration:
 
         # Should set delay to negative strobe time for hardware trigger
         assert ("set_delay_offset_ms", -15) in filter_wheel.calls
-        assert ("set_filter_wheel_position", {1: 3}) in filter_wheel.calls
+        assert ("set_emission_filter_position", 3) in filter_wheel.calls
 
     def test_skips_filter_when_disabled(self):
         camera = FakeCameraService()

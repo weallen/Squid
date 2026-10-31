@@ -33,6 +33,7 @@ from squid.ui.widgets.camera._common import (
     handles,
     squid,
 )
+from squid.core.config.feature_flags import get_feature_flags
 
 
 class LiveControlWidget(EventBusFrame):
@@ -114,9 +115,19 @@ class LiveControlWidget(EventBusFrame):
     ) -> None:
         # line 0: trigger mode
         self.dropdown_triggerManu = QComboBox()
-        self.dropdown_triggerManu.addItems(
-            [TriggerMode.SOFTWARE, TriggerMode.HARDWARE, TriggerMode.CONTINUOUS]
-        )
+        # Continuous acquisition is only meaningful for recording; hide it otherwise.
+        trigger_modes = [TriggerMode.SOFTWARE, TriggerMode.HARDWARE]
+        if get_feature_flags().is_enabled("ENABLE_RECORDING"):
+            trigger_modes.append(TriggerMode.CONTINUOUS)
+        self.dropdown_triggerManu.addItems(trigger_modes)
+        if self._initial_trigger_mode not in trigger_modes:
+            # e.g. Continuous while recording is disabled: fall back to a visible mode and tell the
+            # backend, so the dropdown and the actual trigger mode agree.
+            self._log.info(
+                f"Initial trigger mode {self._initial_trigger_mode!r} is not available; using {TriggerMode.SOFTWARE!r}"
+            )
+            self._initial_trigger_mode = TriggerMode.SOFTWARE
+            self._publish(SetTriggerModeCommand(mode=TriggerMode.SOFTWARE))
         self.dropdown_triggerManu.setCurrentText(self._initial_trigger_mode)
         sizePolicy = QSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.dropdown_triggerManu.setSizePolicy(sizePolicy)

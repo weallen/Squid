@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import threading
-from typing import Optional
+from typing import List, Optional
 
 from squid.backend.services.base import BaseService, gated_command
 from squid.core.events import (
@@ -99,6 +99,31 @@ class FilterWheelService(BaseService):
                 setter(position)
             else:
                 raise AttributeError("Underlying filter wheel does not support position mapping")
+
+    def available_filter_wheels(self) -> List[int]:
+        """Indices of the configured wheels (empty if no hardware or the driver doesn't report them)."""
+        if self._wheel is None:
+            return []
+        with self._lock:
+            try:
+                return list(self._wheel.available_filter_wheels or [])
+            except Exception:
+                return []
+
+    def set_emission_filter_position(self, position: int) -> bool:
+        """Move the first configured wheel to ``position``.
+
+        A channel's emission filter position applies to the first configured wheel, which is not always
+        index 1 (e.g. an Optospin wheel on rotor port 2); addressing a missing index raises in the driver.
+
+        Returns:
+            True if a command was sent, False if no wheel is configured.
+        """
+        wheels = self.available_filter_wheels()
+        if not wheels:
+            return False
+        self.set_filter_wheel_position({wheels[0]: int(position)})
+        return True
 
     def get_position(self, wheel_index: int = 0) -> int:
         if self._wheel is None:

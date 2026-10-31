@@ -276,7 +276,7 @@ class AcquisitionService:
             _log.debug("Failed to set filter wheel delay")
 
         try:
-            self._filter_wheel.set_filter_wheel_position({1: int(position)})
+            self._filter_wheel.set_emission_filter_position(int(position))
         except Exception:
             _log.debug("Failed to set filter wheel position")
 
