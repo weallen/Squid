@@ -95,6 +95,11 @@ from _def import (
 from squid.core.config.feature_flags import get_feature_flags
 from squid.core.utils import get_last_used_saving_path, save_last_used_saving_path
 from squid.ui.widgets.acquisition.yaml_drop_mixin import AcquisitionYAMLDropMixin
+from squid.ui.widgets.acquisition.coordinates_csv import (
+    coordinate_rows_for_save,
+    parfocal_adjusted_z_mm,
+    regions_from_coordinates_dataframe,
+)
 from squid.backend.io.acquisition_yaml import (
     AcquisitionYAMLData,
     save_acquisition_preset,
@@ -935,11 +940,8 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, EventBusFrame):
         # are now handled via EventBus subscriptions (see _on_acquisition_state_changed etc.)
         self.eta_timer.timeout.connect(self.update_eta_display)
 
-        # Connect save/clear coordinates button
-        self.btn_save_scan_coordinates.clicked.connect(
-            self.on_save_or_clear_coordinates_clicked
-        )
-        self.btn_load_scan_coordinates.clicked.connect(self.on_load_coordinates_clicked)
+        self.btn_save_scan_coordinates.clicked.connect(self.save_coordinates)
+        self.btn_load_scan_coordinates.clicked.connect(self.on_load_or_clear_coordinates_clicked)
 
         # Connect acquisition tabs
         self.checkbox_xy.toggled.connect(self.on_xy_toggled)
@@ -1371,7 +1373,7 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, EventBusFrame):
             if self.cached_loaded_coordinates_df is None and not getattr(
                 self, "_loading_from_cache", False
             ):
-                QTimer.singleShot(100, self.on_load_coordinates_clicked)
+                QTimer.singleShot(100, self.on_load_or_clear_coordinates_clicked)
             else:
                 # Restore cached coordinates when switching to Load Coordinates mode
                 self.restore_cached_coordinates()
@@ -1382,6 +1384,8 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, EventBusFrame):
                 and self._previous_xy_mode == "Load Coordinates"
             ):
                 self._publish(ClearScanCoordinatesCommand())
+                # The cached file is kept (restored on switching back), but no plan is active now.
+                self._set_has_loaded_coordinates(False)
 
         # Store the current mode as previous for next time
         self._previous_xy_mode = mode
@@ -2300,7 +2304,6 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, EventBusFrame):
             self.focusMapWidget.update_focus_point_display()
             self.focusMapWidget.enable_updating_focus_points_on_signal()
         self.setEnabled_all(True)
-        self.toggle_coordinate_controls(self.has_loaded_coordinates)
 
     def setEnabled_all(self, enabled):
         for widget in self.findChildren(QWidget):
@@ -2587,132 +2590,79 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, EventBusFrame):
             SetAcquisitionChannelsCommand(channel_names=list(selected_channels))
         )
 
-    def toggle_coordinate_controls(self, has_coordinates: bool):
-        """Toggle button text and control states based on whether coordinates are loaded"""
-        if has_coordinates:
-            self.btn_save_scan_coordinates.setText("Clear Coordinates")
-            # Disable scan controls when coordinates are loaded
-            self.combobox_shape.setEnabled(False)
-            self.entry_scan_size.setEnabled(False)
-            self.entry_well_coverage.setEnabled(False)
-            self.entry_overlap.setEnabled(False)
-            # Disable well selector
-            if self.well_selection_widget is not None:
-                self.well_selection_widget.setEnabled(False)
-        else:
-            self.btn_save_scan_coordinates.setText("Save Coordinates")
-            # Re-enable scan controls when coordinates are cleared - use update_scan_control_ui for proper logic
-            self.update_scan_control_ui()
-
-        self.has_loaded_coordinates = has_coordinates
-
-    def on_save_or_clear_coordinates_clicked(self):
-        """Handle save/clear coordinates button click"""
+    def on_load_or_clear_coordinates_clicked(self):
+        """Toggle for btn_load_scan_coordinates: open the load dialog when nothing is
+        loaded, clear the loaded coordinates otherwise."""
         if self.has_loaded_coordinates:
-            # Clear coordinates
-            self._publish(ClearScanCoordinatesCommand())
-            self.toggle_coordinate_controls(has_coordinates=False)
-            # Update display/coordinates as needed
-            self.update_coordinates()
-        else:
-            # Save coordinates (existing save functionality)
-            self.save_coordinates()
-
-    def on_load_coordinates_clicked(self):
-        """Open file dialog and load coordinates from selected CSV file"""
+            self.clear_loaded_coordinates()
+            return
         file_path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Load Scan Coordinates",
-            "",
-            "CSV Files (*.csv);;All Files (*)",  # Default directory
+            self, "Load Scan Coordinates", "", "CSV Files (*.csv);;All Files (*)"
         )
-
         if file_path:
             self._log.info(f"Loading coordinates from {file_path}")
             self.load_coordinates(file_path)
 
-    def restore_cached_coordinates(self):
-        """Restore previously loaded coordinates from cached dataframe"""
-        if self.cached_loaded_coordinates_df is None:
-            return
+    def clear_loaded_coordinates(self):
+        self._publish(ClearScanCoordinatesCommand())
+        self.cached_loaded_coordinates_df = None
+        self.cached_loaded_file_path = None
+        self.text_loaded_coordinates.clear()
+        self._set_has_loaded_coordinates(False)
 
-        df = self.cached_loaded_coordinates_df
+    def _set_has_loaded_coordinates(self, loaded: bool):
+        self.has_loaded_coordinates = loaded
+        self.btn_load_scan_coordinates.setText("Clear Coords" if loaded else "Load New Coords")
 
-        region_fov_coordinates = {}
-        region_centers = {}
-        for region_id in df["region"].unique():
-            region_points = df[df["region"] == region_id]
-            coords = tuple(
-                (float(x), float(y))
-                for x, y in zip(region_points["x (mm)"], region_points["y (mm)"])
-            )
-            region_fov_coordinates[str(region_id)] = coords
+    def _publish_loaded_regions(self, df: pd.DataFrame) -> bool:
+        """Parse a coordinates dataframe and publish it as the scan plan.
 
-            # Calculate and store region center (average of points)
-            center_x = region_points["x (mm)"].mean()
-            center_y = region_points["y (mm)"].mean()
-            region_centers[str(region_id)] = (float(center_x), float(center_y))
-
+        Parsing/validation completes before anything is published, so a bad file
+        never replaces the existing regions. Returns whether the z column was dropped.
+        """
+        region_fov_coordinates, region_centers, z_dropped = regions_from_coordinates_dataframe(df)
         self._publish(
             LoadScanCoordinatesCommand(
                 region_fov_coordinates=region_fov_coordinates,
                 region_centers=region_centers,
             )
         )
+        return z_dropped
 
-        # Update text area to show loaded file path
-        if self.cached_loaded_file_path:
-            self.text_loaded_coordinates.setText(
-                f"Loaded: {self.cached_loaded_file_path}"
-            )
+    def restore_cached_coordinates(self):
+        """Restore previously loaded coordinates from the cached dataframe."""
+        if self.cached_loaded_coordinates_df is None:
+            return
+        try:
+            self._publish_loaded_regions(self.cached_loaded_coordinates_df)
+            if self.cached_loaded_file_path:
+                self.text_loaded_coordinates.setText(f"Loaded: {self.cached_loaded_file_path}")
+            self._set_has_loaded_coordinates(True)
+        except Exception as e:
+            # SOFTWARE_POS_LIMIT is runtime-mutable, so a cached dataframe that validated
+            # at load time can fail on a later restore. This runs from a Qt slot; an
+            # unhandled exception would abort PyQt5.
+            self._log.error(f"Failed to restore cached coordinates: {str(e)}")
+            QMessageBox.warning(self, "Load Error", f"Failed to restore cached coordinates\nError: {str(e)}")
 
     def load_coordinates(self, file_path: str):
-        """Load scan coordinates from a CSV file.
-
-        Args:
-            file_path: Path to CSV file containing coordinates
-        """
+        """Load scan coordinates (optionally with per-FOV z) from a CSV file."""
         try:
-            # Read coordinates from CSV
             df = pd.read_csv(file_path)
+            z_dropped = self._publish_loaded_regions(df)
 
-            # Validate CSV format
-            required_columns = ["region", "x (mm)", "y (mm)"]
-            if not all(col in df.columns for col in required_columns):
-                raise ValueError(
-                    "CSV file must contain 'region', 'x (mm)', and 'y (mm)' columns"
-                )
-
-            # Cache the dataframe and file path
             self.cached_loaded_coordinates_df = df.copy()
             self.cached_loaded_file_path = file_path
 
-            region_fov_coordinates = {}
-            region_centers = {}
-            for region_id in df["region"].unique():
-                region_points = df[df["region"] == region_id]
-                coords = tuple(
-                    (float(x), float(y))
-                    for x, y in zip(region_points["x (mm)"], region_points["y (mm)"])
-                )
-                region_fov_coordinates[str(region_id)] = coords
-
-                # Calculate and store region center (average of points)
-                center_x = region_points["x (mm)"].mean()
-                center_y = region_points["y (mm)"].mean()
-                region_centers[str(region_id)] = (float(center_x), float(center_y))
-
-            self._publish(
-                LoadScanCoordinatesCommand(
-                    region_fov_coordinates=region_fov_coordinates,
-                    region_centers=region_centers,
-                )
-            )
-
             self._log.info(f"Loaded {len(df)} coordinates from {file_path}")
-
-            # Update text area to show loaded file path
             self.text_loaded_coordinates.setText(f"Loaded: {file_path}")
+            self._set_has_loaded_coordinates(True)
+            if z_dropped:
+                QMessageBox.warning(
+                    self,
+                    "Z column ignored",
+                    "The 'z (mm)' column contains empty or non-numeric values; coordinates were loaded as XY-only.",
+                )
 
         except Exception as e:
             self._log.error(f"Failed to load coordinates: {str(e)}")
@@ -2723,10 +2673,12 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, EventBusFrame):
             )
 
     def save_coordinates(self):
-        """Save scan coordinates to a CSV file.
+        """Save scan coordinates to CSV files (one per objective).
 
-        Opens a file dialog for the user to specify a folder name and location.
-        Coordinates are saved in CSV format with headers for each objective.
+        Each FOV row carries 'z (mm)': the current stage z for the objective in use,
+        shifted for the other objectives by the objective switcher's per-machine Z
+        offset (XERYON_OBJECTIVE_SWITCHER_POS_2_OFFSET_MM). FOVs that already carry
+        z (e.g. a loaded plan) keep it.
         """
         # Open file dialog for user to specify folder name and location
         folder_path, _ = QFileDialog.getSaveFileName(
@@ -2744,19 +2696,14 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, EventBusFrame):
 
             current_objective = self._current_objective
             objective_names = self._objective_names or [current_objective]
+            z_current_mm = self._cached_z_mm
 
-            def _helper_save_coordinates(self, file_path: str):
+            def _helper_save_coordinates(self, file_path: str, objective_name: str):
                 snapshot = self._request_scan_coordinates_snapshot()
                 if snapshot is None:
                     raise RuntimeError("Timed out waiting for scan coordinate snapshot")
-                coordinates = []
-                for region_id, fov_coords in snapshot.region_fov_coordinates.items():
-                    for coord in fov_coords:
-                        coordinates.append([region_id, coord[0], coord[1]])
-
-                # Save to CSV with headers
-
-                df = pd.DataFrame(coordinates, columns=["region", "x (mm)", "y (mm)"])
+                z_mm = parfocal_adjusted_z_mm(current_objective, objective_name, z_current_mm)
+                df = coordinate_rows_for_save(snapshot.region_fov_coordinates, z_mm)
                 df.to_csv(file_path, index=False)
 
                 self._log.info(f"Saved scan coordinates to {file_path}")
@@ -2773,7 +2720,7 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, EventBusFrame):
                     obj_file_path = os.path.join(
                         folder_path, f"{folder_name}_{objective_name}.csv"
                     )
-                    _helper_save_coordinates(self, obj_file_path)
+                    _helper_save_coordinates(self, obj_file_path, objective_name)
 
                 # Restore current objective factor and coordinates
                 self._pixel_size_factor = original_factor

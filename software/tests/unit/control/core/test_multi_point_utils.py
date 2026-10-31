@@ -102,3 +102,18 @@ def test_multipoint_worker_fans_out_frame_via_stream_handler_and_publishes_coord
     assert kwargs["timestamp"] == 456.0
     assert kwargs["capture_info"] is info
     assert coords_events and coords_events[-1].x_mm == 1.0 and coords_events[-1].region_id == 7
+
+
+def test_from_scan_coordinates_snapshots_fov_lists_and_centers():
+    """Mutating the snapshot must not leak into the source ScanCoordinates (upstream #608)."""
+    sc = SimpleNamespace(
+        region_centers={"A1": [10.0, 10.0]},
+        region_fov_coordinates={"A1": [(10.0, 10.0), (10.5, 10.0)]},
+    )
+
+    info = ScanPositionInformation.from_scan_coordinates(sc)
+    info.scan_region_fov_coords_mm["A1"][0] = (10.0, 10.0, 3.0)
+    info.scan_region_coords_mm[0].append(3.0)
+
+    assert sc.region_fov_coordinates["A1"] == [(10.0, 10.0), (10.5, 10.0)]
+    assert sc.region_centers["A1"] == [10.0, 10.0]

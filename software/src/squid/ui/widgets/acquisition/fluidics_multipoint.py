@@ -59,6 +59,7 @@ from _def import (
     MULTIPOINT_USE_PIEZO_FOR_ZSTACKS,
 )
 from squid.core.config.feature_flags import get_feature_flags
+from squid.ui.widgets.acquisition.coordinates_csv import regions_from_coordinates_dataframe
 
 
 _FEATURE_FLAGS = get_feature_flags()
@@ -571,36 +572,14 @@ class MultiPointWithFluidicsWidget(QFrame):
             self.load_coordinates(file_path)
 
     def load_coordinates(self, file_path: str):
-        """Load scan coordinates from a CSV file.
+        """Load scan coordinates (optionally with per-FOV z) from a CSV file.
 
         Args:
-            file_path: Path to CSV file containing coordinates
+            file_path: Path to CSV file with 'region', 'x (mm)', 'y (mm)' and optional 'z (mm)'
         """
         try:
-            # Read coordinates from CSV
             df = pd.read_csv(file_path)
-
-            # Validate CSV format
-            required_columns = ["region", "x (mm)", "y (mm)"]
-            if not all(col in df.columns for col in required_columns):
-                raise ValueError(
-                    "CSV file must contain 'region', 'x (mm)', and 'y (mm)' columns"
-                )
-
-            region_fov_coordinates = {}
-            region_centers = {}
-            for region_id in df["region"].unique():
-                region_points = df[df["region"] == region_id]
-                coords = tuple(
-                    (float(x), float(y))
-                    for x, y in zip(region_points["x (mm)"], region_points["y (mm)"])
-                )
-                region_fov_coordinates[str(region_id)] = coords
-
-                # Calculate and store region center (average of points)
-                center_x = region_points["x (mm)"].mean()
-                center_y = region_points["y (mm)"].mean()
-                region_centers[str(region_id)] = (float(center_x), float(center_y))
+            region_fov_coordinates, region_centers, z_dropped = regions_from_coordinates_dataframe(df)
 
             self._event_bus.publish(
                 LoadScanCoordinatesCommand(
@@ -608,6 +587,12 @@ class MultiPointWithFluidicsWidget(QFrame):
                     region_centers=region_centers,
                 )
             )
+            if z_dropped:
+                QMessageBox.warning(
+                    self,
+                    "Z column ignored",
+                    "The 'z (mm)' column contains empty or non-numeric values; coordinates were loaded as XY-only.",
+                )
 
             self._log.info(f"Loaded {len(df)} coordinates from {file_path}")
 

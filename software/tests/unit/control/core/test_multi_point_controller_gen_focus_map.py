@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 from pathlib import Path
 import threading
@@ -148,10 +149,8 @@ class _FakeGlobalScanCoordinates:
         self.objectiveStore = object()
         self.stage = object()
         self.camera = object()
-        self.update_calls: list[tuple[str, int, float]] = []
-
-    def update_fov_z_level(self, region_id: str, index: int, z_mm: float) -> None:
-        self.update_calls.append((region_id, index, z_mm))
+        self.region_centers: dict = {}
+        self.region_fov_coordinates: dict = {}
 
 
 class _FakeFocusMap:
@@ -315,14 +314,13 @@ def test_acquire_current_fov_skips_focus_map_interpolation(tmp_path: Path, monke
             self.objectiveStore = objectiveStore
             self.stage = stage
             self.camera = camera
-            self.update_calls: list[tuple[str, int, float]] = []
+            self.region_centers: dict = {}
+            self.region_fov_coordinates: dict = {}
             type(self).last_instance = self
 
         def add_single_fov_region(self, *_args, **_kwargs) -> None:
-            return None
-
-        def update_fov_z_level(self, region_id: str, index: int, z_mm: float) -> None:
-            self.update_calls.append((region_id, index, z_mm))
+            self.region_centers["current"] = [1.0, 2.0, 0.0]
+            self.region_fov_coordinates["current"] = [(1.0, 2.0, 0.0)]
 
     class _FakeScanPositionInformation:
         def __init__(self) -> None:
@@ -379,9 +377,74 @@ def test_acquire_current_fov_skips_focus_map_interpolation(tmp_path: Path, monke
             controller.thread.join(timeout=1.0)
 
         assert focus_map.calls == []
-        assert global_scan.update_calls == []
+        assert global_scan.region_fov_coordinates == {}
         local_scan = _LocalScanCoordinates.last_instance
         assert local_scan is not None
-        assert local_scan.update_calls == []
+        assert local_scan.region_fov_coordinates == {"current": [(1.0, 2.0, 0.0)]}
+    finally:
+        bus.stop()
+
+
+def test_focus_map_does_not_mutate_gui_scan_coordinates(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Focus-map Z goes into the acquisition's private snapshot only (upstream #608).
+
+    ScanPositionInformation used to share the GUI ScanCoordinates' FOV lists and the
+    controller wrote interpolated z back via update_fov_z_level, so the GUI plan
+    silently carried focus-map z into later runs and saves.
+    """
+    captured: list = []
+
+    class _CapturingWorker:
+        def __init__(self, *, acquisition_parameters, event_bus, **_kwargs) -> None:
+            self._event_bus = event_bus
+            self._params = acquisition_parameters
+            captured.append(acquisition_parameters)
+
+        def run(self) -> None:
+            if self._event_bus:
+                self._event_bus.publish(
+                    AcquisitionWorkerFinished(
+                        experiment_id=self._params.experiment_ID,
+                        success=True,
+                        final_fov_count=0,
+                    )
+                )
+
+    monkeypatch.setattr(multi_point_controller, "MultiPointWorker", _CapturingWorker)
+
+    bus = EventBus()
+    bus.start()
+    try:
+        gui_scan = _FakeGlobalScanCoordinates()
+        gui_scan.region_centers = {"A1": [10.0, 10.0]}
+        gui_scan.region_fov_coordinates = {"A1": [(10.0, 10.0), (10.5, 10.0, 2.0)]}
+        coords_before = copy.deepcopy(gui_scan.region_fov_coordinates)
+        centers_before = copy.deepcopy(gui_scan.region_centers)
+
+        controller = MultiPointController(
+            live_controller=_FakeLiveController(),
+            autofocus_controller=_FakeAutoFocusController(),
+            objective_store=_FakeObjectiveStore(),
+            channel_configuration_manager=_FakeChannelConfigurationManager(),
+            camera_service=_FakeCameraService(),
+            stage_service=_FakeStageService(),
+            peripheral_service=_FakePeripheralService(),
+            event_bus=bus,
+            scan_coordinates=gui_scan,
+        )
+        controller.set_base_path(str(tmp_path))
+        controller.start_new_experiment("unit_test")
+        controller.set_focus_map(_FakeFocusMap())
+
+        controller.run_acquisition()
+        bus.drain(timeout_s=1.0)
+        if controller.thread:
+            controller.thread.join(timeout=1.0)
+
+        assert captured, "worker was never constructed"
+        snapshot = captured[0].scan_position_information.scan_region_fov_coords_mm
+        assert snapshot["A1"] == [(10.0, 10.0, 1.23), (10.5, 10.0, 1.23)]
+        assert gui_scan.region_fov_coordinates == coords_before
+        assert gui_scan.region_centers == centers_before
     finally:
         bus.stop()
