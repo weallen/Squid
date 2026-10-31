@@ -3,7 +3,7 @@ meta:
   target_branch: multipoint-refactor
   cutoff_date: '2025-12-12'
   created: '2026-01-12'
-  last_verified: '2026-10-30T20:36:35'
+  last_verified: '2026-10-30T21:46:23'
 commits:
   295afbb3:
     title: 'fix: Disable memory profiling in CI to fix test hangs (#451)'
@@ -1191,7 +1191,9 @@ commits:
     analysis_file: plans/2026-10-30-oct-sync-triage.md
   9a8a7afd:
     title: 'feat(gui): line profiler - multiple lines, H / V / Full / Fill FOV shortcuts (#732)'
-    status: pending
+    status: ported
+    ported_in: eebc491e
+    ported_date: '2026-10-30'
     analysis_file: plans/2026-10-30-oct-sync-triage.md
   1c13072e:
     title: 'feat(gui): opt-in PyQt6 per machine ([GENERAL] qt_api), --qt-api / SQUID_QT_API; two Qt 6 fixes (#729)'
@@ -1219,7 +1221,9 @@ commits:
     analysis_file: plans/2026-10-30-oct-sync-triage.md
   1adae748:
     title: 'perf(camera): one pass per frame for the copy out of the driver and the flip (#721)'
-    status: pending
+    status: ported
+    ported_in: 080b5758
+    ported_date: '2026-10-30'
     analysis_file: plans/2026-10-30-oct-sync-triage.md
   1a54d891:
     title: 'fix(camera): Aries readout time from the camera, working region, link-mode log (#715)'
@@ -1242,7 +1246,10 @@ commits:
   55236d92:
     title: 'perf(acquisition): cut per-image overhead - wait for the frame after a confocal scan, skip unchanged mode sets,
       no test frame (#712)'
-    status: pending
+    status: ported
+    ported_in: d23c9048
+    ported_date: '2026-10-30'
+    notes: 'Partial: test-frame removal + unchanged-mode skip; NL5 post-scan frame wait deferred (NL5 not in use).'
     analysis_file: plans/2026-10-30-oct-sync-triage.md
   9d8a5f56:
     title: 'fix(fw): compile FastLED logging out — it prints on the binary protocol''s serial port (#660)'
@@ -1266,11 +1273,16 @@ commits:
     analysis_file: plans/2026-10-30-oct-sync-triage.md
   c8f69125:
     title: 'fix(napari): keep the multichannel viewer responsive during large z-stacks (#713)'
-    status: pending
+    status: ported
+    ported_in: d7445b37
+    ported_date: '2026-10-30'
     analysis_file: plans/2026-10-30-oct-sync-triage.md
   70f2afdd:
     title: 'fix(acquisition): AION/NL5 hardware trigger - one scan per image, no stalls, prompt aborts (#711)'
-    status: pending
+    status: ported
+    ported_in: 5e15c0ca
+    ported_date: '2026-10-30'
+    notes: 'Partial: prompt abort + NL5 double start removed; RcmScanTrigger/ConfocalScanFailedError/Tucsen close lock deferred.'
     analysis_file: plans/2026-10-30-oct-sync-triage.md
   85917dc7:
     title: 'feat(illumination): Vortran Stradus VersaLase over USB HID (#709)'
@@ -1360,7 +1372,9 @@ commits:
     analysis_file: plans/2026-10-30-oct-sync-triage.md
   aa9107d9:
     title: fix file format menu and enable TIFF compression (#652)
-    status: pending
+    status: ported
+    ported_in: 8bb0fb3a
+    ported_date: '2026-10-30'
     analysis_file: plans/2026-10-30-oct-sync-triage.md
   5d992336:
     title: 'fix(xlight): positions and disk motor state from the device; default iris for channels without one (#675)'
@@ -1408,7 +1422,10 @@ commits:
   7385a179:
     title: 'fix(live): hold live triggers during stage motion and camera settings changes; survive a busy MCU at acquisition
       start (#639)'
-    status: pending
+    status: ported
+    ported_in: 09f1687d
+    ported_date: '2026-10-30'
+    notes: Host-side MCU-busy hold; camera _trigger_lock / _get_ready_for_trigger_imp ABC refactor left for Wave 3 (3b).
     analysis_file: plans/2026-10-30-oct-sync-triage.md
   46a139b9:
     title: Remove napari live view; port overexposure indicator and alignment (with auto-align) to the pyqtgraph viewer (#627)
@@ -1470,7 +1487,9 @@ commits:
     analysis_file: plans/2026-10-30-oct-sync-triage.md
   f9305f9f:
     title: 'fix(live): don''t widen the panel for the Snap button; rename live button to Live/Stop (#620)'
-    status: pending
+    status: ported
+    ported_in: 04c076bd
+    ported_date: '2026-10-30'
     analysis_file: plans/2026-10-30-oct-sync-triage.md
   5be72178:
     title: 'fix: focus map KeyError on loaded coordinates, stage move timeouts 38-300x too long, focus-map double move (#618)'
@@ -1480,7 +1499,9 @@ commits:
     analysis_file: plans/2026-10-30-oct-sync-triage.md
   752c9bb8:
     title: 'feat(live): add a Snap button for single-frame capture (#616)'
-    status: pending
+    status: ported
+    ported_in: 04c076bd
+    ported_date: '2026-10-30'
     analysis_file: plans/2026-10-30-oct-sync-triage.md
   e86a608f:
     title: 'fix(camera): prevent intermittent all-zero ToupCam frames from read-buffer realloc race (#585)'
@@ -1494,11 +1515,16 @@ commits:
     analysis_file: plans/2026-10-30-oct-sync-triage.md
   edc13253:
     title: 'fix(illumination): apply config edits without restart; add per-channel max output cap (#610)'
-    status: pending
+    status: ported
+    ported_in: 5244bdf4
+    ported_date: '2026-10-30'
+    notes: Cap also enforced in acquisition path (MultiPointWorker._apply_channel_mode); NapariLiveWidget part skipped.
     analysis_file: plans/2026-10-30-oct-sync-triage.md
   856bc0ee:
     title: 'feat(wellplate): save/load z coordinates in multipoint coordinate CSVs (#608)'
-    status: pending
+    status: ported
+    ported_in: 12a1b7eb
+    ported_date: '2026-10-30'
     analysis_file: plans/2026-10-30-oct-sync-triage.md
   875eda71:
     title: 'feat(camera): add sensor mode selection (Hamamatsu READOUTSPEED) (#605)'
@@ -1643,7 +1669,9 @@ commits:
     analysis_file: plans/2026-10-30-oct-sync-triage.md
   8779ced6:
     title: 'feat: reorderable channel acquisition sequence in multipoint widgets (#557)'
-    status: pending
+    status: ported
+    ported_in: 6404d6b2
+    ported_date: '2026-10-30'
     analysis_file: plans/2026-10-30-oct-sync-triage.md
   0a10ad1e:
     title: 'fix: populate region_shapes for flexible/single/template regions (#554)'

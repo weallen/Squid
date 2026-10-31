@@ -1,6 +1,6 @@
 # Oct 2026 Upstream Sync — Triage & Port Roadmap
 
-**Status:** IN-PROGRESS — Wave 1 COMPLETED 2026-10-30 (merge 57536204; record commits/42-57536204-oct-sync-wave1.md)
+**Status:** IN-PROGRESS — Wave 1 COMPLETED 2026-10-30 (record commits/42-57536204-oct-sync-wave1.md); Wave 2 COMPLETED 2026-10-30 (record commits/43-d2f8bafc-oct-sync-wave2.md)
 **Started:** 2026-10-30
 **Range:** 98 upstream/master commits, `0a10ad1e` (2026-06-13, #554) .. `53ddb024` (2026-10-26, #750)
 
@@ -8,7 +8,7 @@ Untracked since the 2026-06-10 sync. The fork's 3-layer architecture means no gi
 item is a semantic port. Triage verdicts below were made by checking each upstream diff against
 `software/src/squid/`. "Bug present" means the defect was confirmed in our code.
 
-**Totals (tracking YAML):** 27 ported (Wave 1) · 12 skipped · 27 deferred · 32 pending (Waves 2–4)
+**Totals (tracking YAML):** 39 ported (Waves 1–2) · 12 skipped · 27 deferred · 20 pending (Waves 3–4)
 
 `d25a1b73` and `b40b187b` (test follow-ups) were ported alongside #674 / #621.
 
@@ -56,28 +56,28 @@ Bugs confirmed present in our fork; low design risk; do first.
 
 ---
 
-## Wave 2 — Acquisition performance & behavior (M each, ~4–5 days)
+## Wave 2 — Acquisition performance & behavior — ✅ COMPLETED
 
 ### 2a `saving-format-tiff`
-- [ ] `aa9107d9` - file-format menu default bug (`config.py:344,1321`), TIFF compression, frozen `SaveSettings` snapshot on Job (#652)
+- [x] `aa9107d9` - file-format menu default bug (`config.py:344,1321`), TIFF compression, frozen `SaveSettings` snapshot on Job (#652)
 
 ### 2b `acq-overhead-abort`
-- [ ] `55236d92` (2 of 3 parts) - remove `_temporary_get_an_image_hack` (~1.2 s + stray trigger per acquisition), skip unchanged mode sets (~22 ms/image) (#712). Clear the cache on every channel/mode event (AF, z-offset, orchestrator).
-- [ ] `70f2afdd` (generic parts) - prompt abort mid z-stack, return Z by steps taken (via ZStackExecutor); fix NL5 double `start_acquisition` (#711). RcmScanTrigger stall recovery → defer (AION/NL5 only).
-- [ ] `1adae748` - single-pass copy+flip in `rotate_and_flip_image` (all cameras) + Tucsen view (#721). Port pixel-equivalence test.
+- [x] `55236d92` (2 of 3 parts) - remove `_temporary_get_an_image_hack` (~1.2 s + stray trigger per acquisition), skip unchanged mode sets (~22 ms/image) (#712). Clear the cache on every channel/mode event (AF, z-offset, orchestrator).
+- [x] `70f2afdd` (generic parts) - prompt abort mid z-stack, return Z by steps taken (via ZStackExecutor); fix NL5 double `start_acquisition` (#711). RcmScanTrigger stall recovery → defer (AION/NL5 only).
+- [x] `1adae748` - single-pass copy+flip in `rotate_and_flip_image` (all cameras) + Tucsen view (#721). Port pixel-equivalence test.
 
 ### 2c `live-snap-and-motion-hold`
-- [ ] `752c9bb8` + `f9305f9f` - Snap button on main live panel (LiveController command + StreamHandler force-display)
-- [ ] `7385a179` - hold live triggers while MCU busy / stage moving; multipoint start survives busy MCU (#639). Host-side guard is our only fix for the MCU wedge.
+- [x] `752c9bb8` + `f9305f9f` - Snap button on main live panel (LiveController command + StreamHandler force-display)
+- [x] `7385a179` - hold live triggers while MCU busy / stage moving; multipoint start survives busy MCU (#639). Host-side guard is our only fix for the MCU wedge.
 
 ### 2d `coordinates-z-csv`
-- [ ] `856bc0ee` - save/load Z in coordinate CSVs; **fixes focus-map Z leaking into GUI ScanCoordinates** via shallow copy (`multi_point_controller.py:952`)
+- [x] `856bc0ee` - save/load Z in coordinate CSVs; **fixes focus-map Z leaking into GUI ScanCoordinates** via shallow copy (`multi_point_controller.py:952`)
 
 ### 2e UI items
-- [ ] `c8f69125` - napari multichannel viewer responsive during large z-stacks (#713)
-- [ ] `9a8a7afd` - line profiler: multiple lines, H/V/Full/Fill; fixes centerline/rounding/off-image accuracy bugs (#732)
-- [ ] `8779ced6` - reorderable channel sequence in multipoint widgets; reuse `ChannelOrderWidget` (#557)
-- [ ] `edc13253` - illumination config edits without restart (stale `_illumination_config` snapshot, Cancel leaks edits); per-channel `max_output` (#610)
+- [x] `c8f69125` - napari multichannel viewer responsive during large z-stacks (#713)
+- [x] `9a8a7afd` - line profiler: multiple lines, H/V/Full/Fill; fixes centerline/rounding/off-image accuracy bugs (#732)
+- [x] `8779ced6` - reorderable channel sequence in multipoint widgets; reuse `ChannelOrderWidget` (#557)
+- [x] `edc13253` - illumination config edits without restart (stale `_illumination_config` snapshot, Cancel leaks edits); per-channel `max_output` (#610)
 
 ---
 
