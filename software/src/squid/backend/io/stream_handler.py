@@ -48,6 +48,8 @@ class StreamHandler:
 
         self.save_image_flag: bool = False
         self.handler_busy: bool = False
+        # One-shot exemption from display-fps throttling (see force_next_display()).
+        self._force_next_display: bool = False
 
         # for fps measurement
         self.timestamp_last: int = 0
@@ -66,6 +68,20 @@ class StreamHandler:
 
     def set_display_fps(self, fps: float) -> None:
         self.fps_display = fps
+
+    def force_next_display(self) -> None:
+        """Exempt the next frame from display-fps throttling.
+
+        Used by single-frame captures (snap): dropping the one frame that was acquired
+        because it arrived too soon after the previous one would leave a stale image on screen.
+        """
+        self._force_next_display = True
+
+    def _should_display(self, time_now: float) -> bool:
+        if self._force_next_display:
+            self._force_next_display = False
+            return True
+        return time_now - self.timestamp_last_display >= 1 / self.fps_display
 
     def set_save_fps(self, fps: float) -> None:
         self.fps_save = fps
@@ -126,7 +142,7 @@ class StreamHandler:
 
         # send image to display
         time_now = time.time()
-        if time_now - self.timestamp_last_display >= 1 / self.fps_display:
+        if self._should_display(time_now):
             self._fns.image_to_display(
                 utils.crop_image(
                     image,
@@ -183,7 +199,7 @@ class StreamHandler:
                 _log.warning("capture fanout failed: %s", traceback.format_exc())
 
         time_now = time.time()
-        if time_now - self.timestamp_last_display >= 1 / self.fps_display:
+        if self._should_display(time_now):
             self._fns.image_to_display(
                 utils.crop_image(
                     image,

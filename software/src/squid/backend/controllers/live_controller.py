@@ -19,6 +19,8 @@ from squid.core.events import (
     LaserEngineWarning,
     StartLiveCommand,
     StopLiveCommand,
+    SnapFrameCommand,
+    SnapStateChanged,
     SetTriggerModeCommand,
     SetTriggerFPSCommand,
     SetFilterAutoSwitchCommand,
@@ -43,6 +45,7 @@ from squid.core.utils import utils_channel
 
 if TYPE_CHECKING:
     from squid.core.config.models import AcquisitionChannel
+    from squid.backend.io.stream_handler import StreamHandler
     from squid.backend.services.laser_engine_service import LaserEngineService
     from squid.backend.managers import ChannelConfigService
 
@@ -117,6 +120,10 @@ class LiveController(StateMachine[LiveControllerState]):
             TriggerMode.SOFTWARE
         )  # @@@ change to None
         self.is_live: bool = False
+        # True only for the duration of a single snap(); see should_display_frames().
+        self._is_snapping: bool = False
+        # Set via set_stream_handler(); lets snap() exempt its frame from display throttling.
+        self._stream_handler: Optional["StreamHandler"] = None
         self.control_illumination: bool = control_illumination
         self.illumination_on: bool = False
         self.use_internal_timer_for_hardware_trigger: bool = (
@@ -154,7 +161,7 @@ class LiveController(StateMachine[LiveControllerState]):
         # Register valid commands per state
         self.register_valid_commands(
             LiveControllerState.STOPPED,
-            {StartLiveCommand, SetTriggerModeCommand, SetTriggerFPSCommand}
+            {StartLiveCommand, SnapFrameCommand, SetTriggerModeCommand, SetTriggerFPSCommand}
         )
         self.register_valid_commands(
             LiveControllerState.LIVE,
@@ -359,12 +366,17 @@ class LiveController(StateMachine[LiveControllerState]):
             self._log.info(f"Cannot start live: state is {self.state.name}")
             return
 
-        # Transition to STARTING
-        try:
-            self._transition_to(LiveControllerState.STARTING)
-        except InvalidStateForOperation:
-            self._log.warning("Invalid state for start_live")
-            return
+        # Transition to STARTING. The snap check and the transition happen under one lock so a
+        # concurrent snap() (which claims _is_snapping under the same lock) cannot interleave.
+        with self._lock:
+            if self._is_snapping:
+                self._log.info("Cannot start live: a snap is in progress")
+                return
+            try:
+                self._transition_to(LiveControllerState.STARTING)
+            except InvalidStateForOperation:
+                self._log.warning("Invalid state for start_live")
+                return
 
         # Warn-only: if the laser engine isn't ready for this channel, wake it and
         # surface a warning, but don't block live start.
@@ -472,6 +484,109 @@ class LiveController(StateMachine[LiveControllerState]):
         self._transition_to(LiveControllerState.STOPPED)
         if self._mode_gate:
             self._mode_gate.set_mode(GlobalMode.IDLE, reason="live stop")
+
+    def set_stream_handler(self, stream_handler: Optional["StreamHandler"]) -> None:
+        """Stream handler whose display throttle snap() bypasses for its single frame."""
+        self._stream_handler = stream_handler
+
+    @property
+    def is_snapping(self) -> bool:
+        """True only while snap() is acquiring (and displaying) its single frame."""
+        return self._is_snapping
+
+    def should_display_frames(self) -> bool:
+        """True when camera frames are meant to reach the display (live or snap)."""
+        return self.is_live or self._is_snapping
+
+    def snap(self) -> bool:
+        """Acquire exactly one frame using the current live configuration.
+
+        Same trigger/illumination path as live, but the illumination is turned off as soon as
+        the frame has been read, so a light-sensitive sample only sees a single exposure instead
+        of a free-running stream. The frame reaches the display through the normal camera
+        callbacks (StreamHandler). Does nothing while live is running.
+
+        Returns True if a frame was captured.
+        """
+        if self._mode_gate and self._mode_gate.blocked_for_ui_hardware_commands():
+            self._log.info("Ignoring snap: mode=%s", self._mode_gate.get_mode().name)
+            return False
+        with self._lock:
+            if self.is_live or not self._is_in_state(LiveControllerState.STOPPED):
+                self._log.debug("snap() called while live is running, ignoring.")
+                return False
+            if self._is_snapping:
+                self._log.debug("snap() already in progress, ignoring.")
+                return False
+            self._is_snapping = True
+
+        if self._event_bus:
+            self._event_bus.publish(SnapStateChanged(camera=self._camera, is_snapping=True))
+        success = False
+        try:
+            success = self._snap_impl()
+        except Exception:
+            self._log.exception("Snap failed")
+        finally:
+            with self._lock:
+                self._is_snapping = False
+            if self._event_bus:
+                self._event_bus.publish(SnapStateChanged(camera=self._camera, is_snapping=False, success=success))
+        return success
+
+    def _snap_impl(self) -> bool:
+        self._check_laser_engine_warn_only()
+
+        camera = self._camera_service
+        was_streaming = camera.get_is_streaming()
+        if not was_streaming:
+            camera.start_streaming()
+        # Callbacks may be disabled (e.g. by laser AF); the snapped frame reaches the display
+        # through them, so enable them for the duration of the snap.
+        callbacks_were_enabled = camera.get_callbacks_enabled()
+        camera.enable_callbacks(True)
+
+        if self.for_displacement_measurement and self._peripheral_service:
+            self._peripheral_service.turn_on_af_laser()
+
+        # read_frame() returns as soon as the frame is stored, which can be just before the
+        # callbacks that put it on screen run. This event holds is_snapping (which gates those
+        # callbacks) until they have actually run.
+        frame_propagated = threading.Event()
+        callback_id = camera.add_frame_callback(lambda _frame: frame_propagated.set())
+        if self._stream_handler is not None:
+            self._stream_handler.force_next_display()
+        got_frame = False
+        try:
+            # In HARDWARE mode the microcontroller strobes the illumination for the exposure, so
+            # don't also turn it on here. In CONTINUOUS mode it stays on for one frame period plus
+            # whatever is left of the in-flight frame, i.e. up to two exposures worth of light.
+            if self.trigger_mode != TriggerMode.HARDWARE and self.control_illumination and not self.illumination_on:
+                self.turn_on_illumination()
+            # CONTINUOUS free-runs, so there is no trigger to send.
+            if self.trigger_mode in (TriggerMode.HARDWARE, TriggerMode.SOFTWARE):
+                self.trigger_ID = self.trigger_ID + 1
+                camera.send_trigger()
+
+            got_frame = camera.read_frame() is not None
+            if not got_frame:
+                self._log.warning("Snap timed out waiting for a frame.")
+            return got_frame
+        finally:
+            # Light off first, then let the frame finish its trip to the display.
+            if self.control_illumination and self.illumination_on:
+                self.turn_off_illumination()
+            if self.for_displacement_measurement and self._peripheral_service:
+                try:
+                    self._peripheral_service.turn_off_af_laser()
+                except Exception:
+                    self._log.exception("Failed to turn off AF laser after snap")
+            if got_frame:
+                frame_propagated.wait(1.0)
+            camera.remove_frame_callback(callback_id)
+            camera.enable_callbacks(callbacks_were_enabled)
+            if not was_streaming:
+                camera.stop_streaming()
 
     def _trigger_acquisition_timer_fn(self) -> None:
         trigger_start = time.monotonic()
@@ -721,6 +836,13 @@ class LiveController(StateMachine[LiveControllerState]):
             return
         self._log.info(f"_on_stop_live_command: is_live={self.is_live}")
         self._stop_live()
+
+    @handles(SnapFrameCommand)
+    def _on_snap_frame_command(self, cmd: SnapFrameCommand) -> None:
+        """Handle SnapFrameCommand: snap on a worker thread so the EventBus is not blocked for an exposure."""
+        if getattr(cmd, "camera", "main") != self._camera:
+            return
+        threading.Thread(target=self.snap, name=f"LiveController[{self._camera}].snap", daemon=True).start()
 
     @handles(SetTriggerModeCommand)
     def _on_set_trigger_mode_command(self, cmd: SetTriggerModeCommand) -> None:

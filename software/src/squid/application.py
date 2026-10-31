@@ -421,9 +421,11 @@ class ApplicationContext:
                 image_to_display=lambda _img: None,
                 packet_image_to_write=lambda _img, _fid, _ts: None,
                 signal_new_frame_received=live_controller.on_new_frame,
-                accept_new_frame=lambda: bool(getattr(live_controller, "is_live", False)),
+                # Live view or a single-frame snap (see LiveController.should_display_frames).
+                accept_new_frame=live_controller.should_display_frames,
             )
         )
+        live_controller.set_stream_handler(stream_handler)
         stream_handler_focus: Optional[StreamHandler] = None
         live_controller_focus: Optional[LiveController] = None
 

@@ -622,6 +622,17 @@ class StopLiveCommand(Event):
 
 
 @dataclass
+class SnapFrameCommand(Event):
+    """Command to acquire and display a single frame with the current live configuration.
+
+    Unlike live view, the illumination is on only for that one exposure, so light-sensitive
+    samples are not bleached while settings are dialed in. Ignored while live is running.
+    """
+
+    camera: str = "main"
+
+
+@dataclass
 class CaptureMultichannelCommand(Event):
     """Command: capture one frame per named channel and save as a single OME-TIFF."""
 
@@ -676,6 +687,18 @@ class LiveStateChanged(Event):
     is_live: bool
     camera: str = "main"
     configuration: Optional[str] = None
+
+
+@dataclass
+class SnapStateChanged(Event):
+    """Notification that a single-frame snap started or finished.
+
+    ``success`` is None while snapping and True/False once the snap finished.
+    """
+
+    is_snapping: bool
+    camera: str = "main"
+    success: Optional[bool] = None
 
 
 @dataclass
