@@ -3,7 +3,7 @@ meta:
   target_branch: multipoint-refactor
   cutoff_date: '2025-12-12'
   created: '2026-01-12'
-  last_verified: '2026-06-09T22:31:26'
+  last_verified: '2026-10-30T20:36:35'
 commits:
   295afbb3:
     title: 'fix: Disable memory profiling in CI to fix test hangs (#451)'
@@ -680,11 +680,10 @@ commits:
   be019383:
     title: 'refactor: Backpressure system lifecycle enforcement and test coverage (#488)'
     status: ported
-    ported_date: '2026-02-07'
     ported_in: 9daf295b
-    notes: Lifecycle tracking, TOCTOU capture-reference pattern, is_closed/_warn_if_closed,
-      monotonic clock, atomic get_stats, and test coverage. Pre-warming intentionally not ported
-      (arch_v2 worker creates runners internally). Plan 2026-02-07-backpressure-lifecycle.md.
+    ported_date: '2026-02-07'
+    notes: Lifecycle tracking, TOCTOU capture-reference pattern, is_closed/_warn_if_closed, monotonic clock, atomic get_stats,
+      and test coverage. Pre-warming intentionally not ported (arch_v2 worker creates runners internally). Plan 2026-02-07-backpressure-lifecycle.md.
       Reconciled 2026-06-10 (in-progress -> ported; impl commit lacks Ports-Upstream trailer).
   2cbf3fa8:
     title: 'fix: minor UI and path fixes (#494)'
@@ -695,12 +694,11 @@ commits:
   833ae523:
     title: 'feat: Workflow Runner - Edit button and multiple Acquisition sequences with config paths (#493)'
     status: ported
-    ported_date: '2026-02-07'
     ported_in: ad6c2d64
-    notes: Edit button, multiple acquisition sequences, config_path on SequenceItem, and
-      WorkflowLoadConfigRequest/Response EventBus round-trip (replaces upstream Qt signals).
-      Plan 2026-02-07-workflow-runner-enhancements.md.
-      Reconciled 2026-06-10 (in-progress -> ported; impl commit lacks Ports-Upstream trailer).
+    ported_date: '2026-02-07'
+    notes: Edit button, multiple acquisition sequences, config_path on SequenceItem, and WorkflowLoadConfigRequest/Response
+      EventBus round-trip (replaces upstream Qt signals). Plan 2026-02-07-workflow-runner-enhancements.md. Reconciled 2026-06-10
+      (in-progress -> ported; impl commit lacks Ports-Upstream trailer).
   a3962c55:
     title: 'fix: organize files and fix install script (#491)'
     status: ported
@@ -709,21 +707,19 @@ commits:
   644ac383:
     title: 'feat: Open Chamber fluidics support and FluidicsWidget enhancements (#489)'
     status: ported
-    ported_date: '2026-02-07'
     ported_in: 7fe26bfb
-    notes: Open Chamber sequence validation, FluidicsWidget Save Log button, control-disable during
-      protocol, and stop-fluidics-on-abort (abort path in 9daf295b). arch_v2 uses YAML protocols +
-      EventBus rather than upstream CSV/Qt-signals. Plan 2026-02-07-open-chamber-fluidics.md.
+    ported_date: '2026-02-07'
+    notes: Open Chamber sequence validation, FluidicsWidget Save Log button, control-disable during protocol, and stop-fluidics-on-abort
+      (abort path in 9daf295b). arch_v2 uses YAML protocols + EventBus rather than upstream CSV/Qt-signals. Plan 2026-02-07-open-chamber-fluidics.md.
       Reconciled 2026-06-10 (in-progress -> ported; impl commit lacks Ports-Upstream trailer).
   88c0065c:
     title: 'feat: Wellplate calibration improvements - center point method and parameter editing (#490)'
     status: ported
-    ported_date: '2026-02-07'
     ported_in: 34ff57bc
-    notes: Center-point calibration method, update-parameters-without-recalibration, parameter editing.
-      arch_v2 uses EventBusDialog + SaveWellplateCalibrationCommand and cached StagePositionChanged.
-      Plan 2026-02-07-wellplate-calibration.md.
-      Reconciled 2026-06-10 (in-progress -> ported; impl commit lacks Ports-Upstream trailer).
+    ported_date: '2026-02-07'
+    notes: Center-point calibration method, update-parameters-without-recalibration, parameter editing. arch_v2 uses EventBusDialog
+      + SaveWellplateCalibrationCommand and cached StagePositionChanged. Plan 2026-02-07-wellplate-calibration.md. Reconciled
+      2026-06-10 (in-progress -> ported; impl commit lacks Ports-Upstream trailer).
   2408902a:
     title: 'fix: prevent level trigger from never ending when retriggered too fast (#500)'
     status: ported
@@ -949,13 +945,20 @@ commits:
     status: ported
     ported_in: 4658668d
     ported_date: '2026-06-09'
+    notes: Recording was broken in arch_v2 (base_path_is_set never flipped). Omits upstream per-frame timing / startup-option-dump
+      debug instrumentation (untestable hot-path overhead + SKU-constant risk); the FPS fix (AutoExpoEnable + framerate fallback)
+      is complete.
     analysis_file: commits/34-4658668d-recording-imagesaver-toupcam.md
-    notes: 'Recording was broken in arch_v2 (base_path_is_set never flipped). Omits upstream per-frame timing / startup-option-dump debug instrumentation (untestable hot-path overhead + SKU-constant risk); the FPS fix (AutoExpoEnable + framerate fallback) is complete.'
   19b883eb:
     title: 'fix(firmware): close strobe ISR race that leaves old channel HIGH on switch (#549)'
     status: skipped
     skip_reason: deferred
-    skip_justification: 'Real bug, CONFIRMED present in arch_v2 ISR_strobeTimer (illumination, not filter-wheel — old laser/LED stays HIGH when channel switched mid-strobe during HW-triggered acquisition). Deferred: requires firmware C++ changes that cannot be compiled (no PlatformIO) or hardware-tested (no Teensy) in the dev env, and the upstream helper-extraction/default-fallback depend on multi-port illumination infra arch_v2 firmware lacks (no illumination_source_to_port_index / turn_off_all_ports / NUM_ILLUMINATION_PORTS; no FIRMWARE_VERSION defines). Core strobe_active_source latch is portable to arch_v2''s older model. See plans/2026-06-09-firmware-correctness-deferred.md.'
+    skip_justification: 'Real bug, CONFIRMED present in arch_v2 ISR_strobeTimer (illumination, not filter-wheel — old laser/LED
+      stays HIGH when channel switched mid-strobe during HW-triggered acquisition). Deferred: requires firmware C++ changes
+      that cannot be compiled (no PlatformIO) or hardware-tested (no Teensy) in the dev env, and the upstream helper-extraction/default-fallback
+      depend on multi-port illumination infra arch_v2 firmware lacks (no illumination_source_to_port_index / turn_off_all_ports
+      / NUM_ILLUMINATION_PORTS; no FIRMWARE_VERSION defines). Core strobe_active_source latch is portable to arch_v2''s older
+      model. See plans/2026-06-09-firmware-correctness-deferred.md.'
     skip_date: '2026-06-09'
     analysis_file: plans/2026-06-09-firmware-correctness-deferred.md
   9c8556db:
@@ -963,15 +966,17 @@ commits:
     status: ported
     ported_in: 29c4edbe
     ported_date: '2026-06-10'
+    notes: README "Updating an existing install" section; arch_v2 file list is the two machine_configs yaml (no Xeryon); restore
+      source 061db6ea^.
     analysis_file: commits/38-061db6ea-config-hygiene.md
-    notes: 'README "Updating an existing install" section; arch_v2 file list is the two machine_configs yaml (no Xeryon); restore source 061db6ea^.'
   '74752073':
     title: 'fix(ci): provide illumination_channel_config example for tests (#548)'
     status: ported
     ported_in: 29c4edbe
     ported_date: '2026-06-10'
+    notes: CI copies illumination_channel_config.yaml.example -> .yaml before pytest; filter_wheels intentionally not copied
+      (loads gracefully; verified suite passes absent).
     analysis_file: commits/38-061db6ea-config-hygiene.md
-    notes: 'CI copies illumination_channel_config.yaml.example -> .yaml before pytest; filter_wheels intentionally not copied (loads gracefully; verified suite passes absent).'
   6713d854:
     title: 'log: enable per-acquisition log by default (#547)'
     status: ported
@@ -983,8 +988,9 @@ commits:
     status: ported
     ported_in: 061db6ea
     ported_date: '2026-06-10'
+    notes: gitignore software/machine_configs/*.yaml + untrack the two yaml + add both .example templates. Xeryon_settings.txt
+      N/A (no software/control/ in arch_v2).
     analysis_file: commits/38-061db6ea-config-hygiene.md
-    notes: 'gitignore software/machine_configs/*.yaml + untrack the two yaml + add both .example templates. Xeryon_settings.txt N/A (no software/control/ in arch_v2).'
   24bb38b1:
     title: 'fix: clear line-profiler preview when toggled off mid-drawing (#544)'
     status: ported
@@ -1002,13 +1008,19 @@ commits:
     status: ported
     ported_in: 3950c1b7
     ported_date: '2026-06-10'
+    notes: NiMotion Modbus-RTU turret driver + sim, unified move_to_objective on Xeryon, _def constants + mutual-exclusion
+      guard, factory/widget/menu/shutdown wiring. 38 ported tests (sim, modbus frames/CRC, dispatcher, guard). Real-hardware
+      paths untested in dev env. Plan 2026-06-10-objective-turret.md.
     analysis_file: commits/39-3950c1b7-objective-turret.md
-    notes: 'NiMotion Modbus-RTU turret driver + sim, unified move_to_objective on Xeryon, _def constants + mutual-exclusion guard, factory/widget/menu/shutdown wiring. 38 ported tests (sim, modbus frames/CRC, dispatcher, guard). Real-hardware paths untested in dev env. Plan 2026-06-10-objective-turret.md.'
   f2a2cef0:
     title: 'fix: firmware reports failed moves; filter wheel uses absolute moveto (#540)'
     status: skipped
     skip_reason: deferred
-    skip_justification: 'Real bug, CONFIRMED present in arch_v2 callback_move_to_w (failed/early-return W move falsely reports COMPLETED_WITHOUT_ERRORS -> off-by-one filter-wheel desync, no W encoder to catch it). Deferred: firmware C++ refactor of all-axis move callbacks + serial status path, unbuildable (no PlatformIO) / untestable (no Teensy) here; host absolute-moveto rewrite needs MOVETO_W2 which arch_v2 firmware lacks. User does not use a filter wheel (2026-06-09), so low priority. See plans/2026-06-09-firmware-correctness-deferred.md.'
+    skip_justification: 'Real bug, CONFIRMED present in arch_v2 callback_move_to_w (failed/early-return W move falsely reports
+      COMPLETED_WITHOUT_ERRORS -> off-by-one filter-wheel desync, no W encoder to catch it). Deferred: firmware C++ refactor
+      of all-axis move callbacks + serial status path, unbuildable (no PlatformIO) / untestable (no Teensy) here; host absolute-moveto
+      rewrite needs MOVETO_W2 which arch_v2 firmware lacks. User does not use a filter wheel (2026-06-09), so low priority.
+      See plans/2026-06-09-firmware-correctness-deferred.md.'
     skip_date: '2026-06-09'
     analysis_file: plans/2026-06-09-firmware-correctness-deferred.md
   fae3aa0a:
@@ -1030,8 +1042,11 @@ commits:
     status: ported
     ported_in: 6df218f8
     ported_date: '2026-06-10'
+    notes: 'Full port (all of #536), EventBus-architected, across 5 commits: 6df218f8 (driver+sim), 5c8bb3ae (service+GUI
+      tab+addons), 4da055b6 (acquisition gate via AcquisitionDependencies), c0d4eab3 (acquisition modal), 41f410bc (live-mode
+      warn). 63 tests. Qt-coupled upstream driver decoupled to callbacks → LaserEngineService → EventBus. Behind USE_SQUID_LASER_ENGINE.
+      Hardware/serial path untested (no engine).'
     analysis_file: commits/36-6df218f8-squid-laser-engine.md
-    notes: 'Full port (all of #536), EventBus-architected, across 5 commits: 6df218f8 (driver+sim), 5c8bb3ae (service+GUI tab+addons), 4da055b6 (acquisition gate via AcquisitionDependencies), c0d4eab3 (acquisition modal), 41f410bc (live-mode warn). 63 tests. Qt-coupled upstream driver decoupled to callbacks → LaserEngineService → EventBus. Behind USE_SQUID_LASER_ENGINE. Hardware/serial path untested (no engine).'
   beaf48cc:
     title: 'fix: fall back to per-iris defaults when channel has no confocal_hardware_settings (#537)'
     status: skipped
@@ -1046,12 +1061,593 @@ commits:
     status: ported
     ported_in: 278b9fc8
     ported_date: '2026-06-09'
+    notes: Adapted to arch_v2 EventBus (ImageClickController + new ImageScrollZCommand). Kept ENABLE_CLICK_TO_MOVE_BY_DEFAULT
+      name; omitted preferences Z-step UI (constants are .ini-configurable).
     analysis_file: commits/35-278b9fc8-clicktomove-zscroll.md
-    notes: 'Adapted to arch_v2 EventBus (ImageClickController + new ImageScrollZCommand). Kept ENABLE_CLICK_TO_MOVE_BY_DEFAULT name; omitted preferences Z-step UI (constants are .ini-configurable).'
   3bcdca38:
     title: 'feat: unify Mosaic + Plate View into single UnifiedMosaicWidget (#530)'
     status: in-progress
-    ported_in: 236ef801
-    ported_date: '2026-06-10'
+    notes: 'PARTIAL (steps 1 + 2a done; 2b pending GUI QA). Step 1 (f000bee3): mosaic_utils.py + UnifiedMosaicWidget (flag
+      USE_UNIFIED_MOSAIC_VIEW, default off) + MosaicTileUpdate + serialize_for_yaml + tests. Step 2a (236ef801): wire the
+      unified widget in-GUI under the flag — main_window builds MosaicTileUpdate per tile + setPlateLayout from PlateViewInit
+      (extended with well_ids + per-well origins); worker skips DownsampledViewJob when flag on; controller emits PlateViewInit
+      for unified mode. IPC plate pipeline BYPASSED (flag on) but NOT deleted — physical removal + manual-ROI/click-to-move
+      wiring deferred to step 2b after on-hardware GUI QA (removing the working fallback before the in-GUI path is hardware-verified
+      would leave no plate view if broken). flag-off default fully intact (regression verified identical). Plan 2026-06-10-unified-mosaic.md.'
     analysis_file: commits/41-236ef801-unified-mosaic-part2a.md
-    notes: 'PARTIAL (steps 1 + 2a done; 2b pending GUI QA). Step 1 (f000bee3): mosaic_utils.py + UnifiedMosaicWidget (flag USE_UNIFIED_MOSAIC_VIEW, default off) + MosaicTileUpdate + serialize_for_yaml + tests. Step 2a (236ef801): wire the unified widget in-GUI under the flag — main_window builds MosaicTileUpdate per tile + setPlateLayout from PlateViewInit (extended with well_ids + per-well origins); worker skips DownsampledViewJob when flag on; controller emits PlateViewInit for unified mode. IPC plate pipeline BYPASSED (flag on) but NOT deleted — physical removal + manual-ROI/click-to-move wiring deferred to step 2b after on-hardware GUI QA (removing the working fallback before the in-GUI path is hardware-verified would leave no plate view if broken). flag-off default fully intact (regression verified identical). Plan 2026-06-10-unified-mosaic.md.'
+  53ddb024:
+    title: 'fix(gui): stop a teardown double-free and a timer that outlives its labels (#750)'
+    status: ported
+    ported_in: 826b6a6e
+    ported_date: '2026-10-30'
+    notes: 'Partial: shared QSpacerItem fix; timer half not applicable (EventBus-fed display).'
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  85bef316:
+    title: 'feat(laser-engine): DF 560 mechanical shutter modes and declared light-source use (#748)'
+    status: skipped
+    skip_reason: deferred
+    skip_justification: 'Laser engine v2: new hardware, not in use.'
+    skip_date: '2026-10-30'
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  '67746338':
+    title: 'feat(laser-engine): Cephla laser engine v2 (400 µm standard and 50 µm Dragonfly variants) (#693)'
+    status: skipped
+    skip_reason: deferred
+    skip_justification: 'Laser engine v2: new hardware, not in use.'
+    skip_date: '2026-10-30'
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  ad1edd66:
+    title: 'fix(fw): controller pin + polarity profile — hardware triggering on the new controller (#653)'
+    status: skipped
+    skip_reason: deferred
+    skip_justification: 'Firmware 1.5-1.8: no PlatformIO/Teensy in dev env; no filter wheel in use.'
+    skip_date: '2026-10-30'
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  c04e5f0d:
+    title: 'feat(fluidics): Flow tab, fluidics_v2 pinned at latest, and a display column that keeps the plots readable (#669)'
+    status: skipped
+    skip_reason: superseded
+    skip_justification: 'Superseded by arch_v2 design: EventBus tab handling / ExperimentProtocol V2 + orchestrator fluidics.'
+    skip_date: '2026-10-30'
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  a93850e2:
+    title: 'feat(z-lift): start at the loading position if closed there; Z Lift tab (#743)'
+    status: skipped
+    skip_reason: deferred
+    skip_justification: PI V-308 / Z-lift hardware not in use.
+    skip_date: '2026-10-30'
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  200f9a26:
+    title: 'fix(pi): master''s CI after #726 and #739 (simulated C-414 takes profile_state_path; black) (#742)'
+    status: skipped
+    skip_reason: not-applicable
+    skip_justification: Upstream-only test/CI/menu code paths with no arch_v2 equivalent (see triage plan).
+    skip_date: '2026-10-30'
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  1f04ceed:
+    title: 'feat(acquisition): choose z-first or channel-first order for z-stacks (#714)'
+    status: skipped
+    skip_reason: already-fixed
+    skip_justification: arch_v2 already has this behavior (_acquisition_in_progress guard / acquisition_order).
+    skip_date: '2026-10-30'
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  b43ddbe3:
+    title: 'fix(filter-wheel): send emission filter positions to the first configured wheel, not index 1 (#738)'
+    status: ported
+    ported_in: 0907eadc
+    ported_date: '2026-10-30'
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  39b091e4:
+    title: 'fix(live): live FPS interval runs from the start of each trigger (#716)'
+    status: ported
+    ported_in: 848e6d5e
+    ported_date: '2026-10-30'
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  26a80322:
+    title: 'fix(serial): warn at start-up when a Windows FTDI port''s latency timer is high (PI C-414, Optospin) (#726)'
+    status: ported
+    ported_in: 2943aa8d
+    ported_date: '2026-10-30'
+    notes: 'Partial: FTDI helper + Optospin call; PI C-414 call deferred with PI suite.'
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  8a3e458c:
+    title: 'fix(pi): quiet V-308 objective swap; lift lowered 5 mm for every manual swap (#739)'
+    status: skipped
+    skip_reason: deferred
+    skip_justification: PI V-308 / Z-lift hardware not in use.
+    skip_date: '2026-10-30'
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  1b1e9f26:
+    title: 'feat(gui): disable sample formats from the Sample Format dropdown (#736)'
+    status: pending
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  670b80ea:
+    title: 'fix(panel): lock the joystick panel out while a commanded move is in progress (#673)'
+    status: skipped
+    skip_reason: deferred
+    skip_justification: Firmware joystick-panel safety bug present in our firmware; first item for next hardware session.
+    skip_date: '2026-10-30'
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  fd4586de:
+    title: 'feat(lift): Z lift stage with a PI V-308 focus Z; focus wheel drives the V-308 (firmware 1.8) (#719)'
+    status: skipped
+    skip_reason: deferred
+    skip_justification: PI V-308 / Z-lift hardware not in use.
+    skip_date: '2026-10-30'
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  7c27f8e2:
+    title: 'fix(fw): reconnecting the joystick panel no longer moves Z or XY (#734)'
+    status: skipped
+    skip_reason: deferred
+    skip_justification: Firmware joystick-panel safety bug present in our firmware; first item for next hardware session.
+    skip_date: '2026-10-30'
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  e64c2ee2:
+    title: 'fix(gui): one Utils menu instead of two (#698)'
+    status: skipped
+    skip_reason: not-applicable
+    skip_justification: Upstream-only test/CI/menu code paths with no arch_v2 equivalent (see triage plan).
+    skip_date: '2026-10-30'
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  9a8a7afd:
+    title: 'feat(gui): line profiler - multiple lines, H / V / Full / Fill FOV shortcuts (#732)'
+    status: pending
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  1c13072e:
+    title: 'feat(gui): opt-in PyQt6 per machine ([GENERAL] qt_api), --qt-api / SQUID_QT_API; two Qt 6 fixes (#729)'
+    status: skipped
+    skip_reason: deferred
+    skip_justification: 'PyQt6 opt-in: direct PyQt5 imports must be removed first.'
+    skip_date: '2026-10-30'
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  e3d502a4:
+    title: 'fix(fw): guard FastLED logging by its resolved level and linked symbols, not a message string (#724)'
+    status: skipped
+    skip_reason: deferred
+    skip_justification: 'Firmware 1.5-1.8: no PlatformIO/Teensy in dev env; no filter wheel in use.'
+    skip_date: '2026-10-30'
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  ff7aad6a:
+    title: 'build(fw): pin FastLED 3.10.3 and PacketSerial 1.4.0 exactly (#725)'
+    status: ported
+    ported_in: 11ae2448
+    ported_date: '2026-10-30'
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  5442ac0c:
+    title: 'fix(camera): Tucsen binning change uses the new binning and re-applies exposure (#727)'
+    status: pending
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  1adae748:
+    title: 'perf(camera): one pass per frame for the copy out of the driver and the flip (#721)'
+    status: pending
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  1a54d891:
+    title: 'fix(camera): Aries readout time from the camera, working region, link-mode log (#715)'
+    status: pending
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  b40b187b:
+    title: 'test(stage): test_position_caching passes on Windows (#723)'
+    status: ported
+    ported_in: b6f6e959
+    ported_date: '2026-10-30'
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  e6d84e29:
+    title: 'feat(limits): configurable limit-switch polarity/enable per axis, stored in the controller; Z limit readout; TMC2240
+      current range follows the current (firmware 1.7) (#710)'
+    status: skipped
+    skip_reason: deferred
+    skip_justification: 'Firmware 1.5-1.8: no PlatformIO/Teensy in dev env; no filter wheel in use.'
+    skip_date: '2026-10-30'
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  55236d92:
+    title: 'perf(acquisition): cut per-image overhead - wait for the frame after a confocal scan, skip unchanged mode sets,
+      no test frame (#712)'
+    status: pending
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  9d8a5f56:
+    title: 'fix(fw): compile FastLED logging out — it prints on the binary protocol''s serial port (#660)'
+    status: ported
+    ported_in: 11ae2448
+    ported_date: '2026-10-30'
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  f207b049:
+    title: 'perf(acquisition): no fixed 20 ms Z stabilization pause on the V-308 (#720)'
+    status: skipped
+    skip_reason: deferred
+    skip_justification: PI V-308 / Z-lift hardware not in use.
+    skip_date: '2026-10-30'
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  9878d13a:
+    title: 'fix(pi): V-308 Z moves wait ~6x less and only finish when actually on target (#717)'
+    status: skipped
+    skip_reason: deferred
+    skip_justification: PI V-308 / Z-lift hardware not in use.
+    skip_date: '2026-10-30'
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  c8f69125:
+    title: 'fix(napari): keep the multichannel viewer responsive during large z-stacks (#713)'
+    status: pending
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  70f2afdd:
+    title: 'fix(acquisition): AION/NL5 hardware trigger - one scan per image, no stalls, prompt aborts (#711)'
+    status: pending
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  85917dc7:
+    title: 'feat(illumination): Vortran Stradus VersaLase over USB HID (#709)'
+    status: ported
+    ported_in: ba694d33
+    ported_date: '2026-10-30'
+    notes: 'Partial: shared software-line intensity + idempotent close; VersaLase driver deferred (AION not in use).'
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  1fdaab6c:
+    title: 'feat(pi): manual objective swap releases the V-308 servo (#708)'
+    status: skipped
+    skip_reason: deferred
+    skip_justification: PI V-308 / Z-lift hardware not in use.
+    skip_date: '2026-10-30'
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  074d0f91:
+    title: 'chore(toupcam): update the ToupCam SDK library to 60.32891 (Linux x64) / 60.32887 (Windows x64) (#707)'
+    status: pending
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  4b610458:
+    title: 'feat(toupcam): global reset mode (ENABLE_TOUPCAM_GLOBAL_RESET) and packed 12-bit (MONO12PACKED) (#705)'
+    status: pending
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  18fff8f2:
+    title: 'feat(wellplate): one well-to-stage transform, geometry/placement split, and measured holder-rotation calibration
+      (#611)'
+    status: pending
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  a77cbac3:
+    title: 'fix(turret): a turret only homes with Z retracted (#702)'
+    status: skipped
+    skip_reason: deferred
+    skip_justification: Objective turret not in use (2026-10-30 decision).
+    skip_date: '2026-10-30'
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  f453dc18:
+    title: 'fix(stage): save and restore the last X/Y position on a Cephla stage without Z (#692)'
+    status: ported
+    ported_in: a88749d5
+    ported_date: '2026-10-30'
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  37d2e005:
+    title: 'fix(wheel): review findings on the merged firmware 1.6 - two ungated commands, theta corruption, merge slip, nits
+      (#672)'
+    status: skipped
+    skip_reason: deferred
+    skip_justification: 'Firmware 1.5-1.8: no PlatformIO/Teensy in dev env; no filter wheel in use.'
+    skip_date: '2026-10-30'
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  594440a3:
+    title: 'fix(dragonfly): confocal wheels in the channel configurator; Refresh button on the confocal tab (#690)'
+    status: pending
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  432772be:
+    title: 'fix(dragonfly): make the Andor Dragonfly work on current master (#688)'
+    status: pending
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  e1ad4cc6:
+    title: 'fix(gui): stray "Per-channel Z-offset" window on machines without laser AF (#686)'
+    status: pending
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  f3bca2cb:
+    title: 'fix(af): compute the LAPE focus measure without int16 overflow on 8-bit images (#679)'
+    status: ported
+    ported_in: 9845f669
+    ported_date: '2026-10-30'
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  81b6c5aa:
+    title: 'fix(tests): the PI focus stage test passes on machines with an objective changer (#678)'
+    status: skipped
+    skip_reason: not-applicable
+    skip_justification: Upstream-only test/CI/menu code paths with no arch_v2 equivalent (see triage plan).
+    skip_date: '2026-10-30'
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  49d1ef74:
+    title: 'fix(tests): wait for the second fluidics hold without reading a cleared hold (#677)'
+    status: skipped
+    skip_reason: not-applicable
+    skip_justification: Upstream-only test/CI/menu code paths with no arch_v2 equivalent (see triage plan).
+    skip_date: '2026-10-30'
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  d25a1b73:
+    title: 'test(laser-af): crop-size test frames honour the camera ROI (#676)'
+    status: ported
+    ported_in: 7a7c806e
+    ported_date: '2026-10-30'
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  aa9107d9:
+    title: fix file format menu and enable TIFF compression (#652)
+    status: pending
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  5d992336:
+    title: 'fix(xlight): positions and disk motor state from the device; default iris for channels without one (#675)'
+    status: pending
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  2a550c86:
+    title: 'fix(laser-af): use the saved Min Peak settings and the .ini crop sizes (#674)'
+    status: ported
+    ported_in: 7a7c806e
+    ported_date: '2026-10-30'
+    notes: 'Partial: .ini crop sizes + unknown-key guard (in laser_spot.detect_spot); min-peak fix was already present.'
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  8bf3c7d0:
+    title: 'fix(hamamatsu): frame ids follow the camera''s frame stamp, so a skipped or repeated frame is visible (#661)'
+    status: pending
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  '74824168':
+    title: 'fix(prefs): read ini values with inline comments the way the running software does (#665)'
+    status: ported
+    ported_in: 6104871a
+    ported_date: '2026-10-30'
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  334487d9:
+    title: 'feat(wheel): filter wheel tuner, tuning dialog, and a restart-safe motor profile (#664)'
+    status: skipped
+    skip_reason: deferred
+    skip_justification: 'Firmware 1.5-1.8: no PlatformIO/Teensy in dev env; no filter wheel in use.'
+    skip_date: '2026-10-30'
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  17dc0444:
+    title: 'feat(fw): firmware 1.6 - filter wheel ramp profile, completion window, encoder reporting (#662)'
+    status: skipped
+    skip_reason: deferred
+    skip_justification: 'Firmware 1.5-1.8: no PlatformIO/Teensy in dev env; no filter wheel in use.'
+    skip_date: '2026-10-30'
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  12ebfebd:
+    title: 'feat(wheel): shortest-path slot changes, position across restarts, completion window setting, Preferences rows
+      (#657)'
+    status: skipped
+    skip_reason: deferred
+    skip_justification: 'Firmware 1.5-1.8: no PlatformIO/Teensy in dev env; no filter wheel in use.'
+    skip_date: '2026-10-30'
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  7385a179:
+    title: 'fix(live): hold live triggers during stage motion and camera settings changes; survive a busy MCU at acquisition
+      start (#639)'
+    status: pending
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  46a139b9:
+    title: Remove napari live view; port overexposure indicator and alignment (with auto-align) to the pyqtgraph viewer (#627)
+    status: pending
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  091bf4e8:
+    title: Pr turret (#609)
+    status: skipped
+    skip_reason: deferred
+    skip_justification: Objective turret not in use (2026-10-30 decision).
+    skip_date: '2026-10-30'
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  c05bef3a:
+    title: 'test: clean up simulated-acquisition output instead of littering /tmp (#640)'
+    status: skipped
+    skip_reason: not-applicable
+    skip_justification: Upstream-only test/CI/menu code paths with no arch_v2 equivalent (see triage plan).
+    skip_date: '2026-10-30'
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  da109c5a:
+    title: 'feat(fw): TMC2240 stepper-driver support behind a per-axis driver seam (firmware 1.5) (#644)'
+    status: skipped
+    skip_reason: deferred
+    skip_justification: 'Firmware 1.5-1.8: no PlatformIO/Teensy in dev env; no filter wheel in use.'
+    skip_date: '2026-10-30'
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  b8f508c4:
+    title: 'fix(celesta): add HTTP timeout so an unreachable laser engine cannot hang startup (#643)'
+    status: ported
+    ported_in: 367aa25f
+    ported_date: '2026-10-30'
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  a7cc89be:
+    title: 'fix(fluidics-gui): default imaging folder, live progress bar, TEC output-enable re-pin (#637)'
+    status: skipped
+    skip_reason: superseded
+    skip_justification: 'Superseded by arch_v2 design: EventBus tab handling / ExperimentProtocol V2 + orchestrator fluidics.'
+    skip_date: '2026-10-30'
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  1cceeacc:
+    title: 'feat(fluidics): protocol GUI phase 2 — Fluidics display tab, Protocol record tab, Qt imaging port (#626)'
+    status: skipped
+    skip_reason: superseded
+    skip_justification: 'Superseded by arch_v2 design: EventBus tab handling / ExperimentProtocol V2 + orchestrator fluidics.'
+    skip_date: '2026-10-30'
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  4baf7135:
+    title: 'feat(fluidics): protocol engine phases 0–1 — plumbing, demolition, engine seams, headless ProtocolRunner (#625)'
+    status: skipped
+    skip_reason: superseded
+    skip_justification: 'Superseded by arch_v2 design: EventBus tab handling / ExperimentProtocol V2 + orchestrator fluidics.'
+    skip_date: '2026-10-30'
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  0f789a45:
+    title: 'fix(stage): tolerate a corrupted cache/last_coords.txt at startup (#621)'
+    status: ported
+    ported_in: b6f6e959
+    ported_date: '2026-10-30'
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  f9305f9f:
+    title: 'fix(live): don''t widen the panel for the Snap button; rename live button to Live/Stop (#620)'
+    status: pending
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  5be72178:
+    title: 'fix: focus map KeyError on loaded coordinates, stage move timeouts 38-300x too long, focus-map double move (#618)'
+    status: ported
+    ported_in: 2349d806
+    ported_date: '2026-10-30'
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  752c9bb8:
+    title: 'feat(live): add a Snap button for single-frame capture (#616)'
+    status: pending
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  e86a608f:
+    title: 'fix(camera): prevent intermittent all-zero ToupCam frames from read-buffer realloc race (#585)'
+    status: ported
+    ported_in: '18921668'
+    ported_date: '2026-10-30'
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  56db6965:
+    title: 'feat(camera): persist sensor mode in the camera settings cache (#612)'
+    status: pending
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  edc13253:
+    title: 'fix(illumination): apply config edits without restart; add per-channel max output cap (#610)'
+    status: pending
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  856bc0ee:
+    title: 'feat(wellplate): save/load z coordinates in multipoint coordinate CSVs (#608)'
+    status: pending
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  875eda71:
+    title: 'feat(camera): add sensor mode selection (Hamamatsu READOUTSPEED) (#605)'
+    status: pending
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  30a193e7:
+    title: 'fix(tests): close leaked Microscope/MPC instances to stop flaky CI segfaults (#604)'
+    status: ported
+    ported_in: 02b4bde1
+    ported_date: '2026-10-30'
+    notes: 'Partial: idempotent Microscope.close(); test-harness changes not applicable.'
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  e34dec3d:
+    title: 'refactor(camera): snapshot cached frame in reuse guard, document post-trigger contract (#603)'
+    status: ported
+    ported_in: 04a92018
+    ported_date: '2026-10-30'
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  2092c2ee:
+    title: 'perf(xlight): skip emission filter wheel command when already at position (#602)'
+    status: ported
+    ported_in: 8d9b25d0
+    ported_date: '2026-10-30'
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  df83fe32:
+    title: 'fix(scan-coordinates): sort 1536-well rows AA-AF after Z, not interleaved with A-F (#600)'
+    status: ported
+    ported_in: d90eca13
+    ported_date: '2026-10-30'
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  f8fe36d9:
+    title: 'fix(camera): don''t reuse a pre-trigger frame in DefaultCamera.read_camera_frame (#599)'
+    status: ported
+    ported_in: f01e004d
+    ported_date: '2026-10-30'
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  52c6f586:
+    title: 'fix(acquisition): default per-channel Z-offset to OFF (#598)'
+    status: pending
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  d5fc5abd:
+    title: 'feat: per-region laser-AF offset (focus-map constant-z + laser AF) (#562)'
+    status: pending
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  a518249e:
+    title: 'feat(turret): per-machine objective turret pulse offset (#575)'
+    status: skipped
+    skip_reason: deferred
+    skip_justification: Objective turret not in use (2026-10-30 decision).
+    skip_date: '2026-10-30'
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  d83cdabf:
+    title: Add PI V-308 / C-414 voice-coil focus stage (USE_PI_FOCUS_STAGE) (#569)
+    status: skipped
+    skip_reason: deferred
+    skip_justification: PI V-308 / Z-lift hardware not in use.
+    skip_date: '2026-10-30'
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  '24276973':
+    title: 'fix(channel-config): persist settings for channels added via the channel configurator (#589)'
+    status: pending
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  1f4130f2:
+    title: 'fix(laser-engine): bound serial write_timeout so a stuck engine can''t hang startup (#576)'
+    status: ported
+    ported_in: 1f1077ed
+    ported_date: '2026-10-30'
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  780d80e3:
+    title: 'fix: AttributeError when selecting Simple Recording/Tracking tab (#584)'
+    status: skipped
+    skip_reason: superseded
+    skip_justification: 'Superseded by arch_v2 design: EventBus tab handling / ExperimentProtocol V2 + orchestrator fluidics.'
+    skip_date: '2026-10-30'
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  ee7897c9:
+    title: 'fix: skip focus-map interpolation for single-FOV snap acquisitions (#577)'
+    status: ported
+    ported_in: 98f9fad5
+    ported_date: '2026-10-30'
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  5faaad47:
+    title: 'fix(filter-wheel): reset W/W2 range to full after home (rotary axis) — fixes intermittent post-home CMD_EXECUTION_ERROR
+      (#560)'
+    status: skipped
+    skip_reason: deferred
+    skip_justification: 'Firmware 1.5-1.8: no PlatformIO/Teensy in dev env; no filter wheel in use.'
+    skip_date: '2026-10-30'
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  ecd84920:
+    title: 'feat(worker): log actual z after each per-channel z-offset move (#573)'
+    status: pending
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  7dfd75ca:
+    title: 'feat: acquisition watchdog — Slack alert on prematurely-ended acquisitions (#565)'
+    status: skipped
+    skip_reason: deferred
+    skip_justification: 'Slack watchdog: consistent with earlier Slack deferral.'
+    skip_date: '2026-10-30'
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  8c62827a:
+    title: 'fix(turret): prevent Z-restore timeout at startup; de-energize when idle (#567)'
+    status: skipped
+    skip_reason: deferred
+    skip_justification: Objective turret not in use (2026-10-30 decision).
+    skip_date: '2026-10-30'
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  dd0c4cd2:
+    title: 'fix(mosaic): keep Full View tiles across magnification changes (#566)'
+    status: pending
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  0306f194:
+    title: 'fix(navigation): keep planned-coordinate grid fixed during acquisition (#563)'
+    status: skipped
+    skip_reason: already-fixed
+    skip_justification: arch_v2 already has this behavior (_acquisition_in_progress guard / acquisition_order).
+    skip_date: '2026-10-30'
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  06a91af4:
+    title: 'feat: hide Continuous Acquisition trigger mode unless ENABLE_RECORDING (#561)'
+    status: ported
+    ported_in: 718a1241
+    ported_date: '2026-10-30'
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  90cc5dd0:
+    title: Change upload protocol from teensy-cli to teensy-gui (#553)
+    status: skipped
+    skip_reason: deferred
+    skip_justification: 'Firmware 1.5-1.8: no PlatformIO/Teensy in dev env; no filter wheel in use.'
+    skip_date: '2026-10-30'
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  72bdd2fc:
+    title: 'fix(filter-wheel): recover from CMD_EXECUTION_ERROR on post-home offset move (#559)'
+    status: ported
+    ported_in: 69aadb72
+    ported_date: '2026-10-30'
+    notes: 'Partial: startup home() guard only; recoverable-abort/resend firmware plumbing deferred with firmware suite.'
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  6919470e:
+    title: 'feat: per-channel z-offset for laser autofocus (#551)'
+    status: pending
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  8779ced6:
+    title: 'feat: reorderable channel acquisition sequence in multipoint widgets (#557)'
+    status: pending
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
+  0a10ad1e:
+    title: 'fix: populate region_shapes for flexible/single/template regions (#554)'
+    status: ported
+    ported_in: c49cb72a
+    ported_date: '2026-10-30'
+    analysis_file: plans/2026-10-30-oct-sync-triage.md
