@@ -2193,6 +2193,12 @@ class MultiPointWorker:
             source = getattr(config, "illumination_source", None)
             intensity = getattr(config, "illumination_intensity", None)
             if source is not None and intensity is not None:
+                # Clamp to the illumination channel's max output (same cap as live view)
+                cap_fn = getattr(self.channelConfigurationManager, "get_intensity_cap_percent", None)
+                cap = cap_fn(config) if callable(cap_fn) else None
+                if isinstance(cap, (int, float)) and float(intensity) > cap:
+                    self._log.warning(f"Clamping '{config.name}' intensity from {intensity}% to {cap}% (max output)")
+                    intensity = cap
                 try:
                     self._illumination_service.set_channel_power(int(source), float(intensity))
                 except Exception:

@@ -25,6 +25,7 @@ if TYPE_CHECKING:
         PeripheralService,
     )
     from squid.core.config.models import AcquisitionChannel
+    from squid.backend.managers.channel_config_service import ChannelConfigService
 
 
 _log = squid.core.logging.get_logger(__name__)
@@ -50,6 +51,7 @@ class AcquisitionService:
         peripheral_service: "PeripheralService",
         illumination_service: Optional["IlluminationService"] = None,
         filter_wheel_service: Optional["FilterWheelService"] = None,
+        channel_config_service: Optional["ChannelConfigService"] = None,
     ):
         """
         Initialize the acquisition service.
@@ -59,11 +61,13 @@ class AcquisitionService:
             peripheral_service: Peripheral service for operation completion
             illumination_service: Optional illumination service for LED/laser control
             filter_wheel_service: Optional filter wheel service for emission filters
+            channel_config_service: Optional; provides per-channel intensity caps (max output)
         """
         self._camera = camera_service
         self._peripheral = peripheral_service
         self._illumination = illumination_service
         self._filter_wheel = filter_wheel_service
+        self._channel_config_service = channel_config_service
 
     def apply_configuration(
         self,
@@ -139,7 +143,7 @@ class AcquisitionService:
             # Set power before turning on (in case it changed)
             intensity = getattr(config, "illumination_intensity", None)
             if intensity is not None:
-                self._illumination.set_channel_power(channel, float(intensity))
+                self._illumination.set_channel_power(channel, self._capped_intensity(config, intensity))
             self._illumination.turn_on_channel(channel)
             return True
         except Exception:
@@ -250,9 +254,21 @@ class AcquisitionService:
             return
 
         try:
-            self._illumination.set_channel_power(int(source), float(intensity))
+            self._illumination.set_channel_power(int(source), self._capped_intensity(config, intensity))
         except Exception:
             _log.debug("Failed to set illumination power")
+
+    def _capped_intensity(self, config: "AcquisitionChannel", intensity: float) -> float:
+        """Clamp intensity to the channel's max output cap, warning when it clamps."""
+        intensity = float(intensity)
+        cap_fn = getattr(self._channel_config_service, "get_intensity_cap_percent", None)
+        cap = cap_fn(config) if callable(cap_fn) else None
+        if isinstance(cap, (int, float)) and intensity > cap:
+            _log.warning(
+                f"Clamping '{getattr(config, 'name', '?')}' intensity from {intensity}% to {cap}% (max output)"
+            )
+            return float(cap)
+        return intensity
 
     def _set_filter_position(self, config: "AcquisitionChannel", trigger_mode: str) -> None:
         """Set emission filter position with appropriate delay offset."""
