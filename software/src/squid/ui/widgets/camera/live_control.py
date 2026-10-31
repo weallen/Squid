@@ -331,6 +331,16 @@ class LiveControlWidget(EventBusFrame):
             self.entry_analogGain.blockSignals(True)
             self.entry_analogGain.setValue(event.analog_gain)
             self.entry_analogGain.blockSignals(False)
+        # Cap the intensity controls at the illumination channel's max output (signals blocked so
+        # narrowing the range doesn't publish a clamped value as a config edit)
+        intensity_cap = event.max_illumination_intensity if event.max_illumination_intensity is not None else 100.0
+        for control, cap in (
+            (self.slider_illuminationIntensity, int(intensity_cap)),
+            (self.entry_illuminationIntensity, intensity_cap),
+        ):
+            control.blockSignals(True)
+            control.setMaximum(cap)
+            control.blockSignals(False)
         if event.illumination_intensity is not None:
             self.currentConfiguration.illumination_intensity = event.illumination_intensity
             self.slider_illuminationIntensity.blockSignals(True)

@@ -148,6 +148,7 @@ class MicroscopeModeController(BaseController):
         exposure = getattr(config, "exposure_time", None) or getattr(config, "exposure_ms", None)
         gain = getattr(config, "analog_gain", None)
         intensity = getattr(config, "illumination_intensity", None) or getattr(config, "intensity", None)
+        max_intensity = getattr(config, "max_illumination_intensity", None)
 
         # Publish outside lock
         if self._event_bus:
@@ -157,6 +158,7 @@ class MicroscopeModeController(BaseController):
                     exposure_time_ms=exposure,
                     analog_gain=gain,
                     illumination_intensity=intensity,
+                    max_illumination_intensity=max_intensity if isinstance(max_intensity, (int, float)) else None,
                 )
             )
 

@@ -295,3 +295,64 @@ class TestCacheManagement:
 
         repo.clear_all_cache()
         assert len(repo._machine_cache) == 0
+
+
+class TestIlluminationConfigEditing:
+    """Copy-on-edit, partial port-mapping update and max_output (upstream edc13253, #610)."""
+
+    def test_for_edit_returns_independent_copy(self, repo, illumination_config):
+        repo.save_illumination_config(illumination_config)
+        working = repo.get_illumination_config(for_edit=True)
+        working.channels[0].name = "edited but not saved"
+        working.controller_port_mapping["D1"] = 99
+
+        shared = repo.get_illumination_config()
+        assert shared.channels[0].name == "405nm Laser"
+        assert shared.controller_port_mapping["D1"] == 11
+
+    def test_update_port_mapping_keeps_channels_saved_meanwhile(self, repo, illumination_config, tmp_config_dir):
+        repo.save_illumination_config(illumination_config)
+        # Another editor saves a channel change after the mapping dialog opened
+        edited = repo.get_illumination_config(for_edit=True)
+        edited.channels[0].max_output = 0.5
+        repo.save_illumination_config(edited)
+
+        assert repo.update_port_mapping({"D1": 21, "USB1": 0}) is True
+
+        current = repo.get_illumination_config()
+        assert current.controller_port_mapping == {"D1": 21, "USB1": 0}
+        assert current.channels[0].max_output == 0.5
+        # Persisted to disk too
+        fresh = ConfigRepository(base_path=tmp_config_dir).get_illumination_config()
+        assert fresh.controller_port_mapping["D1"] == 21
+        assert fresh.channels[0].max_output == 0.5
+
+    def test_update_port_mapping_without_config(self, repo):
+        assert repo.update_port_mapping({"D1": 11}) is False
+
+    def test_max_output_defaults_to_full_and_round_trips(self, repo, illumination_config, tmp_config_dir):
+        assert all(ch.max_output == 1.0 for ch in illumination_config.channels)
+        illumination_config.channels[1].max_output = 0.2
+        repo.save_illumination_config(illumination_config)
+        fresh = ConfigRepository(base_path=tmp_config_dir).get_illumination_config()
+        assert [ch.max_output for ch in fresh.channels] == [1.0, 0.2]
+
+    @pytest.mark.parametrize("value", [0, -0.1, 1.01])
+    def test_max_output_bounds(self, value):
+        with pytest.raises(ValueError):
+            IlluminationChannel(
+                name="x", type=IlluminationType.EPI_ILLUMINATION, controller_port="D1", max_output=value
+            )
+
+    def test_default_max_output_by_type(self):
+        from squid.core.config.models.illumination_config import default_max_output
+
+        assert default_max_output(IlluminationType.EPI_ILLUMINATION) == 1.0
+        assert default_max_output(IlluminationType.TRANSILLUMINATION) == 0.2
+
+    def test_channel_max_output_percent(self, illumination_config):
+        illumination_config.channels[1].max_output = 0.25
+        assert _make_channel(ill_channel="BF Full").get_max_output_percent(illumination_config) == 25.0
+        assert _make_channel(ill_channel="405nm Laser").get_max_output_percent(illumination_config) == 100.0
+        assert _make_channel(ill_channel="unknown").get_max_output_percent(illumination_config) == 100.0
+        assert _make_channel(ill_channel=None).get_max_output_percent(illumination_config) == 100.0

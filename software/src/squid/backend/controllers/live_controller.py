@@ -202,9 +202,16 @@ class LiveController(StateMachine[LiveControllerState]):
         if intensity is None:
             return None
         try:
-            return float(intensity)
+            intensity = float(intensity)
         except Exception:
             return None
+        # Clamp to the illumination channel's max output (read fresh from the shared config)
+        cap = getattr(getattr(self, "_channel_config_service", None), "get_intensity_cap_percent", None)
+        cap = cap(self.currentConfiguration) if callable(cap) else None
+        if isinstance(cap, (int, float)) and intensity > cap:
+            self._log.warning(f"Clamping illumination intensity from {intensity}% to {cap}% (channel max output)")
+            intensity = float(cap)
+        return intensity
 
     def turn_on_illumination(self) -> None:
         if self.currentConfiguration is None:

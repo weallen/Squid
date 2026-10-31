@@ -214,6 +214,20 @@ class AcquisitionChannel(BaseModel):
             return None
         return ill_channel.wavelength_nm
 
+    def get_max_output_percent(self, illumination_config: "IlluminationChannelConfig") -> float:
+        """Maximum allowed intensity (percent) for the primary illumination channel.
+
+        Derived from the illumination channel's max_output (fraction of full scale).
+        Unknown channels fall back to 100%.
+        """
+        ill_channel_name = self.primary_illumination_channel
+        if not ill_channel_name:
+            return 100.0
+        ill_channel = illumination_config.get_channel_by_name(ill_channel_name)
+        if not ill_channel:
+            return 100.0
+        return ill_channel.max_output * 100.0
+
     def get_effective_settings(self, confocal_mode: bool) -> "AcquisitionChannel":
         """Get effective settings based on confocal mode."""
         if not confocal_mode or not self.confocal_override:

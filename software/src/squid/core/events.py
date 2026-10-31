@@ -820,6 +820,8 @@ class MicroscopeModeChanged(Event):
     exposure_time_ms: Optional[float] = None
     analog_gain: Optional[float] = None
     illumination_intensity: Optional[float] = None
+    # Intensity cap in percent from the illumination channel's max_output (None = no cap / 100%)
+    max_illumination_intensity: Optional[float] = None
 
 
 @dataclass

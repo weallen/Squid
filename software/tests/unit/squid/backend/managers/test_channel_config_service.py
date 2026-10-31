@@ -306,3 +306,40 @@ class TestSaveAcquisitionOutput:
 
         output_file = output_dir / "acquisition_channels.yaml"
         assert output_file.exists()
+
+
+class TestIlluminationConfigFreshness:
+    """ChannelConfigService must not snapshot the illumination config (upstream edc13253, #610)."""
+
+    def test_port_mapping_edit_applies_without_restart(self, service, config_repo):
+        dapi = service.get_channel_configuration_by_name("10x", "DAPI")
+        assert dapi.illumination_source == 11
+
+        config_repo.update_port_mapping({"D1": 21, "D2": 12})
+
+        dapi = service.get_channel_configuration_by_name("10x", "DAPI")
+        assert dapi.illumination_source == 21
+
+    def test_cache_clear_rereads_yaml(self, service, config_repo, tmp_config_dir):
+        other = ConfigRepository(base_path=tmp_config_dir)
+        edited = other.get_illumination_config(for_edit=True)
+        edited.controller_port_mapping["D2"] = 22
+        other.save_illumination_config(edited)
+
+        config_repo.clear_all_cache()
+        gfp = service.get_channel_configuration_by_name("10x", "GFP")
+        assert gfp.illumination_source == 22
+
+    def test_intensity_cap_follows_max_output(self, service, config_repo):
+        dapi = service.get_channel_configuration_by_name("10x", "DAPI")
+        assert service.get_intensity_cap_percent(dapi) == 100.0
+        assert dapi.max_illumination_intensity == 100.0
+
+        edited = config_repo.get_illumination_config(for_edit=True)
+        edited.channels[0].max_output = 0.3
+        config_repo.save_illumination_config(edited)
+
+        assert service.get_intensity_cap_percent(dapi) == pytest.approx(30.0)
+        dapi = service.get_channel_configuration_by_name("10x", "DAPI")
+        assert dapi.max_illumination_intensity == pytest.approx(30.0)
+        assert service.get_intensity_cap_percent(None) == 100.0
