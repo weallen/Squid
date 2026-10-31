@@ -330,6 +330,9 @@ class LiveControlWidget(EventBusFrame):
         else:
             self._log.info("Publishing StopLiveCommand")
             self._publish(StopLiveCommand())
+        # The click toggled the checkable button locally. Show the backend-reported state until
+        # LiveStateChanged confirms the change, so an ignored or failed start/stop can't leave it lying.
+        self._sync_live_buttons()
 
     def snap(self) -> None:
         """Request one frame with the current configuration; the backend displays it."""

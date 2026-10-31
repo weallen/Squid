@@ -71,6 +71,9 @@ class LiveStateData:
 
 
 class LiveController(StateMachine[LiveControllerState]):
+    # How long snap() waits for a busy microcontroller (stage move) before giving up.
+    _SNAP_MCU_IDLE_WAIT_S: float = 5.0
+
     def __init__(
         self,
         camera_service: CameraService,
@@ -485,6 +488,16 @@ class LiveController(StateMachine[LiveControllerState]):
         if self._mode_gate:
             self._mode_gate.set_mode(GlobalMode.IDLE, reason="live stop")
 
+    def _is_mcu_busy(self) -> bool:
+        """True while the microcontroller is mid-command (usually a stage move)."""
+        if self._peripheral_service is None:
+            return False
+        try:
+            return self._peripheral_service.is_mcu_busy()
+        except Exception:
+            self._log.exception("Failed to read microcontroller busy state; assuming idle")
+            return False
+
     def set_stream_handler(self, stream_handler: Optional["StreamHandler"]) -> None:
         """Stream handler whose display throttle snap() bypasses for its single frame."""
         self._stream_handler = stream_handler
@@ -524,6 +537,14 @@ class LiveController(StateMachine[LiveControllerState]):
             self._event_bus.publish(SnapStateChanged(camera=self._camera, is_snapping=True))
         success = False
         try:
+            if self._is_mcu_busy():
+                # Same wedge-avoidance as trigger_acquisition(): never fire a trigger while the MCU
+                # is mid-command. A stage move finishes well within this wait.
+                try:
+                    self._peripheral_service.wait_till_operation_is_completed(self._SNAP_MCU_IDLE_WAIT_S)
+                except TimeoutError:
+                    self._log.warning("Microcontroller still busy; not snapping.")
+                    return False
             success = self._snap_impl()
         except Exception:
             self._log.exception("Snap failed")
@@ -598,13 +619,24 @@ class LiveController(StateMachine[LiveControllerState]):
                 self._start_new_timer(maybe_custom_interval_ms=max(0.0, self.timer_trigger_interval - elapsed_ms))
         else:
             if self.is_live:
-                # It failed, try again real soon
-                # Use a short period so we get back here fast and check again.
-                re_check_period_ms = 10
-                self._start_new_timer(maybe_custom_interval_ms=re_check_period_ms)
+                if self._is_mcu_busy():
+                    # A busy MCU (a stage move) resolves on a 100 ms-to-seconds scale, and every re-check
+                    # spins up a fresh Timer thread: poll at frame cadence, not every 10 ms.
+                    self._start_new_timer()
+                else:
+                    # Camera not ready yet: try again real soon.
+                    re_check_period_ms = 10
+                    self._start_new_timer(maybe_custom_interval_ms=re_check_period_ms)
 
     # software trigger related
     def trigger_acquisition(self) -> bool:
+        if self._is_mcu_busy():
+            # Don't trigger while the MCU executes a command (usually a stage move): triggering mid-command
+            # corrupts the firmware's single command-status slot and wedges it - it keeps executing commands
+            # but reports IN_PROGRESS for everything until the trigger stream stops for a few seconds.
+            # The trigger is skipped, not queued; the live timer re-checks on its own schedule, so live
+            # resumes by itself after the move.
+            return False
         with self._lock:
             ready = self._camera_service.get_ready_for_trigger()
             if not ready:

@@ -76,3 +76,21 @@ def test_live_click_publishes_start(qtbot, monkeypatch):
     widget, bus = _make_widget(qtbot, monkeypatch)
     widget.btn_live.click()
     assert any(isinstance(e, StartLiveCommand) for e in _published(bus))
+
+
+def test_live_button_reflects_backend_state_not_the_click(qtbot, monkeypatch):
+    # Upstream #639: a failed or ignored start/stop must not leave the button lying.
+    widget, bus = _make_widget(qtbot, monkeypatch)
+    widget.btn_live.click()  # start requested; backend has not confirmed yet (or ignored it)
+    assert not widget.btn_live.isChecked()
+    assert widget.btn_live.text() == "Live"
+
+    widget._on_live_state_changed(LiveStateChanged(is_live=True))
+    assert widget.btn_live.isChecked()
+
+    widget.btn_live.click()  # stop requested, e.g. stop_live timed out before confirming
+    assert widget.btn_live.isChecked()
+    assert widget.btn_live.text() == "Stop"
+    widget._on_live_state_changed(LiveStateChanged(is_live=False))
+    assert not widget.btn_live.isChecked()
+    assert widget.btn_live.text() == "Live"
