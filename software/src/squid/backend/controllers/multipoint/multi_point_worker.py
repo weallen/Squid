@@ -19,7 +19,6 @@ from _def import (
     DOWNSAMPLED_VIEW_IDLE_TIMEOUT_S,
     DOWNSAMPLED_VIEW_JOB_TIMEOUT_S,
     FILE_ID_PADDING,
-    FILE_SAVING_OPTION,
     FileSavingOption,
     SCAN_STABILIZATION_TIME_MS_X,
     SCAN_STABILIZATION_TIME_MS_Y,
@@ -47,6 +46,7 @@ from squid.backend.controllers.multipoint.job_processing import (
     CaptureInfo,
     SaveImageJob,
     SaveOMETiffJob,
+    SaveSettings,
     SaveZarrJob,
     ZarrWriterInfo,
     ZarrWriteResult,
@@ -145,6 +145,15 @@ from squid.core.events import (
 
 # Module-level logger for static methods
 _log = squid.core.logging.get_logger(__name__)
+
+
+def save_job_classes_for_format(file_saving_option: FileSavingOption) -> List[Type[Job]]:
+    """The saving job classes that implement the given file saving format."""
+    if file_saving_option == FileSavingOption.OME_TIFF:
+        return [SaveOMETiffJob]
+    if file_saving_option == FileSavingOption.ZARR_V3:
+        return [SaveZarrJob]
+    return [SaveImageJob]
 
 
 class SummarizeResult(NamedTuple):
@@ -396,17 +405,13 @@ class MultiPointWorker:
             physical_size_y_um=self._pixel_size_um,
         )
 
-        # Determine job classes based on file saving option
-        job_classes: List[Type[Job]] = []
-        use_ome_tiff = FILE_SAVING_OPTION == FileSavingOption.OME_TIFF
-        use_zarr_v3 = FILE_SAVING_OPTION == FileSavingOption.ZARR_V3
-        if not self.skip_saving:
-            if use_ome_tiff:
-                job_classes.append(SaveOMETiffJob)
-            elif use_zarr_v3:
-                job_classes.append(SaveZarrJob)
-            else:
-                job_classes.append(SaveImageJob)
+        # The saving settings in effect now (read from _def, which Preferences updates live), for the whole
+        # acquisition. Carried on every job: the job subprocess has its own, possibly stale, copy of _def.
+        self._save_settings = SaveSettings()
+        file_saving_option = self._save_settings.file_saving_option
+        use_ome_tiff = file_saving_option == FileSavingOption.OME_TIFF
+        use_zarr_v3 = file_saving_option == FileSavingOption.ZARR_V3
+        job_classes: List[Type[Job]] = [] if self.skip_saving else save_job_classes_for_format(file_saving_option)
 
         if extra_job_classes:
             job_classes.extend(extra_job_classes)
@@ -2502,7 +2507,9 @@ class MultiPointWorker:
                             continue  # Skip if not a well-based acquisition
                     else:
                         job = job_class(
-                            capture_info=info, capture_image=JobImage(image_array=image)
+                            capture_info=info,
+                            capture_image=JobImage(image_array=image),
+                            save_settings=self._save_settings,
                         )
                     if job_runner is not None:
                         if not job_runner.dispatch(job):
@@ -2538,7 +2545,7 @@ class MultiPointWorker:
             # Only register when using individual image saving - OME-TIFF uses different paths
             if (
                 self._progress_tracker is not None
-                and FILE_SAVING_OPTION == FileSavingOption.INDIVIDUAL_IMAGES
+                and self._save_settings.file_saving_option == FileSavingOption.INDIVIDUAL_IMAGES
             ):
                 filepath = utils_acquisition.get_image_filepath(
                     save_directory=info.save_directory,

@@ -97,6 +97,21 @@ class JobImage:
     image_array: Optional[np.array]
 
 
+@dataclass(frozen=True)
+class SaveSettings:
+    """The saving settings that can be changed while the software is running (Preferences dialog).
+
+    The values are read from _def where this is created (the acquisition process, at acquisition start), and
+    reach the saving subprocess with each job.  Jobs must not read them from _def: the subprocess has its own
+    copy of it, from when the subprocess was started.
+    """
+
+    file_saving_option: _def.FileSavingOption = field(default_factory=lambda: _def.FILE_SAVING_OPTION)
+    tiff_compression_level: int = field(default_factory=lambda: _def.TIFF_COMPRESSION_LEVEL)
+    zarr_chunk_mode: _def.ZarrChunkMode = field(default_factory=lambda: _def.ZARR_CHUNK_MODE)
+    zarr_compression: _def.ZarrCompression = field(default_factory=lambda: _def.ZARR_COMPRESSION)
+
+
 T = TypeVar("T")
 
 
@@ -106,6 +121,7 @@ class Job(abc.ABC, Generic[T]):
     capture_image: JobImage
 
     job_id: str = field(default_factory=lambda: str(uuid4()))
+    save_settings: SaveSettings = field(default_factory=SaveSettings)
 
     def image_array(self) -> np.array:
         if self.capture_image.image_array is not None:
@@ -210,7 +226,7 @@ class SaveImageJob(Job):
 
     def save_image(self, image: np.ndarray, info: CaptureInfo, is_color: bool) -> bool:
         # NOTE(imo): We silently fall back to individual image saving here.  We should warn or do something.
-        if _def.FILE_SAVING_OPTION == _def.FileSavingOption.MULTI_PAGE_TIFF:
+        if self.save_settings.file_saving_option == _def.FileSavingOption.MULTI_PAGE_TIFF:
             metadata: Dict[str, Any] = {
                 "z_level": info.z_index,
                 "channel": info.configuration.name,
@@ -252,6 +268,7 @@ class SaveImageJob(Job):
                     metadata=metadata,
                     description=description,
                     extratags=extratags,
+                    **utils_acquisition.tiff_compression_kwargs(self.save_settings.tiff_compression_level),
                 )
         else:
             # OME-TIFF is handled by SaveOMETiffJob, which requires AcquisitionInfo
@@ -261,6 +278,7 @@ class SaveImageJob(Job):
                 save_directory=info.save_directory,
                 config=info.configuration,
                 is_color=is_color,
+                tiff_compression_level=self.save_settings.tiff_compression_level,
             )
 
             if _feature_flags.is_enabled("MERGE_CHANNELS"):
@@ -786,8 +804,8 @@ class SaveZarrJob(Job):
                 channel_names=self.zarr_writer_info.channel_names,
                 channel_colors=self.zarr_writer_info.channel_colors,
                 channel_wavelengths=self.zarr_writer_info.channel_wavelengths,
-                chunk_mode=_def.ZARR_CHUNK_MODE,
-                compression=_def.ZARR_COMPRESSION,
+                chunk_mode=self.save_settings.zarr_chunk_mode,
+                compression=self.save_settings.zarr_compression,
                 is_hcs=is_hcs or not use_6d_fov,  # 5D for HCS and non-HCS default
             )
             try:
