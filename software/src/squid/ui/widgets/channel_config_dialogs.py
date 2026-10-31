@@ -24,6 +24,7 @@ from qtpy.QtWidgets import (
     QColorDialog,
     QComboBox,
     QDialog,
+    QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QHBoxLayout,
@@ -256,7 +257,8 @@ class IlluminationChannelConfiguratorDialog(QDialog):
     COL_TYPE = 1
     COL_PORT = 2
     COL_WAVELENGTH = 3
-    COL_CALIBRATION = 4
+    COL_MAX_OUTPUT = 4
+    COL_CALIBRATION = 5
 
     def __init__(self, config_repo, parent=None):
         super().__init__(parent)
@@ -283,8 +285,10 @@ class IlluminationChannelConfiguratorDialog(QDialog):
 
         # Table for illumination channels
         self.table = QTableWidget()
-        self.table.setColumnCount(5)
-        self.table.setHorizontalHeaderLabels(["Name", "Type", "Controller Port", "Wavelength (nm)", "Calibration File"])
+        self.table.setColumnCount(6)
+        self.table.setHorizontalHeaderLabels(
+            ["Name", "Type", "Controller Port", "Wavelength (nm)", "Max Output", "Calibration File"]
+        )
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
@@ -343,8 +347,16 @@ class IlluminationChannelConfiguratorDialog(QDialog):
         return str(calib_dir / filename)
 
     def _load_channels(self):
-        """Load illumination channels from YAML config into the table."""
-        self.illumination_config = self.config_repo.get_illumination_config()
+        """Load illumination channels from the repository into the table.
+
+        Edits a deep copy: table edits and add/remove/move must not touch the
+        shared cached config until Save publishes them through the repository.
+        """
+        self.illumination_config = self.config_repo.get_illumination_config(for_edit=True)
+        self._refresh_table()
+
+    def _refresh_table(self):
+        """Render the table from the working copy in self.illumination_config."""
         if not self.illumination_config:
             return
 
@@ -375,15 +387,24 @@ class IlluminationChannelConfiguratorDialog(QDialog):
             wave_widget = WavelengthWidget(channel.wavelength_nm)
             self.table.setCellWidget(row, self.COL_WAVELENGTH, wave_widget)
 
+            # Max output (fraction of full scale; caps intensity at max_output*100 %)
+            self.table.setCellWidget(row, self.COL_MAX_OUTPUT, _make_max_output_spinbox(channel.max_output))
+
             # Calibration file (full path)
             full_path = self._get_calibration_full_path(channel.intensity_calibration_file)
             calib_item = QTableWidgetItem(full_path)
             self.table.setItem(row, self.COL_CALIBRATION, calib_item)
 
     def _on_type_changed(self, row, new_type):
-        """Handle type change - update wavelength default and controller port."""
+        """Handle type change - update wavelength, max output and controller port defaults."""
+        from squid.core.config.models.illumination_config import IlluminationType, default_max_output
+
         wave_widget = self.table.cellWidget(row, self.COL_WAVELENGTH)
         available_ports = self.illumination_config.get_available_ports()
+
+        max_output_widget = self.table.cellWidget(row, self.COL_MAX_OUTPUT)
+        if isinstance(max_output_widget, QDoubleSpinBox):
+            max_output_widget.setValue(default_max_output(IlluminationType(new_type)))
 
         # Find first available USB and D ports
         first_usb = next((p for p in available_ports if p.startswith("USB")), None)
@@ -417,7 +438,7 @@ class IlluminationChannelConfiguratorDialog(QDialog):
 
             new_channel = IlluminationChannel(**channel_data)
             self.illumination_config.channels.append(new_channel)
-            self._load_channels()
+            self._refresh_table()
 
     def _remove_channel(self):
         """Remove selected channel."""
@@ -432,7 +453,7 @@ class IlluminationChannelConfiguratorDialog(QDialog):
             )
             if reply == QMessageBox.Yes:
                 del self.illumination_config.channels[current_row]
-                self._load_channels()
+                self._refresh_table()
 
     def _move_up(self):
         """Move selected channel up."""
@@ -442,7 +463,7 @@ class IlluminationChannelConfiguratorDialog(QDialog):
 
         channels = self.illumination_config.channels
         channels[current_row], channels[current_row - 1] = channels[current_row - 1], channels[current_row]
-        self._load_channels()
+        self._refresh_table()
         self.table.selectRow(current_row - 1)
 
     def _move_down(self):
@@ -453,14 +474,24 @@ class IlluminationChannelConfiguratorDialog(QDialog):
 
         channels = self.illumination_config.channels
         channels[current_row], channels[current_row + 1] = channels[current_row + 1], channels[current_row]
-        self._load_channels()
+        self._refresh_table()
         self.table.selectRow(current_row + 1)
 
     def _open_port_mapping(self):
         """Open the controller port mapping dialog."""
         dialog = ControllerPortMappingDialog(self.config_repo, self)
-        dialog.signal_mappings_updated.connect(self._load_channels)
+        dialog.signal_mappings_updated.connect(self._on_port_mappings_updated)
         dialog.exec_()
+
+    def _on_port_mappings_updated(self):
+        """Pull the freshly saved port mapping into the working copy.
+
+        Keeps unsaved channel edits while updating the available ports.
+        """
+        saved = self.config_repo.get_illumination_config()
+        if saved and self.illumination_config:
+            self.illumination_config.controller_port_mapping = dict(saved.controller_port_mapping)
+        self._refresh_table()
 
     def _save_changes(self):
         """Save all changes to illumination channel config."""
@@ -530,6 +561,11 @@ class IlluminationChannelConfiguratorDialog(QDialog):
             else:
                 channel.wavelength_nm = None
 
+            # Max output
+            max_output_widget = self.table.cellWidget(row, self.COL_MAX_OUTPUT)
+            if isinstance(max_output_widget, QDoubleSpinBox):
+                channel.max_output = max_output_widget.value()
+
             # Calibration file (extract filename from full path)
             calib_item = self.table.item(row, self.COL_CALIBRATION)
             if calib_item:
@@ -544,6 +580,16 @@ class IlluminationChannelConfiguratorDialog(QDialog):
         self.config_repo.save_illumination_config(self.illumination_config)
         self.signal_channels_updated.emit()
         self.accept()
+
+
+def _make_max_output_spinbox(value: float) -> QDoubleSpinBox:
+    """Spinbox for a channel's max output fraction (caps intensity at value*100 %)."""
+    spin = QDoubleSpinBox()
+    spin.setRange(0.01, 1.0)
+    spin.setSingleStep(0.05)
+    spin.setDecimals(2)
+    spin.setValue(value)
+    return spin
 
 
 class AddIlluminationChannelDialog(QDialog):
@@ -585,6 +631,9 @@ class AddIlluminationChannelDialog(QDialog):
         self.wave_spin.setMinimum(0)  # Allow 0 to represent N/A
         layout.addRow("Wavelength (nm):", self.wave_spin)
 
+        self.max_output_spin = _make_max_output_spinbox(1.0)
+        layout.addRow("Max Output:", self.max_output_spin)
+
         # Calibration file
         self.calib_edit = QLineEdit()
         self.calib_edit.setPlaceholderText("e.g., 405.csv")
@@ -599,6 +648,9 @@ class AddIlluminationChannelDialog(QDialog):
         button_layout.addWidget(self.btn_ok)
         button_layout.addWidget(self.btn_cancel)
         layout.addRow(button_layout)
+
+        # Apply type-dependent defaults (port, wavelength, max output) from one place
+        self._on_type_changed(self.type_combo.currentText())
 
     def _validate_and_accept(self):
         """Validate input before accepting."""
@@ -617,12 +669,15 @@ class AddIlluminationChannelDialog(QDialog):
         self.accept()
 
     def _on_type_changed(self, type_str):
+        from squid.core.config.models.illumination_config import IlluminationType, default_max_output
+
         is_epi = type_str == "epi_illumination"
         available_ports = self.illumination_config.get_available_ports() if self.illumination_config else []
         first_d = next((p for p in available_ports if p.startswith("D")), None)
         first_usb = next((p for p in available_ports if p.startswith("USB")), None)
 
-        # Update port default based on type
+        # Update port, wavelength and max output defaults based on type
+        self.max_output_spin.setValue(default_max_output(IlluminationType(type_str)))
         if is_epi:
             if first_d:
                 self.port_combo.setCurrentText(first_d)
@@ -642,6 +697,7 @@ class AddIlluminationChannelDialog(QDialog):
             "type": channel_type,
             "controller_port": self.port_combo.currentText(),
             "wavelength_nm": wavelength if wavelength > 0 else None,
+            "max_output": self.max_output_spin.value(),
         }
 
         calib_text = self.calib_edit.text().strip()
@@ -712,7 +768,7 @@ class ControllerPortMappingDialog(QDialog):
         """Load current port mappings into the table."""
         from squid.core.config.models.illumination_config import IlluminationChannelConfig
 
-        self.illumination_config = self.config_repo.get_illumination_config()
+        self.illumination_config = self.config_repo.get_illumination_config(for_edit=True)
         if not self.illumination_config:
             return
 
@@ -766,8 +822,9 @@ class ControllerPortMappingDialog(QDialog):
                 if source_code is not None:
                     new_mapping[port] = source_code
 
-        self.illumination_config.controller_port_mapping = new_mapping
-        self.config_repo.save_illumination_config(self.illumination_config)
+        # Partial update: only the mapping is replaced, so channel edits saved
+        # elsewhere since this dialog opened are not clobbered.
+        self.config_repo.update_port_mapping(new_mapping)
         self.signal_mappings_updated.emit()
         self.accept()
 

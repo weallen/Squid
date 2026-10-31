@@ -56,9 +56,22 @@ class _DummyMenu:
         pass
 
 
+class _DummyDimsEvents:
+    def __init__(self) -> None:
+        self.ndisplay = _DummyEvent()
+
+
 class _DummyDims:
     def __init__(self) -> None:
         self.axis_labels: list[str] = []
+        self.ndisplay = 2
+        self.point: tuple[float, ...] = (0.0, 0.0, 0.0)
+        self.events = _DummyDimsEvents()
+
+    def set_point(self, axis: int, value: float) -> None:
+        point = list(self.point)
+        point[axis] = value
+        self.point = tuple(point)
 
 
 class _DummyGrid:

@@ -35,6 +35,7 @@ from squid.core.events import (
     auto_unsubscribe,
     handles,
     event_bus,
+    ChannelConfigurationsChanged,
     ObjectiveChanged,
     LoadFluidicsProtocolsCommand,
 )
@@ -889,6 +890,12 @@ class ApplicationContext:
     @handles(ObjectiveChanged)
     def _on_objective_changed(self, event: ObjectiveChanged) -> None:
         """Refresh channel configs when objective changes."""
+        if self._controllers and self._controllers.microscope_mode:
+            self._refresh_channel_configs(self._controllers.microscope_mode)
+
+    @handles(ChannelConfigurationsChanged)
+    def _on_channel_configurations_changed(self, event: ChannelConfigurationsChanged) -> None:
+        """Refresh the mode controller's channel configs after config edits (e.g. illumination max output)."""
         if self._controllers and self._controllers.microscope_mode:
             self._refresh_channel_configs(self._controllers.microscope_mode)
 

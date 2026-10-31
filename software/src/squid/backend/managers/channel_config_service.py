@@ -27,6 +27,7 @@ from squid.core.events import (
 )
 
 if TYPE_CHECKING:
+    from squid.core.config.models.illumination_config import IlluminationChannelConfig
     from squid.core.events import EventBus
 
 
@@ -54,7 +55,22 @@ class ChannelConfigService(BaseManager):
         self.config_repo = config_repo
         self.confocal_mode = False
         self._current_objective = None
-        self._illumination_config = config_repo.get_illumination_config()
+
+    @property
+    def _illumination_config(self) -> Optional["IlluminationChannelConfig"]:
+        """Current illumination config, read through the shared repository on every access.
+
+        Not snapshotted: edits saved in the illumination configurator (or a cache clear)
+        must take effect without a restart, e.g. port-mapping changes to source codes.
+        """
+        return self.config_repo.get_illumination_config()
+
+    def get_intensity_cap_percent(self, channel: Optional[AcquisitionChannel]) -> float:
+        """Maximum allowed illumination intensity (percent) for a channel; 100 when unknown."""
+        ill_config = self._illumination_config
+        if channel is None or not ill_config:
+            return 100.0
+        return channel.get_max_output_percent(ill_config)
 
     # ── Public API ──────────────────────────────────────────────────────
 
@@ -251,14 +267,17 @@ class ChannelConfigService(BaseManager):
         inject via __dict__ for backward compatibility with code that reads
         channel.illumination_source (an integer hardware code).
         """
-        if not self._illumination_config:
+        ill_config = self._illumination_config
+        if not ill_config:
             return
 
         for ch in channels:
             ill_name = ch.illumination_settings.illumination_channel
             if ill_name is None:
                 continue
-            ill_ch = self._illumination_config.get_channel_by_name(ill_name)
+            ill_ch = ill_config.get_channel_by_name(ill_name)
             if ill_ch is not None:
-                source_code = self._illumination_config.get_source_code(ill_ch)
+                source_code = ill_config.get_source_code(ill_ch)
                 ch.__dict__["illumination_source"] = source_code
+                # Intensity cap (percent) from the channel's max_output, for UI controls
+                ch.__dict__["max_illumination_intensity"] = ill_ch.max_output * 100.0
