@@ -70,3 +70,96 @@ def test_convert_header_to_numpy_rejects_padding():
 
     with pytest.raises(CameraError):
         TucsenCamera._convert_header_to_numpy(header)
+
+
+def test_header_view_reads_device_memory_without_copying():
+    arr = np.arange(2 * 3, dtype=np.uint16).reshape(2, 3)
+    header, backing = _make_header(arr)
+
+    view = TucsenCamera._header_to_numpy_view(header)
+
+    np.testing.assert_array_equal(view, arr)
+    ctypes.memset(backing, 0, len(backing))
+    np.testing.assert_array_equal(view, np.zeros((2, 3)))  # a view: it follows the device buffer
+
+
+@pytest.mark.parametrize("flip", [None, "Vertical"])
+def test_frame_callback_copies_the_frame_out_of_device_memory(monkeypatch, flip):
+    """The callback reads the driver's buffer directly; the frame it hands on must not alias that buffer,
+    which the driver reuses for the next frame."""
+    import threading
+    import types
+
+    import squid.backend.drivers.cameras.tucsen as tucsen
+    import squid.core.logging
+    from squid.core.utils.hardware_utils import FlipVariant, rotate_and_flip_image
+
+    arr = np.arange(4 * 3, dtype=np.uint16).reshape(4, 3)
+    source, backing = _make_header(arr)
+
+    def get_data(handle, header_ptr):
+        ctypes.memmove(header_ptr, ctypes.addressof(source), ctypes.sizeof(source))
+        return tucsen.TUCAMRET.TUCAMRET_SUCCESS
+
+    monkeypatch.setattr(tucsen, "TUCAM_Buf_GetData", get_data)
+    frames = []
+    flip_variant = FlipVariant(flip) if flip else None
+    camera = types.SimpleNamespace(
+        _is_streaming=threading.Event(),
+        _frame_lock=threading.Lock(),
+        _camera=None,
+        _current_frame=None,
+        _trigger_sent=threading.Event(),
+        _log=squid.core.logging.get_logger("test"),
+        _header_to_numpy_view=TucsenCamera._header_to_numpy_view,
+        _process_raw_frame=lambda image: rotate_and_flip_image(image, None, flip_variant),
+        get_frame_format=lambda: None,
+        get_pixel_format=lambda: None,
+        _propogate_frame=frames.append,
+    )
+    camera._is_streaming.set()
+
+    TucsenCamera._on_frame_callback(camera)
+
+    expected = arr[::-1] if flip else arr
+    np.testing.assert_array_equal(frames[0].frame, expected)
+    ctypes.memset(backing, 0, len(backing))  # the driver reuses its buffer
+    np.testing.assert_array_equal(frames[0].frame, expected)
+
+
+def test_frame_callback_copies_when_processing_returns_a_view(monkeypatch):
+    """Guard: if processing ever hands back a view of the driver buffer, the callback copies it."""
+    import threading
+    import types
+
+    import squid.backend.drivers.cameras.tucsen as tucsen
+    import squid.core.logging
+
+    arr = np.arange(4 * 3, dtype=np.uint16).reshape(4, 3)
+    source, backing = _make_header(arr)
+
+    def get_data(handle, header_ptr):
+        ctypes.memmove(header_ptr, ctypes.addressof(source), ctypes.sizeof(source))
+        return tucsen.TUCAMRET.TUCAMRET_SUCCESS
+
+    monkeypatch.setattr(tucsen, "TUCAM_Buf_GetData", get_data)
+    frames = []
+    camera = types.SimpleNamespace(
+        _is_streaming=threading.Event(),
+        _frame_lock=threading.Lock(),
+        _camera=None,
+        _current_frame=None,
+        _trigger_sent=threading.Event(),
+        _log=squid.core.logging.get_logger("test"),
+        _header_to_numpy_view=TucsenCamera._header_to_numpy_view,
+        _process_raw_frame=lambda image: image[1:],  # a view, e.g. a crop
+        get_frame_format=lambda: None,
+        get_pixel_format=lambda: None,
+        _propogate_frame=frames.append,
+    )
+    camera._is_streaming.set()
+
+    TucsenCamera._on_frame_callback(camera)
+
+    ctypes.memset(backing, 0, len(backing))
+    np.testing.assert_array_equal(frames[0].frame, arr[1:])

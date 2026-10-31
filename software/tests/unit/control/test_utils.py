@@ -222,3 +222,40 @@ def test_threaded_operation_helper():
     # Verify results
     assert operation_result == [("value1", "value2")]
     assert callback_result == [(True, None)]
+
+
+@pytest.mark.parametrize("rotate", [None, 0, 90, -90, 180])
+@pytest.mark.parametrize("flip", [None, *squid.core.utils.hardware_utils.FlipVariant])
+@pytest.mark.parametrize("shape", [(6, 4), (6, 4, 3)])
+def test_rotate_and_flip_image_matches_opencv_and_never_aliases_the_input(rotate, flip, shape):
+    import cv2
+
+    from squid.core.utils.hardware_utils import rotate_and_flip_image
+
+    image = np.arange(np.prod(shape), dtype=np.uint16).reshape(shape)
+    original = image.copy()
+    expected = image.copy()
+    if rotate:
+        expected = cv2.rotate(
+            expected, {90: cv2.ROTATE_90_CLOCKWISE, -90: cv2.ROTATE_90_COUNTERCLOCKWISE, 180: cv2.ROTATE_180}[rotate]
+        )
+    if flip is not None:
+        expected = cv2.flip(expected, {"Vertical": 0, "Horizontal": 1, "Both": -1}[flip.value])
+
+    result = rotate_and_flip_image(image, rotate_image_angle=rotate, flip_image=flip)
+
+    np.testing.assert_array_equal(result, expected)
+    assert result.flags.c_contiguous
+    assert not np.may_share_memory(result, image)  # callers pass views of driver memory
+    np.testing.assert_array_equal(image, original)
+
+
+def test_rotate_and_flip_image_copies_a_non_contiguous_view():
+    from squid.core.utils.hardware_utils import rotate_and_flip_image
+
+    base = np.arange(8 * 6, dtype=np.uint16).reshape(8, 6)
+    view = base[::2]
+    result = rotate_and_flip_image(view, rotate_image_angle=None, flip_image=None)
+    np.testing.assert_array_equal(result, view)
+    assert result.flags.c_contiguous
+    assert not np.may_share_memory(result, base)
