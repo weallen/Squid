@@ -155,8 +155,9 @@ class SummarizeResult(NamedTuple):
 
 
 class MultiPointWorker:
-    # Class-level default (also set in __init__) so partially constructed workers in tests behave.
+    # Class-level defaults (also set in __init__) so partially constructed workers in tests behave.
     _applied_config: Optional[AcquisitionChannel] = None
+    _last_position_complete: bool = True
 
     def __init__(
         self,
@@ -224,6 +225,8 @@ class MultiPointWorker:
         # every position, around autofocus / laser AF / z-offset moves, and on any out-of-band channel,
         # illumination, camera or trigger change seen on the EventBus, so a stale mode is never left behind.
         self._applied_config: Optional[AcquisitionChannel] = None
+        # False when an abort stopped the last acquire_at_position mid z-stack / channel loop.
+        self._last_position_complete: bool = True
         self._focus_lock_controller = focus_lock_controller
         self._alignment_widget = alignment_widget
 
@@ -1883,6 +1886,11 @@ class MultiPointWorker:
                         success = False
                         error_msg = str(e)
                         self._log.error(f"Error executing FOV {task.fov_id}: {e}")
+                    else:
+                        if not self._last_position_complete:
+                            # Stopped mid z-stack / channel loop: don't record a partial FOV as completed.
+                            success = False
+                            error_msg = "Aborted before all z-levels/channels were acquired"
 
                 # Mark task complete - this advances cursor
                 self._fov_task_list.mark_complete_task(task, success, error_msg)
@@ -1911,6 +1919,7 @@ class MultiPointWorker:
         fov_id: Optional[str] = None,
         attempt: int = 1,
     ) -> None:
+        self._last_position_complete = True
         # New position: always re-apply the first channel (whatever ran between positions can change the mode).
         self._invalidate_applied_config()
         af_succeeded = self.perform_autofocus(region_id, fov)
@@ -2008,9 +2017,11 @@ class MultiPointWorker:
         self._invalidate_applied_config()
         try:
             if self.acquisition_order == "z_first":
-                self._acquire_z_first(region_id, current_path, fov, fov_id, attempt)
+                completed = self._acquire_z_first(region_id, current_path, fov, fov_id, attempt)
             else:
-                self._acquire_channel_first(region_id, current_path, fov, fov_id, attempt)
+                completed = self._acquire_channel_first(region_id, current_path, fov, fov_id, attempt)
+            # An abort stops the z-stack / channel loop at once; the caller (run_coordinate_acquisition) handles it.
+            self._last_position_complete = completed is not False
             # update FOV counter after completing all z-levels for this FOV
             self.af_fov_count += 1
             self._progress_tracker.af_fov_count = self.af_fov_count
@@ -2037,8 +2048,11 @@ class MultiPointWorker:
         fov: int,
         fov_id: Optional[str],
         attempt: int,
-    ) -> None:
-        """Acquire all channels at each z-level before moving to the next z-level."""
+    ) -> bool:
+        """Acquire all channels at each z-level before moving to the next z-level.
+
+        Returns False if an abort stopped it before every z-level and channel was taken.
+        """
         for z_level in range(self.NZ):
             file_ID = self._make_file_id(region_id, fov, z_level, fov_id, attempt)
 
@@ -2057,7 +2071,12 @@ class MultiPointWorker:
 
             self._save_laser_af_characterization(current_path, file_ID)
 
+            images_at_level = 0
             for config_idx, config in enumerate(self.selected_configurations):
+                # Abort promptly: don't wait out a frame timeout for every remaining channel.
+                if self._abort_requested.is_set():
+                    break
+                images_at_level += 1
                 self.handle_z_offset(config, True)
 
                 with self._timing.get_timer("acquire_camera_image"):
@@ -2091,15 +2110,19 @@ class MultiPointWorker:
                     current_channel=config.name,
                 )
 
-            self.update_coordinates_dataframe(
-                region_id, z_level, acquire_pos, fov, fov_id=fov_id
-            )
+            if images_at_level:
+                self.update_coordinates_dataframe(
+                    region_id, z_level, acquire_pos, fov, fov_id=fov_id
+                )
 
+            # On an abort stop here; the caller handles it once. Z is returned to the stack start by
+            # acquire_at_position's cleanup (move_z_back_after_stack), which undoes only the steps taken.
             if self._abort_requested.is_set():
-                self.handle_acquisition_abort(current_path)
+                return z_level == self.NZ - 1 and images_at_level == len(self.selected_configurations)
 
             if z_level < self.NZ - 1:
                 self.move_z_for_stack()
+        return True
 
     def _acquire_z_first(
         self,
@@ -2108,11 +2131,17 @@ class MultiPointWorker:
         fov: int,
         fov_id: Optional[str],
         attempt: int,
-    ) -> None:
-        """Acquire all z-levels for each channel before moving to the next channel."""
+    ) -> bool:
+        """Acquire all z-levels for each channel before moving to the next channel.
+
+        Returns False if an abort stopped it before every channel and z-level was taken.
+        """
         num_configs = len(self.selected_configurations)
 
         for config_idx, config in enumerate(self.selected_configurations):
+            # Abort promptly, before re-positioning for the next channel's stack.
+            if self._abort_requested.is_set():
+                return False
             # Prepare z-stack position at the start of each channel
             if self.NZ > 1 and config_idx > 0:
                 # Return to starting z for this channel's z-stack
@@ -2174,11 +2203,13 @@ class MultiPointWorker:
                     region_id, z_level, acquire_pos, fov, fov_id=fov_id
                 )
 
+                # On an abort stop here; the caller handles it once (see _acquire_channel_first).
                 if self._abort_requested.is_set():
-                    self.handle_acquisition_abort(current_path)
+                    return config_idx == num_configs - 1 and z_level == self.NZ - 1
 
                 if z_level < self.NZ - 1:
                     self.move_z_for_stack()
+        return True
 
     def _make_file_id(
         self,
@@ -2662,19 +2693,9 @@ class MultiPointWorker:
             self._turn_on_illumination(config)
             self.wait_till_operation_is_completed()
             camera_illumination_time = None
-        elif self._trigger_mode == TriggerMode.HARDWARE:
-            if (
-                "Fluorescence" in config.name
-                and self._feature_flags.is_enabled("ENABLE_NL5")
-                and self._feature_flags.is_enabled("NL5_USE_DOUT")
-            ):
-                if self._nl5_service:
-                    try:
-                        self._nl5_service.start_acquisition()
-                    except Exception:
-                        self._log.exception("Failed to start NL5 acquisition via service")
-                else:
-                    self._log.warning("NL5 service unavailable; skipping start_acquisition()")
+        # In HARDWARE mode with an NL5 (NL5_USE_DOUT), send_trigger() below starts the confocal scan through the
+        # camera's hardware trigger function (microscope_factory.acquisition_camera_hw_trigger_fn). Do not also
+        # start one here: the second scan gave every image an extra, untracked camera frame.
         # This is some large timeout that we use just so as to not block forever
         with self._timing.get_timer("_ready_for_next_trigger.wait"):
             if not self._ready_for_next_trigger.wait(self._frame_wait_timeout_s()):
@@ -2980,7 +3001,12 @@ class MultiPointWorker:
             self.z_piezo_um = self._zstack_executor.z_piezo_um
 
     def move_z_back_after_stack(self) -> None:
-        """Return to stack start position using ZStackExecutor."""
+        """Return to stack start position using ZStackExecutor.
+
+        The executor returns to the home it recorded for this stack, i.e. it undoes exactly the z steps taken so
+        far, so a stack stopped early by an abort also ends where it started.
+        """
+        self._log.info(f"move_z_back_after_stack: undoing {self._zstack_executor.steps_taken} z step(s)")
         self._zstack_executor.return_to_start()
         # Keep z_piezo_um in sync for backward compatibility
         if self.use_piezo:

@@ -241,6 +241,15 @@ class ZStackExecutor:
         return self._current_z_level
 
     @property
+    def steps_taken(self) -> int:
+        """Z steps taken since initialize()/return_to_start().
+
+        return_to_start() moves back to the recorded home, so it undoes exactly these steps (and a FROM CENTER
+        start offset applied with reset_piezo()), however many were taken before an abort.
+        """
+        return self._current_z_level
+
+    @property
     def z_piezo_um(self) -> float:
         """Get current piezo z position in um."""
         return self._z_piezo_um
