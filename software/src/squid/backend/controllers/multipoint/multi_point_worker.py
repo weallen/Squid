@@ -101,7 +101,24 @@ from squid.backend.controllers.multipoint.checkpoint import (
     find_latest_checkpoint,
 )
 from squid.core.config.feature_flags import get_feature_flags
-from squid.core.events import AutofocusMode
+from squid.core.events import (
+    AnalogGainChanged,
+    AutofocusMode,
+    ChannelConfigurationsChanged,
+    Event,
+    ExposureTimeChanged,
+    FilterPositionChanged,
+    IlluminationStateChanged,
+    MicroscopeModeChanged,
+    ObjectiveChanged,
+    SetAnalogGainCommand,
+    SetExposureTimeCommand,
+    SetFilterPositionCommand,
+    SetIlluminationCommand,
+    SetMicroscopeModeCommand,
+    TriggerModeChanged,
+    UpdateChannelConfigurationCommand,
+)
 
 if TYPE_CHECKING:
     from squid.backend.services import (
@@ -138,6 +155,9 @@ class SummarizeResult(NamedTuple):
 
 
 class MultiPointWorker:
+    # Class-level default (also set in __init__) so partially constructed workers in tests behave.
+    _applied_config: Optional[AcquisitionChannel] = None
+
     def __init__(
         self,
         auto_focus_controller: Optional[AutoFocusController],
@@ -199,6 +219,11 @@ class MultiPointWorker:
         self._illumination_service = illumination_service
         self._filter_wheel_service = filter_wheel_service
         self._enable_channel_auto_filter_switching = enable_channel_auto_filter_switching
+        # A copy of the channel last applied by _select_config. An image whose channel equals it (by value) skips
+        # re-applying camera/illumination/filter settings (~22 ms per image on single-channel z-stacks). Cleared at
+        # every position, around autofocus / laser AF / z-offset moves, and on any out-of-band channel,
+        # illumination, camera or trigger change seen on the EventBus, so a stale mode is never left behind.
+        self._applied_config: Optional[AcquisitionChannel] = None
         self._focus_lock_controller = focus_lock_controller
         self._alignment_widget = alignment_widget
 
@@ -942,6 +967,8 @@ class MultiPointWorker:
         this_image_callback_id: Optional[str] = None
         acquisition_error: Optional[Exception] = None
         try:
+            self._applied_config = None
+            self._subscribe_config_cache_invalidation()
             self._prepare_focus_lock_for_acquisition()
             # Publish acquisition started event via ProgressTracker
             self._progress_tracker.start()
@@ -1044,6 +1071,7 @@ class MultiPointWorker:
             acquisition_error = e
             raise
         finally:
+            self._unsubscribe_config_cache_invalidation()
             self._teardown_focus_lock_for_acquisition()
             # We do this above, but there are some paths that skip the proper end of the acquisition so make
             # sure to always wait for final images here before removing our callback.
@@ -1883,7 +1911,12 @@ class MultiPointWorker:
         fov_id: Optional[str] = None,
         attempt: int = 1,
     ) -> None:
-        if not self.perform_autofocus(region_id, fov):
+        # New position: always re-apply the first channel (whatever ran between positions can change the mode).
+        self._invalidate_applied_config()
+        af_succeeded = self.perform_autofocus(region_id, fov)
+        # Autofocus / laser AF may apply their own settings outside _select_config.
+        self._invalidate_applied_config()
+        if not af_succeeded:
             current_z = self._stage_service.get_position().z_mm
             self._log.error(
                 f"Autofocus failed in acquire_at_position.  Continuing to acquire anyway using the current z position (z={current_z} [mm])"
@@ -1971,6 +2004,8 @@ class MultiPointWorker:
                 self.z_piezo_um = self._piezo_service.get_position()
                 self._zstack_executor.z_piezo_um = self.z_piezo_um
 
+        # Focus lock verification/pause ran outside _select_config.
+        self._invalidate_applied_config()
         try:
             if self.acquisition_order == "z_first":
                 self._acquire_z_first(region_id, current_path, fov, fov_id, attempt)
@@ -2168,12 +2203,85 @@ class MultiPointWorker:
             and self.laser_auto_focus_controller.characterization_mode
         ):
             image = self.laser_auto_focus_controller.get_image()
+            # Grabbing a laser AF frame toggles the AF laser/camera outside _select_config.
+            self._invalidate_applied_config("laser AF characterization image")
             saving_path = os.path.join(current_path, file_ID + "_laser af camera" + ".bmp")
             iio.imwrite(saving_path, image)
 
     def _select_config(self, config: AcquisitionChannel) -> None:
+        self._applied_config = None
         self._apply_channel_mode(config)
         self.wait_till_operation_is_completed()
+        self._applied_config = config.model_copy(deep=True)
+
+    def _config_already_applied(self, config: AcquisitionChannel) -> bool:
+        # Compared by value against the copy, so a channel edited since it was applied is applied again.
+        applied = self._applied_config
+        return applied is not None and config == applied
+
+    def _invalidate_applied_config(self, reason: str = "") -> None:
+        if self._applied_config is not None and reason:
+            self._log.debug(f"Re-applying channel mode on next image: {reason}")
+        self._applied_config = None
+
+    # EventBus handlers (EventBus thread). The worker applies modes by calling services directly, which never
+    # publish commands, so any command seen here came from elsewhere (UI, scripts, other controllers).
+    _CONFIG_INVALIDATING_EVENTS: Tuple[Type[Event], ...] = (
+        SetExposureTimeCommand,
+        SetAnalogGainCommand,
+        SetIlluminationCommand,
+        SetFilterPositionCommand,
+        SetMicroscopeModeCommand,
+        UpdateChannelConfigurationCommand,
+        MicroscopeModeChanged,
+        ChannelConfigurationsChanged,
+        IlluminationStateChanged,
+        TriggerModeChanged,
+        ObjectiveChanged,
+    )
+
+    def _on_config_invalidating_event(self, event: Event) -> None:
+        self._invalidate_applied_config(type(event).__name__)
+
+    def _on_exposure_time_changed(self, event: ExposureTimeChanged) -> None:
+        # Our own set_exposure_time publishes this too; only a value other than the applied one invalidates.
+        applied = self._applied_config
+        if applied is not None and event.exposure_time_ms != applied.exposure_time:
+            self._invalidate_applied_config("ExposureTimeChanged")
+
+    def _on_analog_gain_changed(self, event: AnalogGainChanged) -> None:
+        applied = self._applied_config
+        if applied is not None and event.gain != applied.analog_gain:
+            self._invalidate_applied_config("AnalogGainChanged")
+
+    def _on_filter_position_changed(self, event: FilterPositionChanged) -> None:
+        applied = self._applied_config
+        if applied is not None and event.position != applied.emission_filter_position:
+            self._invalidate_applied_config("FilterPositionChanged")
+
+    def _config_cache_subscriptions(self) -> List[Tuple[Type[Event], Callable[[Event], None]]]:
+        subscriptions: List[Tuple[Type[Event], Callable[[Event], None]]] = [
+            (event_type, self._on_config_invalidating_event) for event_type in self._CONFIG_INVALIDATING_EVENTS
+        ]
+        subscriptions += [
+            (ExposureTimeChanged, self._on_exposure_time_changed),
+            (AnalogGainChanged, self._on_analog_gain_changed),
+            (FilterPositionChanged, self._on_filter_position_changed),
+        ]
+        return subscriptions
+
+    def _subscribe_config_cache_invalidation(self) -> None:
+        if self._event_bus is None:
+            return
+        for event_type, handler in self._config_cache_subscriptions():
+            self._event_bus.subscribe(event_type, handler)
+
+    def _unsubscribe_config_cache_invalidation(self) -> None:
+        self._applied_config = None
+        if self._event_bus is None:
+            return
+        for event_type, handler in self._config_cache_subscriptions():
+            self._event_bus.unsubscribe(event_type, handler)
 
     def _is_rgb_config(self, config: AcquisitionChannel) -> bool:
         return bool(getattr(config, "is_rgb", False))
@@ -2307,6 +2415,8 @@ class MultiPointWorker:
             direction: int = 1 if not_offset else -1
             z_delta_um = config.z_offset * direction
             self._log.info(f"Moving Z offset {z_delta_um} um via piezo")
+            # Conservative: a per-channel z-offset move is out-of-band for the mode cache, re-apply next image.
+            self._invalidate_applied_config("per-channel z offset")
             if self._piezo_service is not None:
                 self._piezo_service.move_relative(z_delta_um)
 
@@ -2543,7 +2653,8 @@ class MultiPointWorker:
         config_idx: int,
         fov_id: Optional[str] = None,
     ) -> None:
-        self._select_config(config)
+        if not self._config_already_applied(config):
+            self._select_config(config)
 
         # trigger acquisition (including turning on the illumination) and read frame
         camera_illumination_time: Optional[float] = self._camera_service.get_exposure_time()
