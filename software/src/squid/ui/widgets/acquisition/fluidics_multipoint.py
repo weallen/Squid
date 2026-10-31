@@ -27,6 +27,7 @@ from squid.core.events import (
     ActiveAcquisitionTabChanged,
     FluidicsInitialized,
     ScanCoordinatesUpdated,
+    ChannelConfigurationsChanged,
 )
 
 from qtpy.QtCore import QTimer
@@ -44,9 +45,7 @@ from qtpy.QtWidgets import (
     QFileDialog,
     QMessageBox,
     QSizePolicy,
-    QAbstractItemView,
     QWidget,
-    QListWidget,
     QProgressBar,
 )
 from qtpy.QtGui import QIcon
@@ -60,6 +59,11 @@ from _def import (
 )
 from squid.core.config.feature_flags import get_feature_flags
 from squid.ui.widgets.acquisition.coordinates_csv import regions_from_coordinates_dataframe
+from squid.ui.widgets.acquisition.channel_order_widget import (
+    ChannelOrderWidget,
+    load_cached_channel_order,
+    save_cached_channel_order,
+)
 
 
 _FEATURE_FLAGS = get_feature_flags()
@@ -70,6 +74,8 @@ if TYPE_CHECKING:
 
 class MultiPointWithFluidicsWidget(QFrame):
     """A simplified version of WellplateMultiPointWidget for use with fluidics"""
+
+    _CHANNEL_ORDER_CACHE_KEY = "fluidics"
 
     def __init__(
         self,
@@ -146,10 +152,14 @@ class MultiPointWithFluidicsWidget(QFrame):
         self.entry_NZ.setSingleStep(1)
         self.entry_NZ.setValue(1)
 
-        # Channel configurations (populated from initial_channel_configs)
-        self.list_configurations = QListWidget()
-        self.list_configurations.addItems(self._channel_configs)
-        self.list_configurations.setSelectionMode(QAbstractItemView.MultiSelection)
+        # Channel configurations (populated from initial_channel_configs). The selection
+        # order is the acquisition order and is persisted per widget.
+        self.channel_order_widget = ChannelOrderWidget(initial_channels=self._channel_configs, ordered_selection=True)
+        cached_order = load_cached_channel_order(self._CHANNEL_ORDER_CACHE_KEY)
+        if cached_order:
+            self.channel_order_widget.set_selected_channels(cached_order)
+        # Underlying list, kept for callers that only need row access/counts.
+        self.list_configurations = self.channel_order_widget.list_channels
 
         # Reflection AF checkbox
         self.checkbox_withReflectionAutofocus = QCheckBox("Reflection AF")
@@ -227,7 +237,7 @@ class MultiPointWithFluidicsWidget(QFrame):
         grid = QGridLayout()
 
         # Channel configurations on left
-        grid.addWidget(self.list_configurations, 0, 0)
+        grid.addWidget(self.channel_order_widget, 0, 0)
 
         # Options layout
         options_layout = QVBoxLayout()
@@ -275,9 +285,7 @@ class MultiPointWithFluidicsWidget(QFrame):
         self.entry_NZ.valueChanged.connect(self._on_nz_changed)
         self.checkbox_withReflectionAutofocus.toggled.connect(self._on_reflection_af_toggled)
         self.checkbox_usePiezo.toggled.connect(self._on_use_piezo_toggled)
-        self.list_configurations.itemSelectionChanged.connect(
-            self.emit_selected_channels
-        )
+        self.channel_order_widget.selection_changed.connect(self._on_channel_selection_changed)
         # Note: acquisition_finished, signal_acquisition_progress, signal_region_progress
         # are now handled via EventBus subscriptions (see _on_acquisition_state_changed etc.)
         self.eta_timer.timeout.connect(self.update_eta_display)
@@ -293,7 +301,7 @@ class MultiPointWithFluidicsWidget(QFrame):
                 )
                 return
 
-            if not self.list_configurations.selectedItems():
+            if not self._selected_channel_names():
                 self.btn_startAcquisition.setChecked(False)
                 QMessageBox.warning(
                     self, "Warning", "Please select at least one imaging channel"
@@ -358,7 +366,7 @@ class MultiPointWithFluidicsWidget(QFrame):
                 n_t=len(rounds),
             ))
             self._event_bus.publish(SetAcquisitionChannelsCommand(
-                channel_names=[item.text() for item in self.list_configurations.selectedItems()]
+                channel_names=self._selected_channel_names()
             ))
             self._event_bus.publish(SetFluidicsRoundsCommand(rounds=rounds))
             self._event_bus.publish(StartNewExperimentCommand(
@@ -432,14 +440,26 @@ class MultiPointWithFluidicsWidget(QFrame):
             or active_id.startswith(f"{event_id}_")
         )
 
+    def _selected_channel_names(self) -> List[str]:
+        """Selected channels in acquisition order."""
+        return self.channel_order_widget.get_selected_channels_ordered()
+
+    def _on_channel_selection_changed(self, names: List[str]) -> None:
+        save_cached_channel_order(self._CHANNEL_ORDER_CACHE_KEY, names)
+        if self._is_active_tab:
+            self.emit_selected_channels()
+
     def emit_selected_channels(self):
-        """Emit signal with list of selected channel names"""
-        selected_channels = [
-            item.text() for item in self.list_configurations.selectedItems()
-        ]
+        """Emit signal with list of selected channel names (in acquisition order)"""
         self._event_bus.publish(
-            SetAcquisitionChannelsCommand(channel_names=list(selected_channels))
+            SetAcquisitionChannelsCommand(channel_names=self._selected_channel_names())
         )
+
+    @handles(ChannelConfigurationsChanged)
+    def _on_channel_configs_changed(self, event: ChannelConfigurationsChanged) -> None:
+        """Refresh the channel list on config change, keeping the selection order."""
+        self._channel_configs = list(event.configuration_names)
+        self.channel_order_widget.set_channels(self._channel_configs)
 
     def acquisition_is_finished(self):
         """Handle acquisition completion"""

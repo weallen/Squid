@@ -57,8 +57,6 @@ from qtpy.QtWidgets import (
     QSizePolicy,
     QTableWidget,
     QTableWidgetItem,
-    QAbstractItemView,
-    QListWidget,
     QProgressBar,
     QShortcut,
 )
@@ -79,6 +77,11 @@ from squid.core.config.focus_lock import FocusLockConfig
 from squid.core.config.feature_flags import get_feature_flags
 from squid.core.utils import get_last_used_saving_path, save_last_used_saving_path
 from squid.ui.widgets.acquisition.yaml_drop_mixin import AcquisitionYAMLDropMixin
+from squid.ui.widgets.acquisition.channel_order_widget import (
+    ChannelOrderWidget,
+    load_cached_channel_order,
+    save_cached_channel_order,
+)
 from squid.backend.io.acquisition_yaml import (
     AcquisitionYAMLData,
     save_acquisition_preset,
@@ -94,6 +97,8 @@ from squid.ui.widgets.base import error_dialog, check_space_available_with_error
 
 
 class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, EventBusFrame):
+    _CHANNEL_ORDER_CACHE_KEY = "flexible"
+
     def __init__(
         self,
         focusMapWidget,
@@ -178,8 +183,8 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, EventBusFrame):
     @handles(ChannelConfigurationsChanged)
     def _on_channel_configs_changed(self, event: ChannelConfigurationsChanged) -> None:
         """Update channel list when configurations change for current objective."""
-        self.list_configurations.clear()
-        self.list_configurations.addItems(event.configuration_names)
+        self._channel_configs = list(event.configuration_names)
+        self.channel_order_widget.set_channels(self._channel_configs)
 
     @handles(FocusLockModeChanged)
     def _on_focus_lock_mode_changed(self, event: FocusLockModeChanged) -> None:
@@ -351,12 +356,16 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, EventBusFrame):
         self.entry_NZ.setFixedWidth(max_num_width)
         self.entry_Nt.setFixedWidth(max_num_width)
 
-        # Channel configurations (populated from initial_channel_configs)
-        self.list_configurations = QListWidget()
-        self.list_configurations.addItems(self._channel_configs)
-        self.list_configurations.setSelectionMode(
-            QAbstractItemView.MultiSelection
-        )  # ref: https://doc.qt.io/qt-5/qabstractitemview.html#SelectionMode-enum
+        # Channel configurations (populated from initial_channel_configs). The selection
+        # order is the acquisition order and is persisted per widget.
+        self.channel_order_widget = ChannelOrderWidget(
+            initial_channels=self._channel_configs, ordered_selection=True
+        )
+        cached_order = load_cached_channel_order(self._CHANNEL_ORDER_CACHE_KEY)
+        if cached_order:
+            self.channel_order_widget.set_selected_channels(cached_order)
+        # Underlying list, kept for callers that only need row access/counts.
+        self.list_configurations = self.channel_order_widget.list_channels
 
         self.checkbox_withAutofocus = QCheckBox("Contrast AF")
         self.checkbox_withAutofocus.setChecked(
@@ -607,7 +616,7 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, EventBusFrame):
         grid_af.addWidget(self.checkbox_set_z_range)
 
         config_col = QVBoxLayout()
-        config_col.addWidget(self.list_configurations)
+        config_col.addWidget(self.channel_order_widget)
 
         grid_config = QHBoxLayout()
         grid_config.addLayout(config_col)
@@ -688,9 +697,7 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, EventBusFrame):
         self.btn_startAcquisition.clicked.connect(self.toggle_acquisition)
         # Note: acquisition_finished, signal_acquisition_progress, signal_region_progress
         # are now handled via EventBus subscriptions (see _on_acquisition_state_changed etc.)
-        self.list_configurations.itemSelectionChanged.connect(
-            self.emit_selected_channels
-        )
+        self.channel_order_widget.selection_changed.connect(self._on_channel_selection_changed)
         # self.combobox_z_stack.currentIndexChanged.connect(self.signal_z_stacking.emit)
 
         self.eta_timer.timeout.connect(self.update_eta_display)
@@ -978,12 +985,18 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, EventBusFrame):
             self.base_path_is_set = True
             save_last_used_saving_path(save_dir_base)
 
+    def _selected_channel_names(self) -> List[str]:
+        """Selected channels in acquisition order."""
+        return self.channel_order_widget.get_selected_channels_ordered()
+
+    def _on_channel_selection_changed(self, names: List[str]) -> None:
+        save_cached_channel_order(self._CHANNEL_ORDER_CACHE_KEY, names)
+        if getattr(self, "_is_active_tab", False):
+            self.emit_selected_channels()
+
     def emit_selected_channels(self):
-        selected_channels = [
-            item.text() for item in self.list_configurations.selectedItems()
-        ]
         self._publish(
-            SetAcquisitionChannelsCommand(channel_names=list(selected_channels))
+            SetAcquisitionChannelsCommand(channel_names=self._selected_channel_names())
         )
 
     def toggle_acquisition(self, pressed: bool) -> None:
@@ -992,7 +1005,7 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, EventBusFrame):
             self.btn_startAcquisition.setChecked(False)
             error_dialog("Please choose base saving directory first")
             return
-        if not self.list_configurations.selectedItems():  # no channel selected
+        if not self._selected_channel_names():  # no channel selected
             self.btn_startAcquisition.setChecked(False)
             error_dialog("Please select at least one imaging channel first")
             return
@@ -1050,7 +1063,7 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, EventBusFrame):
                 base_path=self.lineEdit_savingDir.text()
             ))
             self._publish(SetAcquisitionChannelsCommand(
-                channel_names=[item.text() for item in self.list_configurations.selectedItems()]
+                channel_names=self._selected_channel_names()
             ))
             self._publish_focus_lock_params()
             self._publish(StartNewExperimentCommand(
@@ -1481,7 +1494,7 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, EventBusFrame):
             self._log.debug(self.location_list)
 
     def on_snap_images(self):
-        if not self.list_configurations.selectedItems():
+        if not self._selected_channel_names():
             QMessageBox.warning(
                 self, "Warning", "Please select at least one imaging channel"
             )
@@ -1489,7 +1502,7 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, EventBusFrame):
 
         # Set the selected channels and acquisition parameters via events
         self._publish(SetAcquisitionChannelsCommand(
-            channel_names=[item.text() for item in self.list_configurations.selectedItems()]
+            channel_names=self._selected_channel_names()
         ))
 
         z = self._cached_z_mm
@@ -1571,7 +1584,7 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, EventBusFrame):
             self.entry_deltaY.setEnabled(enabled)
         else:
             self.entry_overlap.setEnabled(enabled)
-        self.list_configurations.setEnabled(enabled)
+        self.channel_order_widget.setEnabled(enabled)
         self.checkbox_genAFMap.setEnabled(enabled)
         self.checkbox_useFocusMap.setEnabled(enabled)
         self.checkbox_withAutofocus.setEnabled(enabled)
@@ -1849,11 +1862,7 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, EventBusFrame):
         experiment_path = os.path.join(base_path, experiment_id)
 
         # Collect selected channels
-        selected_channels = [
-            self.list_configurations.item(i).text()
-            for i in range(self.list_configurations.count())
-            if self.list_configurations.item(i).isSelected()
-        ]
+        selected_channels = self._selected_channel_names()
 
         try:
             save_acquisition_preset(
@@ -1970,7 +1979,6 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, EventBusFrame):
             self.entry_deltaY,
             self.checkbox_withAutofocus,
             self.checkbox_withReflectionAutofocus,
-            self.list_configurations,
         ]
         if self.use_overlap:
             widgets_to_block.append(self.entry_overlap)
@@ -2014,12 +2022,8 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, EventBusFrame):
                 "maintain_threshold_um": yaml_data.focus_lock_maintain_threshold_um,
             })
 
-            # Channels - select matching channels in list
-            self.list_configurations.clearSelection()
-            for i in range(self.list_configurations.count()):
-                item = self.list_configurations.item(i)
-                if item and item.text() in yaml_data.channel_names:
-                    item.setSelected(True)
+            # Channels - restore selection AND order from the YAML
+            self.channel_order_widget.set_selected_channels(yaml_data.channel_names)
 
             # Load positions if present
             if yaml_data.flexible_positions:

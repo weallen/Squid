@@ -74,9 +74,7 @@ from qtpy.QtWidgets import (
     QFileDialog,
     QMessageBox,
     QSizePolicy,
-    QAbstractItemView,
     QWidget,
-    QListWidget,
     QProgressBar,
 )
 from qtpy.QtGui import QIcon
@@ -95,6 +93,11 @@ from _def import (
 from squid.core.config.feature_flags import get_feature_flags
 from squid.core.utils import get_last_used_saving_path, save_last_used_saving_path
 from squid.ui.widgets.acquisition.yaml_drop_mixin import AcquisitionYAMLDropMixin
+from squid.ui.widgets.acquisition.channel_order_widget import (
+    ChannelOrderWidget,
+    load_cached_channel_order,
+    save_cached_channel_order,
+)
 from squid.ui.widgets.acquisition.coordinates_csv import (
     coordinate_rows_for_save,
     parfocal_adjusted_z_mm,
@@ -113,6 +116,8 @@ from squid.ui.widgets.wellplate import WellSelectionWidget
 
 
 class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, EventBusFrame):
+    _CHANNEL_ORDER_CACHE_KEY = "wellplate"
+
     def __init__(
         self,
         event_bus: "UIEventBus",
@@ -358,8 +363,7 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, EventBusFrame):
         if event.objective_name and event.objective_name != self._current_objective:
             return
         self._channel_configs = list(event.configuration_names)
-        self.list_configurations.clear()
-        self.list_configurations.addItems(self._channel_configs)
+        self.channel_order_widget.set_channels(self._channel_configs)
 
     def add_components(self):
         self.entry_well_coverage = QDoubleSpinBox()
@@ -490,10 +494,16 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, EventBusFrame):
         )
         self.combobox_z_stack.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
-        # Channel configurations (populated from initial_channel_configs)
-        self.list_configurations = QListWidget()
-        self.list_configurations.addItems(self._channel_configs)
-        self.list_configurations.setSelectionMode(QAbstractItemView.MultiSelection)
+        # Channel configurations (populated from initial_channel_configs). The selection
+        # order is the acquisition order and is persisted per widget.
+        self.channel_order_widget = ChannelOrderWidget(
+            initial_channels=self._channel_configs, ordered_selection=True
+        )
+        cached_order = load_cached_channel_order(self._CHANNEL_ORDER_CACHE_KEY)
+        if cached_order:
+            self.channel_order_widget.set_selected_channels(cached_order)
+        # Underlying list, kept for callers that only need row access/counts.
+        self.list_configurations = self.channel_order_widget.list_channels
 
         # Add a combo box for shape selection
         self.combobox_shape = QComboBox()
@@ -847,7 +857,7 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, EventBusFrame):
 
         # Configuration list
         config_row = 3 if _FEATURE_FLAGS.is_enabled("SUPPORT_LASER_AUTOFOCUS") else 2
-        grid.addWidget(self.list_configurations, config_row, 0)
+        grid.addWidget(self.channel_order_widget, config_row, 0)
 
         # Options and Start button
         options_layout = QVBoxLayout()
@@ -933,9 +943,7 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, EventBusFrame):
         self.checkbox_useFocusMap.toggled.connect(self._on_use_focus_map_toggled)
         self.checkbox_usePiezo.toggled.connect(self._on_use_piezo_toggled)
         self.checkbox_skipSaving.toggled.connect(self._on_skip_saving_toggled)
-        self.list_configurations.itemSelectionChanged.connect(
-            self.emit_selected_channels
-        )
+        self.channel_order_widget.selection_changed.connect(self._on_channel_selection_changed)
         # Note: acquisition_finished, signal_acquisition_progress, signal_region_progress
         # are now handled via EventBus subscriptions (see _on_acquisition_state_changed etc.)
         self.eta_timer.timeout.connect(self.update_eta_display)
@@ -978,9 +986,8 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, EventBusFrame):
             self.save_multipoint_widget_config_to_cache
         )
         self.entry_NZ.valueChanged.connect(self.save_multipoint_widget_config_to_cache)
-        self.list_configurations.itemSelectionChanged.connect(
-            self.save_multipoint_widget_config_to_cache
-        )
+        # Channel selection/order is persisted by _on_channel_selection_changed (channel
+        # sequence cache), not by this settings cache.
         self.checkbox_withAutofocus.toggled.connect(
             self.save_multipoint_widget_config_to_cache
         )
@@ -1011,9 +1018,6 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, EventBusFrame):
                 "nt": self.entry_Nt.value(),
                 "dz": self.entry_deltaZ.value(),
                 "nz": self.entry_NZ.value(),
-                "selected_channels": [
-                    item.text() for item in self.list_configurations.selectedItems()
-                ],
                 "autofocus_mode": self._current_autofocus_mode().value,
             }
 
@@ -1044,7 +1048,7 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, EventBusFrame):
             self.entry_Nt.blockSignals(True)
             self.entry_deltaZ.blockSignals(True)
             self.entry_NZ.blockSignals(True)
-            self.list_configurations.blockSignals(True)
+            self.channel_order_widget.blockSignals(True)
             self.checkbox_withAutofocus.blockSignals(True)
             self.checkbox_withReflectionAutofocus.blockSignals(True)
 
@@ -1089,14 +1093,12 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, EventBusFrame):
             self.entry_deltaZ.setValue(settings.get("dz", 1.0))
             self.entry_NZ.setValue(settings.get("nz", 1))
 
-            # Restore selected channels
-            selected_channels = settings.get("selected_channels", [])
-            if selected_channels:
-                self.list_configurations.clearSelection()
-                for i in range(self.list_configurations.count()):
-                    item = self.list_configurations.item(i)
-                    if item.text() in selected_channels:
-                        item.setSelected(True)
+            # Channel selection/order is restored from the channel sequence cache at
+            # construction; fall back to this cache's legacy (unordered) entry once.
+            if load_cached_channel_order(self._CHANNEL_ORDER_CACHE_KEY) is None:
+                selected_channels = settings.get("selected_channels", [])
+                if selected_channels:
+                    self.channel_order_widget.set_selected_channels(selected_channels)
 
             # Restore autofocus settings
             autofocus_mode = AutofocusMode(settings.get("autofocus_mode", AutofocusMode.NONE.value))
@@ -1117,7 +1119,7 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, EventBusFrame):
             self.entry_Nt.blockSignals(False)
             self.entry_deltaZ.blockSignals(False)
             self.entry_NZ.blockSignals(False)
-            self.list_configurations.blockSignals(False)
+            self.channel_order_widget.blockSignals(False)
             self.checkbox_withAutofocus.blockSignals(False)
             self.checkbox_withReflectionAutofocus.blockSignals(False)
 
@@ -2187,7 +2189,7 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, EventBusFrame):
             )
             return
 
-        if not self.list_configurations.selectedItems():
+        if not self._selected_channel_names():
             self.btn_startAcquisition.setChecked(False)
             QMessageBox.warning(
                 self, "Warning", "Please select at least one imaging channel"
@@ -2257,7 +2259,7 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, EventBusFrame):
                 overlap_percent=self.entry_overlap.value(),
             ))
             self._publish(SetAcquisitionChannelsCommand(
-                channel_names=[item.text() for item in self.list_configurations.selectedItems()]
+                channel_names=self._selected_channel_names()
             ))
             self._publish_focus_lock_params()
             self._publish(StartNewExperimentCommand(
@@ -2430,9 +2432,7 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, EventBusFrame):
         experiment_path = os.path.join(base_path, experiment_id)
 
         # Collect selected channels
-        selected_channels = [
-            item.text() for item in self.list_configurations.selectedItems()
-        ]
+        selected_channels = self._selected_channel_names()
 
         try:
             save_acquisition_preset(
@@ -2515,7 +2515,7 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, EventBusFrame):
             )
 
     def on_snap_images(self):
-        if not self.list_configurations.selectedItems():
+        if not self._selected_channel_names():
             QMessageBox.warning(
                 self, "Warning", "Please select at least one imaging channel"
             )
@@ -2523,7 +2523,7 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, EventBusFrame):
 
         # Set the selected channels and acquisition parameters via events
         self._publish(SetAcquisitionChannelsCommand(
-            channel_names=[item.text() for item in self.list_configurations.selectedItems()]
+            channel_names=self._selected_channel_names()
         ))
 
         z = self._cached_z_mm
@@ -2582,12 +2582,18 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, EventBusFrame):
         self.entry_deltaZ.setValue(deltaZ)
         self._publish(SetAcquisitionParametersCommand(delta_z_um=deltaZ))
 
+    def _selected_channel_names(self) -> List[str]:
+        """Selected channels in acquisition order."""
+        return self.channel_order_widget.get_selected_channels_ordered()
+
+    def _on_channel_selection_changed(self, names: List[str]) -> None:
+        save_cached_channel_order(self._CHANNEL_ORDER_CACHE_KEY, names)
+        if getattr(self, "_is_active_tab", False):
+            self.emit_selected_channels()
+
     def emit_selected_channels(self):
-        selected_channels = [
-            item.text() for item in self.list_configurations.selectedItems()
-        ]
         self._publish(
-            SetAcquisitionChannelsCommand(channel_names=list(selected_channels))
+            SetAcquisitionChannelsCommand(channel_names=self._selected_channel_names())
         )
 
     def on_load_or_clear_coordinates_clicked(self):
@@ -2929,7 +2935,6 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, EventBusFrame):
             self.entry_scan_size,
             self.checkbox_withAutofocus,
             self.checkbox_withReflectionAutofocus,
-            self.list_configurations,
             self.combobox_xy_mode,
             self.checkbox_focus_lock,
             self.spinbox_buffer_length,
@@ -2983,12 +2988,8 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, EventBusFrame):
             if index >= 0:
                 self.combobox_xy_mode.setCurrentIndex(index)
 
-            # Channels - select matching channels in list
-            self.list_configurations.clearSelection()
-            for i in range(self.list_configurations.count()):
-                item = self.list_configurations.item(i)
-                if item and item.text() in yaml_data.channel_names:
-                    item.setSelected(True)
+            # Channels - restore selection AND order from the YAML
+            self.channel_order_widget.set_selected_channels(yaml_data.channel_names)
 
             # Load well regions if present
             if yaml_data.wellplate_regions:
