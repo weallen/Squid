@@ -10,6 +10,7 @@ from typing import Optional, TYPE_CHECKING, Tuple, List
 
 import numpy as np
 
+import _def
 import squid.core.logging
 from squid.backend.controllers.base import BaseController
 from squid.core.mode_gate import GlobalMode, GlobalModeGate
@@ -412,6 +413,7 @@ class _TrackingWorker(threading.Thread):
                         save_directory=self._experiment_dir,
                         config=self._cfg.configuration,
                         is_color=is_color,
+                        tiff_compression_level=_def.TIFF_COMPRESSION_LEVEL,
                     )
 
                 if self._csv_file is not None:

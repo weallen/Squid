@@ -1,5 +1,7 @@
 import threading
 
+import pytest
+
 import _def
 import squid.backend.microscope as microscope
 from squid.backend.controllers.multipoint import MultiPointController
@@ -131,6 +133,35 @@ def test_multi_point_controller_disk_space_estimate():
     _def.MERGE_CHANNELS = True
     after_size = mpc.get_estimated_acquisition_disk_storage()
     assert after_size > before_size
+
+
+@pytest.mark.parametrize("trigger_mode", [_def.TriggerMode.SOFTWARE, _def.TriggerMode.HARDWARE])
+@pytest.mark.parametrize("pseudo_color", [False, True])
+def test_disk_space_estimate_does_not_touch_camera(monkeypatch, trigger_mode, pseudo_color):
+    """The estimate uses a synthetic worst-case image; it must never trigger or read the camera (55236d92)."""
+    scope = microscope.Microscope.build_from_global_config(True)
+    mpc = ts.get_test_multi_point_controller(microscope=scope)
+    monkeypatch.setattr(_def, "MERGE_CHANNELS", False)
+    monkeypatch.setattr(_def, "SAVE_IN_PSEUDO_COLOR", pseudo_color)
+    mpc.liveController.trigger_mode = trigger_mode
+
+    camera_calls = []
+    camera_service = mpc._camera_service
+    for name in ("send_trigger", "read_camera_frame", "start_streaming", "enable_callbacks"):
+        monkeypatch.setattr(camera_service, name, lambda *a, _n=name, **k: camera_calls.append(_n))
+
+    configs = mpc.channelConfigurationManager.get_configurations(mpc.objectiveStore.current_objective)
+    mpc.set_selected_configurations([configs[0].name])
+    mpc.scanCoordinates.clear_regions()
+    x_min = mpc.stage.get_config().X_AXIS.MIN_POSITION + 0.01
+    y_min = mpc.stage.get_config().Y_AXIS.MIN_POSITION + 0.01
+    z_mid = (mpc.stage.get_config().Z_AXIS.MAX_POSITION - mpc.stage.get_config().Z_AXIS.MIN_POSITION) / 2.0
+    mpc.scanCoordinates.add_flexible_region(1, x_min, y_min, z_mid, 1, 1, 0)
+
+    width, height = camera_service.get_crop_size()
+    # At least one incompressible 16-bit frame per image.
+    assert mpc.get_estimated_acquisition_disk_storage() >= width * height * 2
+    assert camera_calls == []
 
 
 class AcquisitionTracker:

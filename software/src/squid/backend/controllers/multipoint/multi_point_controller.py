@@ -657,28 +657,6 @@ class MultiPointController(StateMachine[AcquisitionControllerState]):
                 "Not properly configured for an acquisition, cannot calculate image count."
             )
 
-    def _temporary_get_an_image_hack(self) -> Tuple[Optional[np.ndarray], bool]:
-        was_streaming: bool = self._camera_service.get_is_streaming()
-        callbacks_were_enabled: bool = self._camera_service.get_callbacks_enabled()
-        self._camera_service.enable_callbacks(False)
-        test_frame: Optional[CameraFrame] = None
-        if not was_streaming:
-            self._camera_service.start_streaming()
-        try:
-            if (
-                self.liveController.trigger_mode == _def.TriggerMode.SOFTWARE
-                or self.liveController.trigger_mode == _def.TriggerMode.HARDWARE
-            ):
-                self._camera_service.send_trigger()
-            test_frame = self._camera_service.read_camera_frame()
-        finally:
-            self._camera_service.enable_callbacks(callbacks_were_enabled)
-            if not was_streaming:
-                self._camera_service.stop_streaming()
-        return (
-            (test_frame.frame, test_frame.is_color()) if test_frame else (None, False)
-        )
-
     def get_estimated_acquisition_disk_storage(self) -> int:
         """
         This does its best to return the number of bytes needed to store the settings for the currently
@@ -697,31 +675,19 @@ class MultiPointController(StateMachine[AcquisitionControllerState]):
             self.objectiveStore.current_objective
         )[0]
 
-        # Our best bet is to grab an image, and use that for our size estimate.
-        test_image: Optional[np.ndarray] = None
-        is_color: bool = True
-        try:
-            test_image, is_color = self._temporary_get_an_image_hack()
-        except Exception:
-            self._log.exception(
-                "Couldn't capture image from camera for size estimate, using worst cast image."
-            )
-            # Not ideal that we need to catch Exception, but the camera implementations vary wildly...
-            pass
-
-        if test_image is None:
-            is_color = squid.core.abc.CameraPixelFormat.is_color_format(
-                self._camera_service.get_pixel_format()
-            )
-            # Do our best to create a fake image with the correct properties.
-            width, height = self._camera_service.get_crop_size()
-            if width is None or height is None:
-                width, height = self._camera_service.get_resolution()
-            if width is None or height is None:
-                raise RuntimeError("Camera resolution unavailable for disk usage estimate")
-            test_image = np.random.randint(
-                2**16 - 1, size=(height, width, (3 if is_color else 1)), dtype=np.uint16
-            )
+        # A worst-case image with the camera's size and format: random 16-bit data, which compression can't shrink.
+        # This used to trigger the camera for a real frame (~1.2 s plus a stray trigger at every acquisition start;
+        # in hardware trigger mode only the acquisition delivers frames, in software mode it was a dark frame that
+        # compresses better than real images).
+        is_color = squid.core.abc.CameraPixelFormat.is_color_format(self._camera_service.get_pixel_format())
+        width, height = self._camera_service.get_crop_size()
+        if width is None or height is None:
+            width, height = self._camera_service.get_resolution()
+        if width is None or height is None:
+            raise RuntimeError("Camera resolution unavailable for disk usage estimate")
+        # Shaped like the camera's frames: (height, width) monochrome, which pseudocolor saving turns into RGB.
+        shape = (height, width, 3) if is_color else (height, width)
+        test_image = np.random.randint(2**16 - 1, size=shape, dtype=np.uint16)
 
         # Depending on settings, we modify the image before saving.  This means we need to actually save an image
         # to see how much disk space it takes up.  This can be very wrong (eg: if we compress during saving, then
@@ -731,7 +697,12 @@ class MultiPointController(StateMachine[AcquisitionControllerState]):
             test_config = first_config
             size_before = utils.get_directory_disk_usage(pathlib.Path(temp_save_dir))
             utils_acquisition.save_image(
-                test_image, file_id, temp_save_dir, test_config, is_color
+                test_image,
+                file_id,
+                temp_save_dir,
+                test_config,
+                is_color,
+                tiff_compression_level=_def.TIFF_COMPRESSION_LEVEL,
             )
             size_after = utils.get_directory_disk_usage(pathlib.Path(temp_save_dir))
 

@@ -2236,3 +2236,38 @@ class TestZarrWriterFovPositions:
             zarr_json = json.load(f)
 
         assert "fov_positions" not in zarr_json["attributes"]["_squid"]
+
+
+def test_save_zarr_job_uses_the_settings_it_carries(tmp_path, monkeypatch):
+    """The job runs in a subprocess whose _def can predate a change made in Preferences (upstream aa9107d9)."""
+    import _def
+    from squid.backend.controllers.multipoint.job_processing import SaveSettings
+
+    monkeypatch.setattr(_def, "SIMULATED_DISK_IO_ENABLED", False)
+    monkeypatch.setattr(_def, "ZARR_CHUNK_MODE", ZarrChunkMode.FULL_FRAME)
+    monkeypatch.setattr(_def, "ZARR_COMPRESSION", ZarrCompression.FAST)
+    SaveZarrJob.clear_writers()
+
+    job = SaveZarrJob(
+        capture_info=make_test_capture_info(),
+        capture_image=JobImage(image_array=np.ones((512, 512), dtype=np.uint16)),
+        save_settings=SaveSettings(zarr_chunk_mode=ZarrChunkMode.TILED_256, zarr_compression=ZarrCompression.BEST),
+    )
+    job.zarr_writer_info = ZarrWriterInfo(
+        base_path=str(tmp_path), t_size=1, c_size=1, z_size=1, channel_names=["BF"], pixel_size_um=1.0
+    )
+    try:
+        job.run()
+    finally:
+        SaveZarrJob.clear_writers()
+
+    written = None
+    for zarr_json in tmp_path.rglob("zarr.json"):
+        with open(zarr_json) as f:
+            attrs = json.load(f).get("attributes", {})
+        if "chunk_mode" in attrs.get("_squid", {}):
+            written = attrs["_squid"]
+            break
+    assert written is not None, "no zarr.json with _squid chunk_mode metadata was written"
+    assert written["chunk_mode"] == ZarrChunkMode.TILED_256.value
+    assert written["compression"] == ZarrCompression.BEST.value
