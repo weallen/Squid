@@ -61,6 +61,7 @@ from squid.backend.io.stream_handler import StreamHandler
 from squid.backend.microcontroller import Microcontroller
 from squid.core.abc import AbstractCamera, AbstractFilterWheelController
 import squid.backend.microscope
+import squid.backend.drivers.stages.stage_utils as stage_utils
 import squid.ui.widgets as widgets
 import pyqtgraph.dockarea as dock
 import squid.core.logging
@@ -359,9 +360,10 @@ class HighContentScreeningGui(QMainWindow):
         if self._ui_event_bus is not None:
             self._subscriptions = auto_subscribe(self, self._ui_event_bus)
 
-        if HOMING_ENABLED_X and HOMING_ENABLED_Y and HOMING_ENABLED_Z:
-            # Hardware-owned cached-position restore runs in ApplicationContext._initialize_hardware().
-            # Widgets may still need to initialize their own Z tracking state.
+        if HOMING_ENABLED_X and HOMING_ENABLED_Y and stage_utils.z_is_referenced():
+            # Hardware-owned cached-position restore runs in ApplicationContext._initialize_hardware()
+            # (X/Y whenever X and Y are homed, Z only when referenced). Widgets initialize their own
+            # Z tracking state only when Z is referenced.
             if ENABLE_WELLPLATE_MULTIPOINT:
                 self.wellplateMultiPointWidget.init_z()
             self.flexibleMultiPointWidget.init_z()

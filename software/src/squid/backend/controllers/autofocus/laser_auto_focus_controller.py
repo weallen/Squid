@@ -331,6 +331,17 @@ class LaserAutofocusController(BaseController):
         """
         self._set_camera_roi(0, 0, 3088, 2064)
 
+        # The crop sizes have no control in the settings panel, so take them from the machine configuration (.ini).
+        # A loaded per-objective profile still holds the sizes it was saved with until the next Initialize.
+        self.laser_af_properties = self.laser_af_properties.model_copy(
+            update={
+                "width": _def.LASER_AF_CROP_WIDTH,
+                "height": _def.LASER_AF_CROP_HEIGHT,
+                "initialize_crop_width": _def.LASER_AF_INITIALIZE_CROP_WIDTH,
+                "initialize_crop_height": _def.LASER_AF_INITIALIZE_CROP_HEIGHT,
+            }
+        )
+
         # update camera settings
         self._set_camera_exposure(
             self.laser_af_properties.focus_camera_exposure_time_ms

@@ -3,7 +3,6 @@ Tests for stage functionality including SimulatedStage and CephlaStage.
 """
 
 import pytest
-import tempfile
 
 from squid.backend.drivers.stages.simulated import SimulatedStage
 import squid.core.config
@@ -194,9 +193,11 @@ def test_get_stage_returns_simulated(stage_config):
 # ============================================================================
 
 
-def test_position_caching():
+def test_position_caching(tmp_path):
     """Test position caching and retrieval."""
-    (unused_temp_fd, temp_cache_path) = tempfile.mkstemp(".cache", "squid_testing_")
+    # A path, not mkstemp's open handle: cache_position() replaces the file atomically, which Windows refuses while
+    # another handle has it open.
+    temp_cache_path = str(tmp_path / "last_coords.cache")
 
     # Use 6 figures after the decimal so we test that we can capture nanometers
     p = squid.core.abc.Pos(x_mm=11.111111, y_mm=22.222222, z_mm=1.333333, theta_rad=None)

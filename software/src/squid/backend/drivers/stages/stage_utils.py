@@ -1,4 +1,5 @@
 from typing import Optional, Callable
+import math
 import os
 
 import squid.core.logging
@@ -9,6 +10,7 @@ import squid.core.utils.hardware_utils
 
 _log = squid.core.logging.get_logger(__package__)
 _DEFAULT_CACHE_PATH = "cache/last_coords.txt"
+_MAX_CACHE_BYTES = 4096
 
 
 def get_stage(
@@ -60,53 +62,82 @@ def get_stage(
         )
 
 
-"""
-Attempts to load a cached stage position and return it.
-"""
-
-
 def get_cached_position(cache_path=_DEFAULT_CACHE_PATH) -> Optional[Pos]:
+    """Load the stage position written by cache_position(), or None if there is no usable one.
+
+    A cache file that cannot be read or parsed (truncated by a crash mid-write, edited by hand,
+    filled with garbage, ...) is treated exactly like a missing one: a warning is logged and None
+    is returned, so an unreadable cache cannot stop the software from starting.  A well-formed but
+    stale position is returned as-is; it is not range checked against the stage's axis limits.
+    """
     if not os.path.isfile(cache_path):
         _log.debug(f"Cache file '{cache_path}' not found, no cached pos found.")
         return None
-    with open(cache_path, "r") as f:
-        for line in f:
-            try:
-                x, y, z = line.strip("\n").strip().split(",")
-                x = float(x)
-                y = float(y)
-                z = float(z)
-                return Pos(x_mm=x, y_mm=y, z_mm=z, theta_rad=None)
-            except RuntimeError as e:
-                raise e
-                pass
-    return None
+
+    try:
+        with open(cache_path, "r") as f:
+            # A valid cache is one short line, so cap the read: a stray large file at this path
+            # must not pull hundreds of MB into memory during startup.  Read one byte past the cap
+            # so an oversized file is rejected below instead of parsed from its truncated prefix.
+            contents = f.read(_MAX_CACHE_BYTES + 1)
+    except (OSError, UnicodeDecodeError) as e:
+        _log.warning(
+            f"Cached position file '{cache_path}' could not be read ({e}). "
+            "Continuing as if there is no cached position."
+        )
+        return None
+
+    try:
+        if len(contents) > _MAX_CACHE_BYTES:
+            raise ValueError(f"file is larger than {_MAX_CACHE_BYTES} bytes")
+        x, y, z = (float(v) for v in contents.strip().split(","))
+        if not all(math.isfinite(v) for v in (x, y, z)):
+            raise ValueError("non-finite coordinate")
+    except ValueError as e:
+        _log.warning(
+            f"Cached position file '{cache_path}' is corrupted ({e}), contents={contents[:100].strip()!r}. "
+            "Continuing as if there is no cached position."
+        )
+        return None
+
+    return Pos(x_mm=x, y_mm=y, z_mm=z, theta_rad=None)
 
 
-"""
-Write out the current x, y, z position, in mm, so we can use it later as a cached position.
-"""
+def z_is_referenced() -> bool:
+    """True when Z is an absolute position, i.e. the Cephla Z is homed at startup.
+
+    Otherwise Z is the raw firmware step count: 0 at boot on an XY-only Cephla stage (homing_enabled_z = False).
+    Upstream also counts a PI V-308 focus stage as referenced; this fork has no PI stage support.
+    """
+    return bool(_def.HOMING_ENABLED_Z)
 
 
-def cache_position(pos: Pos, stage_config: StageConfig, cache_path=_DEFAULT_CACHE_PATH):
+def cache_position(
+    pos: Pos, stage_config: StageConfig, cache_path=_DEFAULT_CACHE_PATH, validate_z: bool = True
+) -> None:
+    """Write out the current x, y, z position, in mm, so we can use it later as a cached position.
+
+    Raises ValueError, writing nothing, when a validated axis is outside its soft limits.  X and Y are always
+    validated; Z is skipped when validate_z=False (see z_is_referenced).
+    """
     if stage_config is not None:  # StageConfig not implemented for Prior stage
-        x_min = stage_config.X_AXIS.MIN_POSITION
-        x_max = stage_config.X_AXIS.MAX_POSITION
-        y_min = stage_config.Y_AXIS.MIN_POSITION
-        y_max = stage_config.Y_AXIS.MAX_POSITION
-        z_min = stage_config.Z_AXIS.MIN_POSITION
-        z_max = stage_config.Z_AXIS.MAX_POSITION
-        if not (
-            x_min <= pos.x_mm <= x_max
-            and y_min <= pos.y_mm <= y_max
-            and z_min <= pos.z_mm <= z_max
-        ):
-            raise ValueError(
-                f"Position {pos} is not cacheable because it is outside of the min/max of at least one axis. x_range=({x_min}, {x_max}), y_range=({y_min}, {y_max}), z_range=({z_min}, {z_max})"
-            )
-    with open(cache_path, "w") as f:
-        _log.debug(f"Writing position={pos} to cache path='{cache_path}'")
+        axes = [("x", stage_config.X_AXIS, pos.x_mm), ("y", stage_config.Y_AXIS, pos.y_mm)]
+        if validate_z:
+            axes.append(("z", stage_config.Z_AXIS, pos.z_mm))
+        out_of_range = [
+            f"{name}={value} not in ({axis.MIN_POSITION}, {axis.MAX_POSITION})"
+            for name, axis, value in axes
+            if not axis.MIN_POSITION <= value <= axis.MAX_POSITION
+        ]
+        if out_of_range:
+            raise ValueError(f"Position {pos} is not cacheable, outside of the axis min/max: {'; '.join(out_of_range)}")
+    _log.debug(f"Writing position={pos} to cache path='{cache_path}'")
+    # Atomic write: a crash between truncating and writing would leave a partial file that
+    # get_cached_position() can only discard, losing the position it was meant to preserve.
+    tmp_path = f"{cache_path}.tmp"
+    with open(tmp_path, "w") as f:
         f.write(",".join([str(pos.x_mm), str(pos.y_mm), str(pos.z_mm)]))
+    os.replace(tmp_path, cache_path)
 
 
 def _move_to_loading_position_impl(stage: AbstractStage, is_wellplate: bool):

@@ -61,6 +61,20 @@ def remove_background(image: np.ndarray, kernel_size: int = 50) -> np.ndarray:
     return cv2.morphologyEx(image, cv2.MORPH_TOPHAT, kernel)
 
 
+# The keys squid.core.utils.hardware_utils.find_spot_location reads from its params dict.
+SPOT_DETECTION_PARAM_KEYS = frozenset(
+    {
+        "y_window",
+        "x_window",
+        "min_peak_width",
+        "min_peak_distance",
+        "min_peak_prominence",
+        "intensity_threshold",
+        "spot_spacing",
+    }
+)
+
+
 def detect_spot(
     image: np.ndarray,
     params: Dict[str, Any],
@@ -88,6 +102,11 @@ def detect_spot(
     Returns:
         SpotDetectionResult with spot location and metrics, or None if detection fails.
     """
+    # A misspelled key would otherwise be ignored by find_spot_location and its default used instead.
+    unknown_keys = set(params or {}) - SPOT_DETECTION_PARAM_KEYS
+    if unknown_keys:
+        raise ValueError(f"Unknown spot detection parameters: {sorted(unknown_keys)}")
+
     full_height, full_width = image.shape[:2]
     processed = image.copy()
 
