@@ -85,6 +85,7 @@ from squid.core.events import (
     ActiveAcquisitionTabChanged,
     AutoLevelCommand,
     LiveStateChanged,
+    SnapStateChanged,
     ManualShapeDrawingEnabledChanged,
     ManualShapesChanged,
     ClearManualShapesCommand,
@@ -437,7 +438,7 @@ class HighContentScreeningGui(QMainWindow):
             self._controllers.stream_handler if self._controllers else None
         )
         self.streamHandler = QtStreamHandler(
-            accept_new_frame_fn=lambda: self.liveController.is_live,
+            accept_new_frame_fn=lambda: self.liveController.should_display_frames(),
             handler=core_stream_handler,
         )
         if self._controllers and self._controllers.autofocus:
@@ -1437,6 +1438,14 @@ class HighContentScreeningGui(QMainWindow):
                 self.alignmentWidget.enable()
             else:
                 self.alignmentWidget.disable()
+
+    @handles(SnapStateChanged)
+    def _on_snap_state_changed(self, event: SnapStateChanged) -> None:
+        """Bring the live view forward so a snapped frame is actually visible."""
+        if getattr(event, "camera", "main") != "main":
+            return
+        if hasattr(self, "imageDisplayTabs") and event.is_snapping:
+            self.imageDisplayTabs.setCurrentIndex(0)
 
     @handles(AcquisitionCoordinates)
     def _on_acquisition_coordinates(self, event: AcquisitionCoordinates) -> None:

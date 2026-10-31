@@ -787,6 +787,31 @@ class MultiPointController(StateMachine[AcquisitionControllerState]):
 
         return mosaic_width * mosaic_height * bytes_per_pixel * num_channels
 
+    # A wedged MCU (see LiveController.trigger_acquisition) clears a few seconds after live triggers stop.
+    _MCU_IDLE_WAIT_S: float = 15.0
+
+    def _wait_for_mcu_idle_before_start(self) -> None:
+        """Wait (up to _MCU_IDLE_WAIT_S) for the MCU to go idle before the worker moves the stage.
+
+        Raises RuntimeError if it stays busy, which aborts the start through the normal failed-start path.
+        """
+        peripheral = self._peripheral_service
+        is_busy = getattr(peripheral, "is_mcu_busy", None)
+        if is_busy is None or not is_busy():
+            return
+        self._log.warning("Microcontroller busy at acquisition start; waiting for it to go idle.")
+        try:
+            peripheral.wait_till_operation_is_completed(self._MCU_IDLE_WAIT_S)
+        except TimeoutError as exc:
+            self._log.error(
+                f"Microcontroller still busy after {self._MCU_IDLE_WAIT_S} s - home the stage or "
+                "power-cycle the controller. Aborting the acquisition start."
+            )
+            # Nothing has moved yet; don't send restore moves into a wedged MCU during cleanup.
+            if self._acquisition_context is not None:
+                self._acquisition_context.start_position = None
+            raise RuntimeError("Microcontroller busy; acquisition not started") from exc
+
     def run_acquisition(
         self,
         acquire_current_fov: bool = False,
@@ -855,6 +880,9 @@ class MultiPointController(StateMachine[AcquisitionControllerState]):
                 self._acquisition_context.callbacks_enabled
             )
             self._start_position = self._acquisition_context.start_position
+            # stop_live() never raises here (LiveController forces STOPPED on a failed stop, after
+            # its trigger timer is already cancelled), but a wedged MCU can still be draining.
+            self._wait_for_mcu_idle_before_start()
 
             if self._config.zstack.z_range is None:
                 z_range = (

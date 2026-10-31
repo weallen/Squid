@@ -124,6 +124,16 @@ class PeripheralService(BaseService):
             if self._microcontroller is not None:
                 self._microcontroller.enable_joystick(enabled)
 
+    def is_mcu_busy(self) -> bool:
+        """True while the microcontroller is executing a command (e.g. a stage move).
+
+        Deliberately lock-free: it is a single flag read, and callers such as the live trigger
+        loop must not block behind a long wait_till_operation_is_completed() holding the lock.
+        """
+        if self._microcontroller is None:
+            return False
+        return bool(self._microcontroller.is_busy())
+
     def wait_till_operation_is_completed(self, timeout_s: float = 10.0) -> None:
         """Wait for microcontroller operations to complete."""
         with self._lock:

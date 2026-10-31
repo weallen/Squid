@@ -33,7 +33,39 @@ from squid.ui.widgets.camera._common import (
     handles,
     squid,
 )
+from qtpy.QtCore import QSize
+from qtpy.QtWidgets import QWidget
+
 from squid.core.config.feature_flags import get_feature_flags
+from squid.core.events import SnapFrameCommand, SnapStateChanged
+
+
+class SingleSlotButtonRow(QWidget):
+    """Buttons in a row that together advertise the footprint of a single button.
+
+    Lets several buttons take over a layout slot one button used to occupy without adding to
+    the panel's minimum or preferred width: the row's size hints report one button's width, the
+    buttons split the slot evenly and may compress below their own size hints when squeezed.
+    """
+
+    def __init__(self, *buttons: QPushButton, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self._buttons = buttons
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        row = QHBoxLayout(self)
+        row.setContentsMargins(0, 0, 0, 0)
+        slot_width = max(b.sizeHint().width() for b in buttons)
+        for b in buttons:
+            b.setMinimumWidth(max(1, slot_width // len(buttons) - row.spacing()))
+            row.addWidget(b, 1)
+
+    def sizeHint(self) -> QSize:
+        return QSize(
+            max(b.sizeHint().width() for b in self._buttons),
+            max(b.sizeHint().height() for b in self._buttons),
+        )
+
+    minimumSizeHint = sizeHint
 
 
 class LiveControlWidget(EventBusFrame):
@@ -68,6 +100,8 @@ class LiveControlWidget(EventBusFrame):
         self.streamHandler = streamHandler
 
         # Cached state from events
+        self._is_live = False
+        self._is_snapping = False
         self._current_objective = initial_objective
         self._channel_config_names = list(initial_channel_configs)
 
@@ -189,10 +223,22 @@ class LiveControlWidget(EventBusFrame):
         self.entry_illuminationIntensity.setSingleStep(1)
         self.entry_illuminationIntensity.setValue(100)
 
-        self.btn_live = QPushButton("Start Live")
+        self.btn_live = QPushButton("Live")
         self.btn_live.setCheckable(True)
         self.btn_live.setChecked(False)
         self.btn_live.setDefault(False)
+        self.btn_live.setToolTip("Start/stop continuous live imaging with the current configuration.")
+
+        # Single-frame capture, for light-sensitive samples where a free-running live stream
+        # would bleach the sample while settings are dialed in.
+        self.btn_snap = QPushButton("Snap")
+        self.btn_snap.setCheckable(False)
+        self.btn_snap.setDefault(False)
+        self.btn_snap.setToolTip(
+            "Acquire a single frame with the current configuration. In software/hardware trigger "
+            "mode the illumination is on for that one exposure only; in continuous mode it stays "
+            "on for up to two exposures."
+        )
 
         self.btn_autolevel = QPushButton("Autolevel")
         self.btn_autolevel.setCheckable(True)
@@ -239,7 +285,10 @@ class LiveControlWidget(EventBusFrame):
         grid_line5 = QHBoxLayout()
         if show_autolevel:
             grid_line5.addWidget(self.btn_autolevel)
-        grid_line5.addWidget(self.btn_live)
+        # Live and Snap share the slot the single live button used to occupy, advertising one
+        # button's width so the pair does not widen the panel.
+        self.live_snap_row = SingleSlotButtonRow(self.btn_live, self.btn_snap)
+        grid_line5.addWidget(self.live_snap_row)
         self.grid.addLayout(grid_line5)
 
         if stretch:
@@ -272,6 +321,7 @@ class LiveControlWidget(EventBusFrame):
             lambda enabled: self._publish(AutoLevelCommand(enabled=enabled))
         )
         self.btn_live.clicked.connect(self.toggle_live)
+        self.btn_snap.clicked.connect(self.snap)
 
     def toggle_live(self, pressed: bool) -> None:
         self._log.info(f"toggle_live called with pressed={pressed}")
@@ -280,6 +330,25 @@ class LiveControlWidget(EventBusFrame):
         else:
             self._log.info("Publishing StopLiveCommand")
             self._publish(StopLiveCommand())
+        # The click toggled the checkable button locally. Show the backend-reported state until
+        # LiveStateChanged confirms the change, so an ignored or failed start/stop can't leave it lying.
+        self._sync_live_buttons()
+
+    def snap(self) -> None:
+        """Request one frame with the current configuration; the backend displays it."""
+        if self._is_live or self._is_snapping:
+            return
+        # Disabled until SnapStateChanged reports the snap finished.
+        self.btn_snap.setEnabled(False)
+        self._publish(SnapFrameCommand())
+
+    def _sync_live_buttons(self) -> None:
+        """Derive the Live/Snap buttons from backend-reported state, never from the click."""
+        self.btn_live.setChecked(self._is_live)
+        self.btn_live.setText("Stop" if self._is_live else "Live")
+        self.btn_live.setEnabled(not self._is_snapping)
+        # Snapping while live is meaningless - the sample is already being exposed.
+        self.btn_snap.setEnabled(not self._is_live and not self._is_snapping)
 
     @handles(LiveStateChanged)
     def _on_live_state_changed(self, event: LiveStateChanged) -> None:
@@ -287,12 +356,15 @@ class LiveControlWidget(EventBusFrame):
         if getattr(event, "camera", "main") != "main":
             return
         self._log.info(f"_on_live_state_changed: is_live={event.is_live}")
-        if event.is_live:
-            self.btn_live.setChecked(True)
-            self.btn_live.setText("Stop Live")
-        else:
-            self.btn_live.setChecked(False)
-            self.btn_live.setText("Start Live")
+        self._is_live = event.is_live
+        self._sync_live_buttons()
+
+    @handles(SnapStateChanged)
+    def _on_snap_state_changed(self, event: SnapStateChanged) -> None:
+        if getattr(event, "camera", "main") != "main":
+            return
+        self._is_snapping = event.is_snapping
+        self._sync_live_buttons()
 
     @handles(TriggerModeChanged)
     def _on_trigger_mode_changed(self, event: TriggerModeChanged) -> None:

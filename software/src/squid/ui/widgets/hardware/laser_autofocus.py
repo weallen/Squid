@@ -535,6 +535,9 @@ class LaserAutofocusSettingWidget(QWidget):
                 )
         else:
             self._event_bus.publish(StopLiveCommand(camera="focus"))
+        # The click toggled the checkable button locally; show the backend-reported state until
+        # LiveStateChanged confirms the change, so an ignored or failed start/stop can't leave it lying.
+        self.btn_live.setChecked(self._is_live)
 
     def stop_live(self) -> None:
         """Used for stopping live when switching to other tabs"""
