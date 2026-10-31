@@ -253,8 +253,9 @@ def YTracking_Objective_Function(image, color):
 def calculate_focus_measure(image):
     if len(image.shape) == 3:
         image = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)  # optional
-    lap = cv2.Laplacian(image, cv2.CV_16S)
-    focus_measure = mean(square(lap))
+    # float, not CV_16S: squaring an int16 Laplacian wraps around, which makes sharp 8-bit images score low
+    lap = cv2.Laplacian(image, cv2.CV_32F)
+    focus_measure = mean(square(lap, dtype=np.float64))
     return focus_measure
 
 

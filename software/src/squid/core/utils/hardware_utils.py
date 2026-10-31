@@ -57,11 +57,9 @@ def calculate_focus_measure(
     if len(image.shape) == 3:
         image = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)  # optional
     if method == FocusMeasureOperator.LAPE:
-        if image.dtype == np.uint16:
-            lap = cv2.Laplacian(image, cv2.CV_32F)
-        else:
-            lap = cv2.Laplacian(image, cv2.CV_16S)
-        focus_measure = mean(square(lap))
+        # float, not CV_16S: squaring an int16 Laplacian wraps around, which makes sharp 8-bit images score low
+        lap = cv2.Laplacian(image, cv2.CV_32F)
+        focus_measure = mean(square(lap, dtype=np.float64))
     elif method == FocusMeasureOperator.GLVA:
         focus_measure = np.std(image, axis=None)  # GLVA
     elif method == FocusMeasureOperator.TENENGRAD:
